@@ -1183,6 +1183,10 @@ pub fn launch_session(
 /// Implemented for Ghostty on macOS — the terminal the agent sandbox runs in.
 /// Other terminals return `Err` so the caller can fall back to printing the
 /// command for the user to paste.
+///
+/// `command` is interpreted by `bash -lc`, so callers must not build it from
+/// untrusted or unsanitized input (`cwd` is passed as a literal argv token and
+/// is not shell-interpreted).
 pub fn spawn_command_window(cwd: &str, command: &str) -> Result<String, String> {
     match detect_terminal() {
         Terminal::Ghostty => ghostty::spawn_window(cwd, command),

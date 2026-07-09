@@ -75,6 +75,20 @@ pub(crate) fn restore_sessions(sandbox_arg: &str, dry_run: bool) -> io::Result<(
 
         println!("Restoring {} session(s) from '{sandbox}':", entries.len());
         for entry in entries {
+            // The id is interpolated into a `sc --resume <id>` command that the
+            // terminal runs via `bash -lc`, so reject anything outside the
+            // Claude Code UUID charset — defense against a tampered or corrupt
+            // registry injecting shell metacharacters, and a corruption signal
+            // in its own right.
+            if !is_valid_session_id(&entry.session_id) {
+                eprintln!(
+                    "  [skip] {:?}: unexpected characters in session id",
+                    entry.session_id
+                );
+                skipped += 1;
+                continue;
+            }
+
             // A resume needs the JSONL transcript, which lives on the shared
             // ~/.claude mount and normally survives `sbx rm`. If it's gone the
             // session can't be resumed — skip it rather than open a window that
@@ -132,6 +146,17 @@ pub(crate) fn restore_sessions(sandbox_arg: &str, dry_run: bool) -> io::Result<(
 /// First 8 chars of a session id — enough to eyeball, short enough to scan.
 fn short_id(session_id: &str) -> &str {
     session_id.get(..8).unwrap_or(session_id)
+}
+
+/// Whether `session_id` is safe to interpolate into the `sc --resume <id>`
+/// command line (which the terminal runs via `bash -lc`). Claude Code session
+/// ids are UUIDs; this conservative allowlist accepts them and rejects every
+/// shell metacharacter.
+fn is_valid_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 /// The directory to reopen a session in, falling back to `$HOME` (then `.`)
@@ -1178,5 +1203,25 @@ pub(crate) fn run_brain_query(cfg: &config::Config, cli: &Cli) -> io::Result<()>
             println!("{}", serde_json::to_string(&result).unwrap());
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_id_validation_accepts_uuids_and_rejects_shell_metacharacters() {
+        // Real Claude Code session ids.
+        assert!(is_valid_session_id("11111111-aaaa-2222-bbbb-333333333333"));
+        assert!(is_valid_session_id("abc_123.def"));
+        // Injection attempts that would break out of `sc --resume <id>`.
+        assert!(!is_valid_session_id(""));
+        assert!(!is_valid_session_id("foo; rm -rf ~"));
+        assert!(!is_valid_session_id("$(whoami)"));
+        assert!(!is_valid_session_id("a b"));
+        assert!(!is_valid_session_id("back`tick`"));
+        assert!(!is_valid_session_id("a|b"));
+        assert!(!is_valid_session_id("a&&b"));
     }
 }
