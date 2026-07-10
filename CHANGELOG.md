@@ -12,6 +12,13 @@ All notable changes to claudectl are documented here.
   spawns one terminal window per live-at-teardown session running
   `sc --resume <id>` in its recorded directory (Ghostty on macOS; other
   terminals print the commands). Pair with `--dry-run` to preview.
+  - The registry now stores each session's `/rename` name (captured in-sandbox
+    on `SessionStart` and refreshed on `Stop`, since the name lives in the
+    container-local session JSON that `sbx rm` destroys), so restore shows
+    `name (short-id)` instead of a bare id.
+  - Restore skips any session already being resumed in the host process table,
+    so re-running it (or restoring alongside a manual `sc --resume`) won't open
+    a duplicate window.
 
 ## [0.32.0] - 2026-04-20
 

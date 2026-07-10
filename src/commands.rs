@@ -3,6 +3,7 @@
 //! Each function implements a standalone CLI mode (--doctor, --clean, --list, etc.)
 //! called from `run_main()` dispatch in main.rs.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
@@ -60,6 +61,9 @@ pub(crate) fn restore_sessions(sandbox_arg: &str, dry_run: bool) -> io::Result<(
     }
 
     let can_spawn = terminals::can_spawn_command_window();
+    // Session ids already being resumed in the host process table, so we don't
+    // open a second window for a session that's already running/restored.
+    let running = running_resumed_ids();
     let mut spawned = 0usize;
     let mut skipped = 0usize;
 
@@ -89,6 +93,14 @@ pub(crate) fn restore_sessions(sandbox_arg: &str, dry_run: bool) -> io::Result<(
                 continue;
             }
 
+            // Don't restore a session that's already up (from a previous restore
+            // or a manual `sc --resume`).
+            if running.contains(&entry.session_id) {
+                println!("  [skip] {}: already running", entry_label(entry));
+                skipped += 1;
+                continue;
+            }
+
             // A resume needs the JSONL transcript, which lives on the shared
             // ~/.claude mount and normally survives `sbx rm`. If it's gone the
             // session can't be resumed — skip it rather than open a window that
@@ -96,7 +108,7 @@ pub(crate) fn restore_sessions(sandbox_arg: &str, dry_run: bool) -> io::Result<(
             if !entry.transcript.is_empty() && !Path::new(&entry.transcript).exists() {
                 eprintln!(
                     "  [skip] {} ({}): transcript missing",
-                    short_id(&entry.session_id),
+                    entry_label(entry),
                     entry.cwd
                 );
                 skipped += 1;
@@ -112,20 +124,17 @@ pub(crate) fn restore_sessions(sandbox_arg: &str, dry_run: bool) -> io::Result<(
                 } else {
                     "   (this terminal can't spawn windows — run it manually)"
                 };
-                println!(
-                    "  {}  {cwd}\n      $ {command}{note}",
-                    short_id(&entry.session_id)
-                );
+                println!("  {}  {cwd}\n      $ {command}{note}", entry_label(entry));
                 continue;
             }
 
             match terminals::spawn_command_window(&cwd, &command) {
                 Ok(term) => {
-                    println!("  ↻ {}  {cwd}  ({term})", short_id(&entry.session_id));
+                    println!("  ↻ {}  {cwd}  ({term})", entry_label(entry));
                     spawned += 1;
                 }
                 Err(error) => {
-                    eprintln!("  [fail] {}: {error}", short_id(&entry.session_id));
+                    eprintln!("  [fail] {}: {error}", entry_label(entry));
                     skipped += 1;
                 }
             }
@@ -146,6 +155,47 @@ pub(crate) fn restore_sessions(sandbox_arg: &str, dry_run: bool) -> io::Result<(
 /// First 8 chars of a session id — enough to eyeball, short enough to scan.
 fn short_id(session_id: &str) -> &str {
     session_id.get(..8).unwrap_or(session_id)
+}
+
+/// Human label for a registry entry: its `/rename` name plus the short id when
+/// named (e.g. `mimir-timeouts (c3df00ed)`), otherwise just the short id.
+fn entry_label(entry: &sandbox_registry::SessionEntry) -> String {
+    match entry.name.as_deref() {
+        Some(name) if !name.is_empty() => format!("{name} ({})", short_id(&entry.session_id)),
+        _ => short_id(&entry.session_id).to_string(),
+    }
+}
+
+/// Session ids currently being resumed anywhere in the host process table. A
+/// restored (or manually `sc --resume`d) session shows up as `sbx exec … claude
+/// --resume <id>`, so `--resume <id>` in any process's args means it's already
+/// up. (Sessions started fresh, without `--resume`, carry no id in their args
+/// and so aren't detected — restore is a post-`sbx rm` tool where nothing is
+/// running anyway.)
+fn running_resumed_ids() -> HashSet<String> {
+    match std::process::Command::new("ps")
+        .args(["-axo", "args="])
+        .output()
+    {
+        Ok(output) => resumed_ids_in(&String::from_utf8_lossy(&output.stdout)),
+        Err(_) => HashSet::new(),
+    }
+}
+
+/// Pure: collect every token immediately following `--resume` in `ps` output.
+fn resumed_ids_in(ps_output: &str) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for line in ps_output.lines() {
+        let mut tokens = line.split_whitespace();
+        while let Some(token) = tokens.next() {
+            if token == "--resume" {
+                if let Some(id) = tokens.next() {
+                    ids.insert(id.to_string());
+                }
+            }
+        }
+    }
+    ids
 }
 
 /// Whether `session_id` is safe to interpolate into the `sc --resume <id>`
@@ -1223,5 +1273,32 @@ mod tests {
         assert!(!is_valid_session_id("back`tick`"));
         assert!(!is_valid_session_id("a|b"));
         assert!(!is_valid_session_id("a&&b"));
+    }
+
+    #[test]
+    fn resumed_ids_parses_resume_targets_from_ps() {
+        let ps = "\
+root  sbx exec -it linera-agent bash -lc sc --resume aaaa-1111\n\
+root  /bin/bash -lc sc --resume bbbb-2222\n\
+root  claudectl --restore-sessions linera-agent\n\
+root  --resume\n";
+        let ids = resumed_ids_in(ps);
+        assert!(ids.contains("aaaa-1111"));
+        assert!(ids.contains("bbbb-2222"));
+        assert_eq!(ids.len(), 2, "a trailing --resume with no id is ignored");
+    }
+
+    #[test]
+    fn entry_label_prefers_name_then_falls_back_to_short_id() {
+        let mut entry = sandbox_registry::SessionEntry {
+            session_id: "c3df00ed-83cd-45d7-8ddc-43820b6e4473".to_string(),
+            cwd: "/Users/ndr".to_string(),
+            transcript: String::new(),
+            started_at_ms: 0,
+            name: Some("mimir-timeouts".to_string()),
+        };
+        assert_eq!(entry_label(&entry), "mimir-timeouts (c3df00ed)");
+        entry.name = None;
+        assert_eq!(entry_label(&entry), "c3df00ed");
     }
 }
