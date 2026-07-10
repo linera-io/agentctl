@@ -146,21 +146,63 @@ pub fn remove_session(session_id: &str) -> io::Result<()> {
     })
 }
 
-/// Set the display name of a registered session (by id, across sandboxes).
-/// Writes only when the name actually changes, and is a no-op when the session
-/// isn't registered — so a hook can call it unconditionally on every turn to
-/// pick up a late `/rename` without churning the file.
-pub fn set_name(session_id: &str, name: Option<String>) -> io::Result<()> {
+/// Ensure a session is registered and its metadata is current. If the session
+/// is already known (in any sandbox), refresh its name/cwd/transcript in place,
+/// keeping the original `started_at_ms`; otherwise insert it under `sandbox`
+/// with `started_at_ms_if_new`. Writes only on a real change.
+///
+/// This lets a `Stop` hook *self-heal* the registry: a session whose
+/// `SessionStart` predated this writer (e.g. claudectl was upgraded mid-session)
+/// is never registered by start alone, but gets picked up — with its `/rename`
+/// name — on its next turn, without needing a restart.
+#[allow(clippy::too_many_arguments)]
+pub fn touch(
+    sandbox: &str,
+    session_id: &str,
+    cwd: &str,
+    transcript: &str,
+    name: Option<String>,
+    started_at_ms_if_new: u64,
+) -> io::Result<()> {
     with_lock(|| {
         let mut registry = load();
         let mut changed = false;
+        let mut found = false;
         for slice in registry.sandboxes.values_mut() {
             for entry in slice.iter_mut() {
-                if entry.session_id == session_id && entry.name != name {
+                if entry.session_id != session_id {
+                    continue;
+                }
+                found = true;
+                if entry.name != name {
                     entry.name = name.clone();
                     changed = true;
                 }
+                // Only overwrite cwd/transcript with a non-empty payload value,
+                // so a sparse hook payload never blanks good data.
+                if !cwd.is_empty() && entry.cwd != cwd {
+                    entry.cwd = cwd.to_string();
+                    changed = true;
+                }
+                if !transcript.is_empty() && entry.transcript != transcript {
+                    entry.transcript = transcript.to_string();
+                    changed = true;
+                }
             }
+        }
+        if !found {
+            registry
+                .sandboxes
+                .entry(sandbox.to_string())
+                .or_default()
+                .push(SessionEntry {
+                    session_id: session_id.to_string(),
+                    cwd: cwd.to_string(),
+                    transcript: transcript.to_string(),
+                    started_at_ms: started_at_ms_if_new,
+                    name,
+                });
+            changed = true;
         }
         if changed {
             write_atomic(&registry)
@@ -334,27 +376,59 @@ mod tests {
     }
 
     #[test]
-    fn set_name_updates_registered_session() {
-        let _guard = TempRegistry::new("set-name");
-        upsert("linera-agent", entry("aaa", "/a")).unwrap();
-        set_name("aaa", Some("mimir-timeouts".to_string())).unwrap();
+    fn touch_refreshes_name_of_existing_session_keeping_started_at() {
+        let _guard = TempRegistry::new("touch-refresh");
+        upsert("linera-agent", entry("aaa", "/a")).unwrap(); // started_at_ms = 42
+        touch(
+            "linera-agent",
+            "aaa",
+            "/a",
+            "/tmp/aaa.jsonl",
+            Some("mimir-timeouts".to_string()),
+            9999,
+        )
+        .unwrap();
         let registry = load();
         let stored = &registry.sandboxes.get("linera-agent").unwrap()[0];
         assert_eq!(stored.name.as_deref(), Some("mimir-timeouts"));
+        assert_eq!(stored.started_at_ms, 42, "existing start time preserved");
+        assert_eq!(
+            registry.sandboxes.get("linera-agent").unwrap().len(),
+            1,
+            "no duplicate"
+        );
     }
 
     #[test]
-    fn set_name_is_noop_for_unknown_session() {
-        let _guard = TempRegistry::new("set-name-unknown");
-        upsert("linera-agent", entry("aaa", "/a")).unwrap();
-        set_name("not-here", Some("x".to_string())).unwrap();
+    fn touch_self_heals_unregistered_session() {
+        let _guard = TempRegistry::new("touch-selfheal");
+        // Session never SessionStart'd (writer deployed mid-session), so it's
+        // absent — touch must insert it with its name.
+        touch(
+            "linera-agent",
+            "live-1",
+            "/work/live",
+            "/tmp/live-1.jsonl",
+            Some("linera-protocol-upstream".to_string()),
+            123,
+        )
+        .unwrap();
         let registry = load();
-        // The known session is untouched and no phantom entry appears.
-        assert_eq!(registry.sandboxes.get("linera-agent").unwrap().len(), 1);
-        assert_eq!(
-            registry.sandboxes.get("linera-agent").unwrap()[0].name,
-            None
-        );
+        let slice = registry.sandboxes.get("linera-agent").unwrap();
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice[0].session_id, "live-1");
+        assert_eq!(slice[0].name.as_deref(), Some("linera-protocol-upstream"));
+        assert_eq!(slice[0].started_at_ms, 123);
+    }
+
+    #[test]
+    fn touch_does_not_blank_cwd_on_empty_payload() {
+        let _guard = TempRegistry::new("touch-empty");
+        upsert("linera-agent", entry("aaa", "/good/cwd")).unwrap();
+        touch("linera-agent", "aaa", "", "", None, 1).unwrap();
+        let registry = load();
+        let stored = &registry.sandboxes.get("linera-agent").unwrap()[0];
+        assert_eq!(stored.cwd, "/good/cwd", "empty payload must not blank cwd");
     }
 
     #[test]
