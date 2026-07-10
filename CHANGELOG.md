@@ -19,6 +19,10 @@ All notable changes to claudectl are documented here.
   - Restore skips any session already being resumed in the host process table,
     so re-running it (or restoring alongside a manual `sc --resume`) won't open
     a duplicate window.
+  - The `Stop` hook now self-heals the registry: a session whose `SessionStart`
+    predated this writer (e.g. claudectl upgraded mid-session) is registered —
+    with its `/rename` name — on its next turn, instead of being tracked only if
+    it happened to start under the new writer.
 
 ## [0.32.0] - 2026-04-20
 

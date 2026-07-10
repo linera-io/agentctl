@@ -248,12 +248,26 @@ pub fn record_hook_event(payload: &serde_json::Value) -> io::Result<()> {
                 );
             }
             "Stop" => {
-                // The `/rename` name is set after SessionStart, so refresh it
-                // once the session has run a turn. No-op if unchanged or if the
-                // session isn't registered.
-                let _ = crate::sandbox_registry::set_name(
+                // A turn finished: refresh the `/rename` name (set after
+                // SessionStart) and, crucially, register the session if it's
+                // missing — a session whose SessionStart predated this writer
+                // (e.g. claudectl upgraded mid-session) is otherwise never
+                // tracked. `touch` writes only on a real change.
+                let cwd = payload
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let transcript = payload
+                    .get("transcript_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let _ = crate::sandbox_registry::touch(
+                    &sandbox,
                     &session_id,
+                    cwd,
+                    transcript,
                     crate::discovery::session_name(&session_id),
+                    now_ms(),
                 );
             }
             "SessionEnd" => {
