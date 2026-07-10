@@ -56,6 +56,11 @@ pub struct SessionEntry {
     /// Unix epoch milliseconds at `SessionStart`. Zero if unknown.
     #[serde(default)]
     pub started_at_ms: u64,
+    /// The session's `/rename` display name, captured from its (container-local)
+    /// session JSON so restore can show it after `sbx rm` destroys that JSON.
+    /// `None` until the session is named. See [`set_name`].
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// The on-disk registry: a map of sandbox name -> its live sessions.
@@ -138,6 +143,30 @@ pub fn remove_session(session_id: &str) -> io::Result<()> {
             !slice.is_empty()
         });
         write_atomic(&registry)
+    })
+}
+
+/// Set the display name of a registered session (by id, across sandboxes).
+/// Writes only when the name actually changes, and is a no-op when the session
+/// isn't registered — so a hook can call it unconditionally on every turn to
+/// pick up a late `/rename` without churning the file.
+pub fn set_name(session_id: &str, name: Option<String>) -> io::Result<()> {
+    with_lock(|| {
+        let mut registry = load();
+        let mut changed = false;
+        for slice in registry.sandboxes.values_mut() {
+            for entry in slice.iter_mut() {
+                if entry.session_id == session_id && entry.name != name {
+                    entry.name = name.clone();
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            write_atomic(&registry)
+        } else {
+            Ok(())
+        }
     })
 }
 
@@ -234,6 +263,7 @@ mod tests {
             cwd: cwd.to_string(),
             transcript: format!("/tmp/{id}.jsonl"),
             started_at_ms: 42,
+            name: None,
         }
     }
 
@@ -301,6 +331,45 @@ mod tests {
         upsert("linera-agent", entry("aaa", "/a")).unwrap();
         remove_session("does-not-exist").unwrap();
         assert_eq!(load().sandboxes.get("linera-agent").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn set_name_updates_registered_session() {
+        let _guard = TempRegistry::new("set-name");
+        upsert("linera-agent", entry("aaa", "/a")).unwrap();
+        set_name("aaa", Some("mimir-timeouts".to_string())).unwrap();
+        let registry = load();
+        let stored = &registry.sandboxes.get("linera-agent").unwrap()[0];
+        assert_eq!(stored.name.as_deref(), Some("mimir-timeouts"));
+    }
+
+    #[test]
+    fn set_name_is_noop_for_unknown_session() {
+        let _guard = TempRegistry::new("set-name-unknown");
+        upsert("linera-agent", entry("aaa", "/a")).unwrap();
+        set_name("not-here", Some("x".to_string())).unwrap();
+        let registry = load();
+        // The known session is untouched and no phantom entry appears.
+        assert_eq!(registry.sandboxes.get("linera-agent").unwrap().len(), 1);
+        assert_eq!(
+            registry.sandboxes.get("linera-agent").unwrap()[0].name,
+            None
+        );
+    }
+
+    #[test]
+    fn session_entry_with_name_roundtrips() {
+        let _guard = TempRegistry::new("name-roundtrip");
+        let mut named = entry("aaa", "/a");
+        named.name = Some("faucet-migration".to_string());
+        upsert("linera-agent", named).unwrap();
+        let registry = load();
+        assert_eq!(
+            registry.sandboxes.get("linera-agent").unwrap()[0]
+                .name
+                .as_deref(),
+            Some("faucet-migration")
+        );
     }
 
     #[test]

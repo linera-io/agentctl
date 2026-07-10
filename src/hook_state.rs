@@ -243,7 +243,17 @@ pub fn record_hook_event(payload: &serde_json::Value) -> io::Result<()> {
                         cwd: cwd.to_string(),
                         transcript: transcript.to_string(),
                         started_at_ms: now_ms(),
+                        name: crate::discovery::session_name(&session_id),
                     },
+                );
+            }
+            "Stop" => {
+                // The `/rename` name is set after SessionStart, so refresh it
+                // once the session has run a turn. No-op if unchanged or if the
+                // session isn't registered.
+                let _ = crate::sandbox_registry::set_name(
+                    &session_id,
+                    crate::discovery::session_name(&session_id),
                 );
             }
             "SessionEnd" => {
