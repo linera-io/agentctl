@@ -23,6 +23,10 @@ All notable changes to claudectl are documented here.
     predated this writer (e.g. claudectl upgraded mid-session) is registered —
     with its `/rename` name — on its next turn, instead of being tracked only if
     it happened to start under the new writer.
+  - Restore opens each session as a new **window in the running Ghostty** via its
+    native `new window with configuration` AppleScript command, instead of
+    `open -na` (which spawned a whole new app instance per session). No macOS
+    Accessibility permission required.
 
 ## [0.32.0] - 2026-04-20
 

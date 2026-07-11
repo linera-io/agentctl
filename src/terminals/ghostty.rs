@@ -131,41 +131,35 @@ pub fn approve(session: &ClaudeSession) -> Result<(), String> {
     run_osascript(&script)
 }
 
-/// Build the `open(1)` argv that launches a NEW Ghostty window running
-/// `command` via a login shell (so PATH, `sbx`, and `sc` resolve) in `cwd`.
-/// `open -n` forces a new instance/window; `-e <argv>` is Ghostty's
-/// run-command flag, and `--working-directory` is a config key exposed as a
-/// CLI option. Pure and unit-tested; [`spawn_window`] just feeds this to
-/// `open`.
-fn open_argv(cwd: &str, command: &str) -> Vec<String> {
-    vec![
-        "-n".to_string(),
-        "-a".to_string(),
-        "Ghostty.app".to_string(),
-        "--args".to_string(),
-        format!("--working-directory={cwd}"),
-        "-e".to_string(),
-        "bash".to_string(),
-        "-lc".to_string(),
-        command.to_string(),
-    ]
+/// Build the AppleScript that opens a NEW window in the already-running Ghostty
+/// and runs `command` in `cwd`.
+///
+/// Uses Ghostty's native `new window with configuration {…}` (from its scripting
+/// dictionary) — no new app instance (unlike `open -na`), and pure Apple Events
+/// to Ghostty, so no macOS Accessibility permission (unlike a System-Events
+/// keystroke). `initial working directory` sets the cwd; `initial input` runs
+/// `command` in the window's normal login shell (so PATH resolves `sc`/`sbx`),
+/// with `& return` to execute it. Pure — unit-tested.
+fn new_window_script(cwd: &str, command: &str) -> String {
+    let cwd = applescript_escape(cwd);
+    let command = applescript_escape(command);
+    format!(
+        r#"
+        tell application "Ghostty"
+            new window with configuration {{initial working directory:"{cwd}", initial input:"{command}" & return}}
+        end tell
+        "#,
+    )
 }
 
-/// Open a new Ghostty window running `command` in `cwd`. macOS only — it
-/// drives the `open(1)` launcher, which does not exist on Linux.
+/// Open a new window in the running Ghostty running `command` in `cwd` (no new
+/// app instance). macOS only — it drives Ghostty via AppleScript.
 pub fn spawn_window(cwd: &str, command: &str) -> Result<String, String> {
     if !cfg!(target_os = "macos") {
         return Err("Ghostty window spawn is only implemented on macOS".to_string());
     }
-    let status = std::process::Command::new("open")
-        .args(open_argv(cwd, command))
-        .status()
-        .map_err(|error| format!("failed to launch `open`: {error}"))?;
-    if status.success() {
-        Ok("Ghostty".to_string())
-    } else {
-        Err(format!("`open` exited unsuccessfully ({status})"))
-    }
+    run_osascript(&new_window_script(cwd, command))?;
+    Ok("Ghostty".to_string())
 }
 
 #[cfg(test)]
@@ -174,15 +168,22 @@ mod tests {
     use crate::session::{ClaudeSession, RawSession};
 
     #[test]
-    fn open_argv_builds_new_window_running_command_in_login_shell() {
-        let args = open_argv("/work/scylla", "sc --resume abc123");
-        // `-n` forces a new window rather than focusing an existing one.
-        assert_eq!(args[0], "-n");
-        assert!(args.contains(&"Ghostty.app".to_string()));
-        assert!(args.contains(&"--working-directory=/work/scylla".to_string()));
-        // `-e bash -lc "<command>"` runs the command in a login shell.
-        let dash_e = args.iter().position(|arg| arg == "-e").unwrap();
-        assert_eq!(&args[dash_e + 1..], &["bash", "-lc", "sc --resume abc123"]);
+    fn new_window_script_uses_native_new_window_with_cwd_and_command() {
+        let script = new_window_script("/work/scylla", "sc --resume abc123");
+        // Native Ghostty command → new window in the running instance.
+        assert!(script.contains("new window with configuration"));
+        assert!(script.contains("initial working directory:\"/work/scylla\""));
+        assert!(script.contains("initial input:\"sc --resume abc123\" & return"));
+        // No System Events (would need Accessibility) and no `open` (new instance).
+        assert!(!script.contains("keystroke"));
+        assert!(!script.to_lowercase().contains("system events"));
+    }
+
+    #[test]
+    fn new_window_script_escapes_applescript_specials() {
+        // A quote in the cwd must be escaped so the record literal stays valid.
+        let script = new_window_script("/work/a\"b", "sc --resume x");
+        assert!(script.contains("initial working directory:\"/work/a\\\"b\""));
     }
 
     fn make_session(cwd: &str, name: &str) -> ClaudeSession {
