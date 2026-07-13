@@ -4,6 +4,16 @@ All notable changes to claudectl are documented here.
 
 ## [Unreleased]
 
+### Changed
+- **Sandbox restore registry now mirrors live processes.** Instead of adding on
+  `SessionStart` / removing on `SessionEnd` / self-healing on `Stop` (which
+  drifted names to garbage and accumulated stale entries), the in-sandbox hook
+  now reconciles the registry to claudectl's live-session set on every event: a
+  session is tracked iff its process is alive (`kill -0`), idle time is
+  irrelevant, names are read straight from the session JSON, and — critically —
+  the writer never deletes a session file. `upsert`/`touch`/`remove_session` are
+  replaced by a single `replace_slice`.
+
 ### Added
 - **`--restore-sessions [sandbox]`** — bring back Linera agent-sandbox Claude
   sessions after `sbx rm`. `SessionStart`/`SessionEnd` hooks now mirror each

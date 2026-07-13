@@ -121,94 +121,31 @@ pub fn load() -> Registry {
     }
 }
 
-/// Add or replace a session under `sandbox` (idempotent on `session_id`).
-pub fn upsert(sandbox: &str, entry: SessionEntry) -> io::Result<()> {
+/// Replace a sandbox's entire slice with `entries` — the current live-session
+/// set for that sandbox. This is the whole write model: the in-sandbox writer
+/// reconciles the registry to claudectl's live session list on each hook event,
+/// so the file always mirrors what the sandbox's claudectl UI shows (idle
+/// sessions included, dead ones dropped). An empty `entries` removes the
+/// sandbox key. Writes only when the slice actually changes, so it's cheap to
+/// call on every event.
+pub fn replace_slice(sandbox: &str, entries: Vec<SessionEntry>) -> io::Result<()> {
     with_lock(|| {
         let mut registry = load();
-        let slice = registry.sandboxes.entry(sandbox.to_string()).or_default();
-        slice.retain(|existing| existing.session_id != entry.session_id);
-        slice.push(entry.clone());
-        write_atomic(&registry)
-    })
-}
-
-/// Remove a session by id from every sandbox slice. We key removal on the id
-/// alone (not the current sandbox name) so a `SessionEnd` whose env drifted
-/// from its `SessionStart` still cleans up correctly. Empty slices are pruned.
-pub fn remove_session(session_id: &str) -> io::Result<()> {
-    with_lock(|| {
-        let mut registry = load();
-        registry.sandboxes.retain(|_, slice| {
-            slice.retain(|entry| entry.session_id != session_id);
-            !slice.is_empty()
-        });
-        write_atomic(&registry)
-    })
-}
-
-/// Ensure a session is registered and its metadata is current. If the session
-/// is already known (in any sandbox), refresh its name/cwd/transcript in place,
-/// keeping the original `started_at_ms`; otherwise insert it under `sandbox`
-/// with `started_at_ms_if_new`. Writes only on a real change.
-///
-/// This lets a `Stop` hook *self-heal* the registry: a session whose
-/// `SessionStart` predated this writer (e.g. claudectl was upgraded mid-session)
-/// is never registered by start alone, but gets picked up — with its `/rename`
-/// name — on its next turn, without needing a restart.
-#[allow(clippy::too_many_arguments)]
-pub fn touch(
-    sandbox: &str,
-    session_id: &str,
-    cwd: &str,
-    transcript: &str,
-    name: Option<String>,
-    started_at_ms_if_new: u64,
-) -> io::Result<()> {
-    with_lock(|| {
-        let mut registry = load();
-        let mut changed = false;
-        let mut found = false;
-        for slice in registry.sandboxes.values_mut() {
-            for entry in slice.iter_mut() {
-                if entry.session_id != session_id {
-                    continue;
-                }
-                found = true;
-                if entry.name != name {
-                    entry.name = name.clone();
-                    changed = true;
-                }
-                // Only overwrite cwd/transcript with a non-empty payload value,
-                // so a sparse hook payload never blanks good data.
-                if !cwd.is_empty() && entry.cwd != cwd {
-                    entry.cwd = cwd.to_string();
-                    changed = true;
-                }
-                if !transcript.is_empty() && entry.transcript != transcript {
-                    entry.transcript = transcript.to_string();
-                    changed = true;
-                }
-            }
+        let current = registry.sandboxes.get(sandbox);
+        let unchanged = match (current, entries.is_empty()) {
+            (None, true) => true,
+            (Some(existing), false) => *existing == entries,
+            _ => false,
+        };
+        if unchanged {
+            return Ok(());
         }
-        if !found {
-            registry
-                .sandboxes
-                .entry(sandbox.to_string())
-                .or_default()
-                .push(SessionEntry {
-                    session_id: session_id.to_string(),
-                    cwd: cwd.to_string(),
-                    transcript: transcript.to_string(),
-                    started_at_ms: started_at_ms_if_new,
-                    name,
-                });
-            changed = true;
-        }
-        if changed {
-            write_atomic(&registry)
+        if entries.is_empty() {
+            registry.sandboxes.remove(sandbox);
         } else {
-            Ok(())
+            registry.sandboxes.insert(sandbox.to_string(), entries);
         }
+        write_atomic(&registry)
     })
 }
 
@@ -317,9 +254,9 @@ mod tests {
     }
 
     #[test]
-    fn upsert_then_load_roundtrips() {
+    fn replace_slice_sets_and_roundtrips() {
         let _guard = TempRegistry::new("roundtrip");
-        upsert("linera-agent", entry("aaa", "/work/a")).unwrap();
+        replace_slice("linera-agent", vec![entry("aaa", "/work/a")]).unwrap();
         let registry = load();
         let slice = registry.sandboxes.get("linera-agent").unwrap();
         assert_eq!(slice.len(), 1);
@@ -328,107 +265,43 @@ mod tests {
     }
 
     #[test]
-    fn upsert_is_idempotent_on_session_id() {
-        let _guard = TempRegistry::new("idempotent");
-        upsert("linera-agent", entry("aaa", "/work/old")).unwrap();
-        upsert("linera-agent", entry("aaa", "/work/new")).unwrap();
+    fn replace_slice_overwrites_the_whole_slice() {
+        let _guard = TempRegistry::new("overwrite");
+        replace_slice("linera-agent", vec![entry("aaa", "/a"), entry("bbb", "/b")]).unwrap();
+        // New live set: "aaa" ended, "ccc" started.
+        replace_slice("linera-agent", vec![entry("bbb", "/b"), entry("ccc", "/c")]).unwrap();
         let registry = load();
-        let slice = registry.sandboxes.get("linera-agent").unwrap();
-        assert_eq!(slice.len(), 1, "same id must not duplicate");
-        assert_eq!(slice[0].cwd, "/work/new", "latest wins");
-    }
-
-    #[test]
-    fn sandboxes_keep_independent_slices() {
-        let _guard = TempRegistry::new("slices");
-        upsert("linera-agent", entry("aaa", "/a")).unwrap();
-        upsert("pm-task", entry("bbb", "/b")).unwrap();
-        let registry = load();
-        assert_eq!(registry.sandboxes.get("linera-agent").unwrap().len(), 1);
-        assert_eq!(registry.sandboxes.get("pm-task").unwrap().len(), 1);
-    }
-
-    #[test]
-    fn remove_deletes_by_id_and_prunes_empty_sandbox() {
-        let _guard = TempRegistry::new("remove");
-        upsert("linera-agent", entry("aaa", "/a")).unwrap();
-        upsert("linera-agent", entry("bbb", "/b")).unwrap();
-        remove_session("aaa").unwrap();
-        let registry = load();
-        let slice = registry.sandboxes.get("linera-agent").unwrap();
-        assert_eq!(slice.len(), 1);
-        assert_eq!(slice[0].session_id, "bbb");
-
-        remove_session("bbb").unwrap();
-        let registry = load();
-        assert!(
-            !registry.sandboxes.contains_key("linera-agent"),
-            "sandbox with no sessions is pruned"
-        );
-    }
-
-    #[test]
-    fn remove_missing_id_is_a_noop() {
-        let _guard = TempRegistry::new("remove-missing");
-        upsert("linera-agent", entry("aaa", "/a")).unwrap();
-        remove_session("does-not-exist").unwrap();
-        assert_eq!(load().sandboxes.get("linera-agent").unwrap().len(), 1);
-    }
-
-    #[test]
-    fn touch_refreshes_name_of_existing_session_keeping_started_at() {
-        let _guard = TempRegistry::new("touch-refresh");
-        upsert("linera-agent", entry("aaa", "/a")).unwrap(); // started_at_ms = 42
-        touch(
-            "linera-agent",
-            "aaa",
-            "/a",
-            "/tmp/aaa.jsonl",
-            Some("mimir-timeouts".to_string()),
-            9999,
-        )
-        .unwrap();
-        let registry = load();
-        let stored = &registry.sandboxes.get("linera-agent").unwrap()[0];
-        assert_eq!(stored.name.as_deref(), Some("mimir-timeouts"));
-        assert_eq!(stored.started_at_ms, 42, "existing start time preserved");
+        let ids: Vec<_> = registry
+            .sandboxes
+            .get("linera-agent")
+            .unwrap()
+            .iter()
+            .map(|e| e.session_id.as_str())
+            .collect();
         assert_eq!(
-            registry.sandboxes.get("linera-agent").unwrap().len(),
-            1,
-            "no duplicate"
+            ids,
+            ["bbb", "ccc"],
+            "slice reflects exactly the new live set"
         );
     }
 
     #[test]
-    fn touch_self_heals_unregistered_session() {
-        let _guard = TempRegistry::new("touch-selfheal");
-        // Session never SessionStart'd (writer deployed mid-session), so it's
-        // absent — touch must insert it with its name.
-        touch(
-            "linera-agent",
-            "live-1",
-            "/work/live",
-            "/tmp/live-1.jsonl",
-            Some("linera-protocol-upstream".to_string()),
-            123,
-        )
-        .unwrap();
-        let registry = load();
-        let slice = registry.sandboxes.get("linera-agent").unwrap();
-        assert_eq!(slice.len(), 1);
-        assert_eq!(slice[0].session_id, "live-1");
-        assert_eq!(slice[0].name.as_deref(), Some("linera-protocol-upstream"));
-        assert_eq!(slice[0].started_at_ms, 123);
+    fn replace_slice_empty_removes_the_sandbox() {
+        let _guard = TempRegistry::new("empty");
+        replace_slice("linera-agent", vec![entry("aaa", "/a")]).unwrap();
+        replace_slice("linera-agent", vec![]).unwrap();
+        assert!(!load().sandboxes.contains_key("linera-agent"));
     }
 
     #[test]
-    fn touch_does_not_blank_cwd_on_empty_payload() {
-        let _guard = TempRegistry::new("touch-empty");
-        upsert("linera-agent", entry("aaa", "/good/cwd")).unwrap();
-        touch("linera-agent", "aaa", "", "", None, 1).unwrap();
+    fn replace_slice_keeps_sandboxes_independent() {
+        let _guard = TempRegistry::new("independent");
+        replace_slice("linera-agent", vec![entry("aaa", "/a")]).unwrap();
+        replace_slice("pm-task", vec![entry("bbb", "/b")]).unwrap();
+        replace_slice("linera-agent", vec![]).unwrap();
         let registry = load();
-        let stored = &registry.sandboxes.get("linera-agent").unwrap()[0];
-        assert_eq!(stored.cwd, "/good/cwd", "empty payload must not blank cwd");
+        assert!(!registry.sandboxes.contains_key("linera-agent"));
+        assert_eq!(registry.sandboxes.get("pm-task").unwrap().len(), 1);
     }
 
     #[test]
@@ -436,7 +309,7 @@ mod tests {
         let _guard = TempRegistry::new("name-roundtrip");
         let mut named = entry("aaa", "/a");
         named.name = Some("faucet-migration".to_string());
-        upsert("linera-agent", named).unwrap();
+        replace_slice("linera-agent", vec![named]).unwrap();
         let registry = load();
         assert_eq!(
             registry.sandboxes.get("linera-agent").unwrap()[0]
