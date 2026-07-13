@@ -4,6 +4,15 @@ All notable changes to claudectl are documented here.
 
 ## [Unreleased]
 
+### Removed
+- **claudectl no longer deletes Claude Code session-pointer files.** The
+  `cleanup_stale_sessions` GC (delete `~/.claude/sessions/<pid>.json` when the
+  PID looks dead + the file is >24h old) is gone. It judged liveness by
+  `kill -0` in the *current* PID namespace, so running claudectl against a
+  sessions dir it didn't own (e.g. inside a sandbox, where host PIDs look dead)
+  deleted live sessions' pointers. A monitor must not GC the app's own state;
+  Claude Code owns those files.
+
 ### Changed
 - **Sandbox restore registry now mirrors live processes.** Instead of adding on
   `SessionStart` / removing on `SessionEnd` / self-healing on `Stop` (which

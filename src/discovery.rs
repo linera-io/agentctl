@@ -21,10 +21,9 @@ pub fn projects_dir() -> PathBuf {
 /// running process. Idle time is irrelevant — if the process is alive, the
 /// session is kept, forever.
 ///
-/// This READS the session-pointer JSONs and never deletes any of them (unlike
-/// [`scan_sessions`], which runs `cleanup_stale_sessions`). The registry writer
-/// must never touch a user's session files — a session is a live process, not a
-/// timestamp, so liveness is decided only by `kill -0` on its PID.
+/// This only READS the session-pointer JSONs — claudectl never deletes a user's
+/// session files. A session is a live process, not a timestamp, so liveness is
+/// decided only by `kill -0` on its PID.
 pub fn live_sessions() -> Vec<ClaudeSession> {
     let entries = match fs::read_dir(sessions_dir()) {
         Ok(entries) => entries,
@@ -60,7 +59,6 @@ pub fn transcript_path(session_id: &str, cwd: &str) -> PathBuf {
 
 pub fn scan_sessions() -> Vec<ClaudeSession> {
     let dir = sessions_dir();
-    cleanup_stale_sessions(&dir);
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
         Err(_) => return Vec::new(),
@@ -307,55 +305,6 @@ fn cwd_to_slug(cwd: &str) -> String {
         return "-".to_string();
     }
     trimmed.replace('/', "-")
-}
-
-/// Remove session JSON files for dead PIDs whose files are older than 24 hours.
-/// This prevents stale files from previous runs accumulating in ~/.claude/sessions/.
-fn cleanup_stale_sessions(dir: &std::path::Path) {
-    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
-    let now = std::time::SystemTime::now();
-
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let Ok(pid) = stem.parse::<u32>() else {
-            continue;
-        };
-
-        if pid_alive(pid) {
-            continue;
-        }
-
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        let Ok(age) = now.duration_since(modified) else {
-            continue;
-        };
-
-        if age > MAX_AGE {
-            crate::logger::log(
-                "DEBUG",
-                &format!(
-                    "cleaning stale session file: {} (PID {pid})",
-                    path.display()
-                ),
-            );
-            let _ = fs::remove_file(&path);
-        }
-    }
 }
 
 /// Whether `pid` is a running process. `kill(pid, 0)` returns 0 for a live
