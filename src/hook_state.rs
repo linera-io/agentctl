@@ -221,60 +221,32 @@ pub fn record_hook_event(payload: &serde_json::Value) -> io::Result<()> {
         return Ok(());
     };
 
-    // Sandbox session registry: when this hook fires inside an `sbx` sandbox,
-    // mirror the session into the host-shared registry so
-    // `claudectl --restore-sessions` can bring it back after `sbx rm`.
-    // Best-effort — registry I/O must never fail or block the hook path.
+    // Sandbox session registry: whenever any hook fires inside an `sbx` sandbox,
+    // reconcile the host-shared registry to claudectl's current live-session set
+    // for this sandbox. The file then always mirrors what the in-sandbox
+    // claudectl UI shows — idle sessions kept, finished/dead ones dropped — so
+    // `claudectl --restore-sessions` brings back exactly that set after
+    // `sbx rm`. `replace_slice` writes only when the set changes, so running on
+    // every event is cheap; best-effort so registry I/O never blocks the hook.
     if let Some(sandbox) = crate::sandbox_registry::current_sandbox() {
-        match event {
-            "SessionStart" => {
-                let cwd = payload
-                    .get("cwd")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let transcript = payload
-                    .get("transcript_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let _ = crate::sandbox_registry::upsert(
-                    &sandbox,
-                    crate::sandbox_registry::SessionEntry {
-                        session_id: session_id.clone(),
-                        cwd: cwd.to_string(),
-                        transcript: transcript.to_string(),
-                        started_at_ms: now_ms(),
-                        name: crate::discovery::session_name(&session_id),
-                    },
-                );
-            }
-            "Stop" => {
-                // A turn finished: refresh the `/rename` name (set after
-                // SessionStart) and, crucially, register the session if it's
-                // missing — a session whose SessionStart predated this writer
-                // (e.g. claudectl upgraded mid-session) is otherwise never
-                // tracked. `touch` writes only on a real change.
-                let cwd = payload
-                    .get("cwd")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let transcript = payload
-                    .get("transcript_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let _ = crate::sandbox_registry::touch(
-                    &sandbox,
-                    &session_id,
-                    cwd,
+        let entries = crate::discovery::live_sessions()
+            .into_iter()
+            .map(|session| {
+                let transcript =
+                    crate::discovery::transcript_path(&session.session_id, &session.cwd)
+                        .to_string_lossy()
+                        .into_owned();
+                let name = (!session.session_name.is_empty()).then_some(session.session_name);
+                crate::sandbox_registry::SessionEntry {
+                    session_id: session.session_id,
+                    cwd: session.cwd,
                     transcript,
-                    crate::discovery::session_name(&session_id),
-                    now_ms(),
-                );
-            }
-            "SessionEnd" => {
-                let _ = crate::sandbox_registry::remove_session(&session_id);
-            }
-            _ => {}
-        }
+                    started_at_ms: session.started_at,
+                    name,
+                }
+            })
+            .collect();
+        let _ = crate::sandbox_registry::replace_slice(&sandbox, entries);
     }
 
     // SessionEnd is the one event that removes state instead of updating it.

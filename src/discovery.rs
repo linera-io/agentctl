@@ -17,35 +17,45 @@ pub fn projects_dir() -> PathBuf {
     dirs_home().join(".claude").join("projects")
 }
 
-/// The `/rename` display name of a live session, read from its session-pointer
-/// JSON. Those files are named by PID (not session id), so we scan the sessions
-/// directory and match on the `sessionId` field. Returns `None` when the
-/// session isn't currently live or has no name. Unlike [`scan_sessions`] this
-/// has no side effects — it never deletes stale files — so it's safe to call
-/// from a hook.
-pub fn session_name(session_id: &str) -> Option<String> {
-    let dir = sessions_dir();
-    for dir_entry in fs::read_dir(dir).ok()?.flatten() {
-        let Ok(content) = fs::read_to_string(dir_entry.path()) else {
+/// The live sessions to mirror into the restore registry: every session with a
+/// running process. Idle time is irrelevant — if the process is alive, the
+/// session is kept, forever.
+///
+/// This READS the session-pointer JSONs and never deletes any of them (unlike
+/// [`scan_sessions`], which runs `cleanup_stale_sessions`). The registry writer
+/// must never touch a user's session files — a session is a live process, not a
+/// timestamp, so liveness is decided only by `kill -0` on its PID.
+pub fn live_sessions() -> Vec<ClaudeSession> {
+    let entries = match fs::read_dir(sessions_dir()) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut sessions = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&path) else {
             continue;
         };
-        if let Some(name) = name_if_session_matches(&content, session_id) {
-            return Some(name);
+        let Ok(raw) = serde_json::from_str::<RawSession>(&content) else {
+            continue;
+        };
+        if pid_alive(raw.pid) {
+            sessions.push(ClaudeSession::from_raw(raw));
         }
     }
-    None
+    sessions
 }
 
-/// Extract the non-empty `name` from one session-pointer JSON iff its
-/// `sessionId` matches `target`. Pure — unit-tested.
-fn name_if_session_matches(content: &str, target: &str) -> Option<String> {
-    let raw: RawSession = serde_json::from_str(content).ok()?;
-    if raw.session_id != target {
-        return None;
-    }
-    raw.name
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty())
+/// Canonical transcript path for a session:
+/// `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`. Recorded in the restore
+/// registry so restore can check resumability.
+pub fn transcript_path(session_id: &str, cwd: &str) -> PathBuf {
+    projects_dir()
+        .join(cwd_to_slug(cwd))
+        .join(format!("{session_id}.jsonl"))
 }
 
 pub fn scan_sessions() -> Vec<ClaudeSession> {
@@ -348,8 +358,10 @@ fn cleanup_stale_sessions(dir: &std::path::Path) {
     }
 }
 
+/// Whether `pid` is a running process. `kill(pid, 0)` returns 0 for a live
+/// process; pid 0 is rejected since it would signal the whole process group.
 fn pid_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    pid != 0 && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
 }
 
 #[cfg(test)]
@@ -357,23 +369,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn name_extracted_only_when_session_id_matches() {
-        let json =
-            r#"{"pid":45276,"sessionId":"abc","cwd":"/x","startedAt":1,"name":"mimir-timeouts"}"#;
-        assert_eq!(
-            name_if_session_matches(json, "abc"),
-            Some("mimir-timeouts".to_string())
-        );
-        assert_eq!(name_if_session_matches(json, "other"), None);
+    fn pid_alive_true_for_self_false_for_zero_and_bogus() {
+        assert!(pid_alive(std::process::id()));
+        assert!(!pid_alive(0));
+        // A very high pid is almost certainly not a running process.
+        assert!(!pid_alive(2_000_000_000));
     }
 
     #[test]
-    fn name_absent_or_blank_yields_none() {
-        let unnamed = r#"{"pid":1,"sessionId":"abc","cwd":"/x","startedAt":1}"#;
-        assert_eq!(name_if_session_matches(unnamed, "abc"), None);
-        let blank = r#"{"pid":1,"sessionId":"abc","cwd":"/x","startedAt":1,"name":"  "}"#;
-        assert_eq!(name_if_session_matches(blank, "abc"), None);
-        assert_eq!(name_if_session_matches("not json", "abc"), None);
+    fn transcript_path_uses_cwd_slug_and_session_id() {
+        let path = transcript_path("abc-123", "/Users/ndr/work");
+        let rendered = path.to_string_lossy();
+        assert!(
+            rendered.ends_with("/projects/-Users-ndr-work/abc-123.jsonl"),
+            "{rendered}"
+        );
     }
 
     #[test]
