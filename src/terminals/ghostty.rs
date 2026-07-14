@@ -1,10 +1,5 @@
-use super::run_osascript;
+use super::{applescript_escape, run_osascript};
 use crate::session::ClaudeSession;
-
-/// Escape a string for embedding inside an AppleScript double-quoted literal.
-fn applescript_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
 
 /// Find the best matching Ghostty terminal for a session.
 ///

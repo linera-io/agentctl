@@ -1,5 +1,29 @@
 use crate::session::ClaudeSession;
 
+/// Open a new tmux window running `command` in `cwd`, in the current session
+/// (restore runs inside tmux — `detect_terminal` returns `Tmux` only when
+/// `$TMUX` is set). tmux runs `command` via the shell; `cwd`/`command` are argv
+/// tokens, and the restore path allowlist-validates the session id, so the
+/// command carries no metacharacters.
+pub fn spawn_window(cwd: &str, command: &str) -> Result<String, String> {
+    let output = std::process::Command::new("tmux")
+        .args(spawn_argv(cwd, command))
+        .output()
+        .map_err(|e| format!("tmux new-window failed: {e}"))?;
+
+    if output.status.success() {
+        Ok("tmux window".into())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn spawn_argv(cwd: &str, command: &str) -> Vec<String> {
+    ["new-window", "-c", cwd, command]
+        .map(String::from)
+        .to_vec()
+}
+
 pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<String, String> {
     let mut parts = vec!["claude".to_string()];
     parts.extend(
@@ -77,4 +101,18 @@ pub fn send_input(session: &ClaudeSession, text: &str) -> Result<(), String> {
     }
 
     Err("TTY not found in tmux".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_argv_opens_a_window_in_cwd_running_the_command() {
+        let argv = spawn_argv("/work/scylla", "claude --resume abc123");
+        assert_eq!(
+            argv,
+            ["new-window", "-c", "/work/scylla", "claude --resume abc123"]
+        );
+    }
 }
