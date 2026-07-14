@@ -138,17 +138,24 @@ pub(crate) struct Cli {
     #[arg(long, help_heading = "Session Management")]
     pub(crate) resume: Option<String>,
 
+    /// Restore your local (laptop) Claude sessions — e.g. after a Ghostty
+    /// restart-to-update — spawning one window per session that was live,
+    /// each running `claude --resume <id>` in its recorded directory. No
+    /// argument; pair with --dry-run to preview.
+    #[arg(long = "restore-sessions", help_heading = "Session Management")]
+    pub(crate) restore_sessions: bool,
+
     /// Restore sandbox Claude sessions after `sbx rm`: spawn one window per
     /// session that was live at teardown, each running `sc --resume <id>` in
     /// its recorded directory. Optionally name a sandbox; omit to auto-pick
     /// (or choose when several are registered). Pair with --dry-run to preview.
     #[arg(
-        long = "restore-sessions",
+        long = "restore-sbx-sessions",
         num_args = 0..=1,
         default_missing_value = "",
         help_heading = "Session Management"
     )]
-    pub(crate) restore_sessions: Option<String>,
+    pub(crate) restore_sbx_sessions: Option<String>,
 
     // ── Budget & Notifications ─────────────────────────────────────────
     /// Per-session budget in USD. Alert at 80%, optionally kill at 100%.
@@ -558,8 +565,12 @@ fn run_main(cli: Cli) -> io::Result<()> {
         return commands::launch_session(&cli.cwd, cli.prompt.as_deref(), cli.resume.as_deref());
     }
 
-    if let Some(ref sandbox) = cli.restore_sessions {
-        return commands::restore_sessions(sandbox, cli.dry_run);
+    if cli.restore_sessions {
+        return commands::restore_local_sessions(cli.dry_run);
+    }
+
+    if let Some(ref sandbox) = cli.restore_sbx_sessions {
+        return commands::restore_sandbox_sessions(sandbox, cli.dry_run);
     }
 
     if cli.summary {

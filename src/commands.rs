@@ -43,27 +43,51 @@ pub(crate) fn launch_session(
     }
 }
 
-/// `--restore-sessions [name]`: bring back sandbox Claude sessions after
-/// `sbx rm`. Reads the host-shared registry (`sandbox_registry`), resolves
-/// which sandbox(es) to restore, and spawns one terminal window per session
-/// running `sc --resume <id>` in its recorded directory. With `--dry-run` (or
-/// a terminal that can't spawn windows) it prints the commands instead.
-pub(crate) fn restore_sessions(sandbox_arg: &str, dry_run: bool) -> io::Result<()> {
+/// `--restore-sessions`: bring back your local (laptop) Claude sessions — e.g.
+/// after a Ghostty restart-to-update — spawning one window per session that was
+/// live, each running `claude --resume <id>` in its recorded directory. Reads
+/// the local registry (`local-sessions.json`), maintained by every host hook.
+pub(crate) fn restore_local_sessions(dry_run: bool) -> io::Result<()> {
+    let entries = sandbox_registry::load_local().sessions;
+    if entries.is_empty() {
+        println!("No local sessions registered — nothing to restore.");
+        return Ok(());
+    }
+
+    // A local session is "already running" if a live process still holds its id:
+    // either one a prior restore relaunched (visible via its `--resume <id>`
+    // argv) or — unlike the post-`sbx rm` sandbox flow — a fresh-started `claude`
+    // that never left (no `--resume` argv, so only its live pointer file betrays
+    // it). Union both, or restoring while sessions are up would open a second
+    // window against a live id and double-write its transcript.
+    let mut running = running_resumed_ids();
+    running.extend(discovery::live_sessions().into_iter().map(|s| s.session_id));
+
+    let can_spawn = terminals::can_spawn_command_window();
+    println!("Restoring {} local session(s):", entries.len());
+    let (spawned, skipped) = restore_slice(&entries, "claude", &running, can_spawn, dry_run);
+    report_restore(spawned, skipped, can_spawn, dry_run);
+    Ok(())
+}
+
+/// `--restore-sbx-sessions [name]`: bring back sandbox Claude sessions after
+/// `sbx rm`, spawning one window per session running `sc --resume <id>` in its
+/// recorded directory. Resolves which sandbox(es) to restore (a name, `all`, or
+/// an interactive pick). With `--dry-run` (or a terminal that can't spawn
+/// windows) it prints the commands instead.
+pub(crate) fn restore_sandbox_sessions(sandbox_arg: &str, dry_run: bool) -> io::Result<()> {
     let registry = sandbox_registry::load();
     if registry.sandboxes.is_empty() {
         println!("No sandbox sessions registered — nothing to restore.");
         return Ok(());
     }
-
     let targets = select_sandboxes(&registry, sandbox_arg)?;
     if targets.is_empty() {
         return Ok(());
     }
 
-    let can_spawn = terminals::can_spawn_command_window();
-    // Session ids already being resumed in the host process table, so we don't
-    // open a second window for a session that's already running/restored.
     let running = running_resumed_ids();
+    let can_spawn = terminals::can_spawn_command_window();
     let mut spawned = 0usize;
     let mut skipped = 0usize;
 
@@ -76,71 +100,89 @@ pub(crate) fn restore_sessions(sandbox_arg: &str, dry_run: bool) -> io::Result<(
             eprintln!("  '{sandbox}': no sessions registered");
             continue;
         };
-
         println!("Restoring {} session(s) from '{sandbox}':", entries.len());
-        for entry in entries {
-            // The id is interpolated into a `sc --resume <id>` command that the
-            // terminal runs via `bash -lc`, so reject anything outside the
-            // Claude Code UUID charset — defense against a tampered or corrupt
-            // registry injecting shell metacharacters, and a corruption signal
-            // in its own right.
-            if !is_valid_session_id(&entry.session_id) {
-                eprintln!(
-                    "  [skip] {:?}: unexpected characters in session id",
-                    entry.session_id
-                );
+        let (slice_spawned, slice_skipped) =
+            restore_slice(entries, "sc", &running, can_spawn, dry_run);
+        spawned += slice_spawned;
+        skipped += slice_skipped;
+    }
+
+    report_restore(spawned, skipped, can_spawn, dry_run);
+    Ok(())
+}
+
+/// Spawn (or, with `--dry-run` / a non-spawning terminal, print) one
+/// `<resume_binary> --resume <id>` window per entry, in its recorded cwd —
+/// `resume_binary` is `claude` for local sessions, `sc` for sandbox ones.
+/// Skips invalid ids, already-running sessions, and missing transcripts;
+/// returns `(spawned, skipped)`.
+fn restore_slice(
+    entries: &[sandbox_registry::SessionEntry],
+    resume_binary: &str,
+    running: &HashSet<String>,
+    can_spawn: bool,
+    dry_run: bool,
+) -> (usize, usize) {
+    let mut spawned = 0usize;
+    let mut skipped = 0usize;
+    for entry in entries {
+        // The id is interpolated into a `<binary> --resume <id>` command the
+        // terminal runs via `bash -lc`, so reject anything outside the Claude
+        // Code UUID charset — shell-injection defense + corruption signal.
+        if !is_valid_session_id(&entry.session_id) {
+            eprintln!(
+                "  [skip] {:?}: unexpected characters in session id",
+                entry.session_id
+            );
+            skipped += 1;
+            continue;
+        }
+        // Don't open a second window for a session already being resumed.
+        if running.contains(&entry.session_id) {
+            println!("  [skip] {}: already running", entry_label(entry));
+            skipped += 1;
+            continue;
+        }
+        // No transcript → not resumable; skip rather than open an erroring window.
+        if !entry.transcript.is_empty() && !Path::new(&entry.transcript).exists() {
+            eprintln!(
+                "  [skip] {} ({}): transcript missing",
+                entry_label(entry),
+                entry.cwd
+            );
+            skipped += 1;
+            continue;
+        }
+
+        let cwd = resolve_cwd(&entry.cwd);
+        let command = format!("{resume_binary} --resume {}", entry.session_id);
+
+        if dry_run || !can_spawn {
+            let note = if dry_run {
+                ""
+            } else {
+                "   (this terminal can't spawn windows — run it manually)"
+            };
+            println!("  {}  {cwd}\n      $ {command}{note}", entry_label(entry));
+            continue;
+        }
+
+        match terminals::spawn_command_window(&cwd, &command) {
+            Ok(term) => {
+                println!("  ↻ {}  {cwd}  ({term})", entry_label(entry));
+                spawned += 1;
+            }
+            Err(error) => {
+                eprintln!("  [fail] {}: {error}", entry_label(entry));
                 skipped += 1;
-                continue;
-            }
-
-            // Don't restore a session that's already up (from a previous restore
-            // or a manual `sc --resume`).
-            if running.contains(&entry.session_id) {
-                println!("  [skip] {}: already running", entry_label(entry));
-                skipped += 1;
-                continue;
-            }
-
-            // A resume needs the JSONL transcript, which lives on the shared
-            // ~/.claude mount and normally survives `sbx rm`. If it's gone the
-            // session can't be resumed — skip it rather than open a window that
-            // immediately errors.
-            if !entry.transcript.is_empty() && !Path::new(&entry.transcript).exists() {
-                eprintln!(
-                    "  [skip] {} ({}): transcript missing",
-                    entry_label(entry),
-                    entry.cwd
-                );
-                skipped += 1;
-                continue;
-            }
-
-            let cwd = resolve_cwd(&entry.cwd);
-            let command = format!("sc --resume {}", entry.session_id);
-
-            if dry_run || !can_spawn {
-                let note = if dry_run {
-                    ""
-                } else {
-                    "   (this terminal can't spawn windows — run it manually)"
-                };
-                println!("  {}  {cwd}\n      $ {command}{note}", entry_label(entry));
-                continue;
-            }
-
-            match terminals::spawn_command_window(&cwd, &command) {
-                Ok(term) => {
-                    println!("  ↻ {}  {cwd}  ({term})", entry_label(entry));
-                    spawned += 1;
-                }
-                Err(error) => {
-                    eprintln!("  [fail] {}: {error}", entry_label(entry));
-                    skipped += 1;
-                }
             }
         }
     }
+    (spawned, skipped)
+}
 
+/// One-line summary after a real (non-dry-run, spawning) restore.
+fn report_restore(spawned: usize, skipped: usize, can_spawn: bool, dry_run: bool) {
     if !dry_run && can_spawn {
         let tail = if skipped > 0 {
             format!(" ({skipped} skipped)")
@@ -149,7 +191,6 @@ pub(crate) fn restore_sessions(sandbox_arg: &str, dry_run: bool) -> io::Result<(
         };
         println!("Restored {spawned} session(s){tail}.");
     }
-    Ok(())
 }
 
 /// First 8 chars of a session id — enough to eyeball, short enough to scan.
@@ -169,9 +210,9 @@ fn entry_label(entry: &sandbox_registry::SessionEntry) -> String {
 /// Session ids currently being resumed anywhere in the host process table. A
 /// restored (or manually `sc --resume`d) session shows up as `sbx exec … claude
 /// --resume <id>`, so `--resume <id>` in any process's args means it's already
-/// up. (Sessions started fresh, without `--resume`, carry no id in their args
-/// and so aren't detected — restore is a post-`sbx rm` tool where nothing is
-/// running anyway.)
+/// up. Fresh-started sessions carry no id in their args and so aren't detected
+/// here; the sandbox restore flow runs post-`sbx rm` (nothing live), while the
+/// local flow unions this with `discovery::live_sessions()` to catch them.
 fn running_resumed_ids() -> HashSet<String> {
     match std::process::Command::new("ps")
         .args(["-axo", "args="])
@@ -1280,7 +1321,7 @@ mod tests {
         let ps = "\
 root  sbx exec -it linera-agent bash -lc sc --resume aaaa-1111\n\
 root  /bin/bash -lc sc --resume bbbb-2222\n\
-root  claudectl --restore-sessions linera-agent\n\
+root  claudectl --restore-sbx-sessions linera-agent\n\
 root  --resume\n";
         let ids = resumed_ids_in(ps);
         assert!(ids.contains("aaaa-1111"));

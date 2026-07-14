@@ -221,14 +221,15 @@ pub fn record_hook_event(payload: &serde_json::Value) -> io::Result<()> {
         return Ok(());
     };
 
-    // Sandbox session registry: whenever any hook fires inside an `sbx` sandbox,
-    // reconcile the host-shared registry to claudectl's current live-session set
-    // for this sandbox. The file then always mirrors what the in-sandbox
-    // claudectl UI shows — idle sessions kept, finished/dead ones dropped — so
-    // `claudectl --restore-sessions` brings back exactly that set after
-    // `sbx rm`. `replace_slice` writes only when the set changes, so running on
-    // every event is cheap; best-effort so registry I/O never blocks the hook.
-    if let Some(sandbox) = crate::sandbox_registry::current_sandbox() {
+    // Session registry: whenever any hook fires, reconcile the registry to
+    // claudectl's current live-session set. The file then always mirrors what
+    // claudectl shows here — idle sessions kept, dead ones dropped — so
+    // `--restore-sessions` (host) / `--restore-sbx-sessions` bring back exactly
+    // that set after a Ghostty restart / `sbx rm`. We route on the sandbox
+    // marker (not a slice name), so a sandbox can never write the host's file.
+    // Reconcile writes only when the set changes, so running on every event is
+    // cheap; best-effort so registry I/O never blocks the hook.
+    {
         let entries = crate::discovery::live_sessions()
             .into_iter()
             .map(|session| {
@@ -246,7 +247,10 @@ pub fn record_hook_event(payload: &serde_json::Value) -> io::Result<()> {
                 }
             })
             .collect();
-        let _ = crate::sandbox_registry::replace_slice(&sandbox, entries);
+        let _ = match crate::sandbox_registry::current_sandbox() {
+            Some(sandbox) => crate::sandbox_registry::replace_sandbox_slice(&sandbox, entries),
+            None => crate::sandbox_registry::replace_local(entries),
+        };
     }
 
     // SessionEnd is the one event that removes state instead of updating it.

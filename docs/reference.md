@@ -89,7 +89,8 @@ Multi-signal inference from CPU usage, JSONL events, and timestamps:
 | `--cwd <path>` | Working directory for the new session (default: `.`) |
 | `--prompt <text>` | Prompt to send to the new session |
 | `--resume <session-id>` | Resume a previous session by ID |
-| `--restore-sessions [sandbox]` | Restore agent-sandbox sessions after `sbx rm`: spawn one window per session that was live at teardown, each running `sc --resume <id>`. Omit the name to auto-pick (or choose when several sandboxes are registered); pair with `--dry-run` to preview |
+| `--restore-sessions` | Restore your local (laptop) Claude sessions — e.g. after a Ghostty restart-to-update — spawning one window per session that was live, each running `claude --resume <id>` in its recorded directory. No argument; pair with `--dry-run` to preview |
+| `--restore-sbx-sessions [sandbox]` | Restore agent-sandbox sessions after `sbx rm`: spawn one window per session that was live at teardown, each running `sc --resume <id>`. Omit the name to auto-pick (or choose when several sandboxes are registered); pair with `--dry-run` to preview |
 
 ### Budget & Notifications
 

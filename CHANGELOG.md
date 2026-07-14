@@ -14,23 +14,36 @@ All notable changes to claudectl are documented here.
   Claude Code owns those files.
 
 ### Changed
-- **Sandbox restore registry now mirrors live processes.** Instead of adding on
+- **Restore registry now mirrors live processes.** Instead of adding on
   `SessionStart` / removing on `SessionEnd` / self-healing on `Stop` (which
-  drifted names to garbage and accumulated stale entries), the in-sandbox hook
-  now reconciles the registry to claudectl's live-session set on every event: a
-  session is tracked iff its process is alive (`kill -0`), idle time is
-  irrelevant, names are read straight from the session JSON, and — critically —
-  the writer never deletes a session file. `upsert`/`touch`/`remove_session` are
-  replaced by a single `replace_slice`.
+  drifted names to garbage and accumulated stale entries), every hook — host or
+  in-sandbox — now reconciles its slice of the registry to claudectl's
+  live-session set on every event: a session is tracked iff its process is alive
+  (`kill -0`), idle time is irrelevant, names are read straight from the session
+  JSON, and — critically — the writer never deletes a session file.
+  `upsert`/`touch`/`remove_session` are replaced by a single reconcile step
+  (`replace_local` on the host, `replace_sandbox_slice` inside a sandbox, routed
+  on the sandbox marker so the two never share a file).
 
 ### Added
-- **`--restore-sessions [sandbox]`** — bring back Linera agent-sandbox Claude
-  sessions after `sbx rm`. `SessionStart`/`SessionEnd` hooks now mirror each
-  in-sandbox session into a host-shared registry
-  (`~/.local/share/claudectl/sandbox-sessions.json`), and `--restore-sessions`
+- **`--restore-sessions`** — bring back your local (laptop) Claude sessions,
+  e.g. after a Ghostty "Restart to Complete Update" drops every window. Host
+  hooks mirror each live local session into `~/.local/share/claudectl/`
+  `local-sessions.json`, and `--restore-sessions` (no argument) spawns one
+  window per session running `claude --resume <id>` in its recorded directory.
+  The local and sandbox registries are separate files with separate locks, so
+  host and in-sandbox writers never contend.
+  - Skips any session that still has a live process (whether started fresh or
+    already resumed), so running it while sessions are up never opens a second
+    window against a live session id.
+- **`--restore-sbx-sessions [sandbox]`** — bring back Linera agent-sandbox
+  Claude sessions after `sbx rm`. `SessionStart`/`SessionEnd` hooks now mirror
+  each in-sandbox session into a host-shared registry
+  (`~/.local/share/claudectl/sandbox-sessions.json`), and `--restore-sbx-sessions`
   spawns one terminal window per live-at-teardown session running
   `sc --resume <id>` in its recorded directory (Ghostty on macOS; other
   terminals print the commands). Pair with `--dry-run` to preview.
+  (Renamed from `--restore-sessions`, which now restores local sessions.)
   - The registry now stores each session's `/rename` name (captured in-sandbox
     on `SessionStart` and refreshed on `Stop`, since the name lives in the
     container-local session JSON that `sbx rm` destroys), so restore shows
