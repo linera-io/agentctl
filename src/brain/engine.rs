@@ -425,6 +425,10 @@ impl BrainEngine {
         sessions: &[ClaudeSession],
         lifecycle: &crate::config::LifecycleConfig,
         is_idle: bool,
+        // Injected so tests can exercise the restart *decision* without spawning
+        // a real terminal window. Production wiring passes
+        // `crate::terminals::launch_session`.
+        launch: impl Fn(&str, Option<&str>, Option<&str>) -> Result<String, String>,
     ) -> Vec<(u32, String)> {
         if !lifecycle.auto_restart {
             return Vec::new();
@@ -473,8 +477,8 @@ impl BrainEngine {
                 crate::logger::log("BRAIN", &format!("Checkpoint save failed: {e}"));
             }
 
-            // Spawn fresh session
-            match crate::terminals::launch_session(&session.cwd, Some(&summary), None) {
+            // Spawn fresh session via the injected launcher.
+            match launch(&session.cwd, Some(&summary), None) {
                 Ok(msg) => {
                     self.restarted_pids.insert(session.pid);
                     actions.push((
@@ -780,6 +784,17 @@ mod tests {
     use super::*;
     use crate::session::{RawSession, TelemetryStatus};
 
+    /// Launcher stub for lifecycle tests: records the call as "success" without
+    /// touching the real terminal. NEVER let a test invoke the real
+    /// `terminals::launch_session` — it spawns an actual window on the host.
+    fn stub_launch(
+        _cwd: &str,
+        _prompt: Option<&str>,
+        _resume: Option<&str>,
+    ) -> Result<String, String> {
+        Ok("stub launch".to_string())
+    }
+
     fn make_config() -> BrainConfig {
         BrainConfig {
             enabled: true,
@@ -952,7 +967,7 @@ mod tests {
         s.context_tokens = 50_000;
         s.context_max = 200_000;
 
-        let actions = engine.maybe_restart_saturated(&[s], &config, true);
+        let actions = engine.maybe_restart_saturated(&[s], &config, true, stub_launch);
         assert!(actions.is_empty());
     }
 
@@ -968,7 +983,7 @@ mod tests {
         s.context_tokens = 190_000;
         s.context_max = 200_000;
 
-        let actions = engine.maybe_restart_saturated(&[s], &config, true);
+        let actions = engine.maybe_restart_saturated(&[s], &config, true, stub_launch);
         assert!(!actions.is_empty());
         assert!(actions[0].1.contains("Lifecycle:"));
     }
@@ -986,7 +1001,7 @@ mod tests {
         s.context_tokens = 190_000;
         s.context_max = 200_000;
 
-        let actions = engine.maybe_restart_saturated(&[s], &config, true);
+        let actions = engine.maybe_restart_saturated(&[s], &config, true, stub_launch);
         assert!(actions.is_empty(), "Should skip already-restarted PID");
     }
 
@@ -1002,7 +1017,7 @@ mod tests {
         s.context_tokens = 190_000;
         s.context_max = 200_000;
 
-        let actions = engine.maybe_restart_saturated(&[s], &config, false);
+        let actions = engine.maybe_restart_saturated(&[s], &config, false, stub_launch);
         assert!(actions.is_empty());
     }
 
@@ -1014,7 +1029,7 @@ mod tests {
         s.context_tokens = 190_000;
         s.context_max = 200_000;
 
-        let actions = engine.maybe_restart_saturated(&[s], &config, true);
+        let actions = engine.maybe_restart_saturated(&[s], &config, true, stub_launch);
         assert!(actions.is_empty());
     }
 
