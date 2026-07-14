@@ -1,27 +1,32 @@
-//! Cross-teardown registry of live Claude Code sessions running inside an
-//! `sbx` agent sandbox.
+//! Cross-teardown registry of live Claude Code sessions, so they can be
+//! restored after the thing they were running in goes away.
 //!
-//! Sandbox sessions (launched via `sc`) run inside an ephemeral `sbx` microVM,
-//! but their Claude Code transcripts (`~/.claude`) and this registry
-//! (`~/.local/share/claudectl`) live on host-shared bind mounts, so both
-//! survive `sbx rm`. On every `SessionStart` / `SessionEnd` hook that fires
-//! *inside a sandbox*, `hook_state::record_hook_event` upserts / removes the
-//! session here, keyed by the sandbox name.
+//! Two flavors, in two files under the host-shared `~/.local/share/claudectl`
+//! mount:
+//!   - `local-sessions.json` — laptop sessions, restored with `claude --resume`
+//!     by `--restore-sessions` (e.g. after a Ghostty restart-to-update).
+//!   - `sandbox-sessions.json` — `sbx`-sandbox sessions, keyed by sandbox name,
+//!     restored with `sc --resume` by `--restore-sbx-sessions` after `sbx rm`.
+//!     Sandbox transcripts (`~/.claude`) and this registry both live on
+//!     host-shared bind mounts, so both survive `sbx rm`.
 //!
-//! The payoff: an abrupt `sbx rm` never fires `SessionEnd`, so that sandbox's
-//! slice stays frozen at its last live state — exactly the set of sessions
-//! `claudectl --restore-sessions` brings back, one `sc --resume <id>` window
-//! each.
+//! On every hook, `hook_state::record_hook_event` reconciles to claudectl's
+//! current live-session set — routing on the sandbox marker
+//! ([`current_sandbox`]): [`replace_sandbox_slice`] inside a sandbox, else
+//! [`replace_local`]. A session is tracked iff its process is alive; the writer
+//! never deletes a session file. An abrupt teardown never fires `SessionEnd`, so
+//! the set stays frozen at its last live state — exactly what the matching
+//! restore command brings back.
 //!
-//! Writes are serialized with an advisory `flock` and committed via
-//! temp-file + atomic rename, so concurrent hook processes (many sessions
-//! starting/ending at once) never corrupt or tear the file.
+//! Each file has its own `.lock` sidecar; writes are serialized with an
+//! advisory `flock` and committed via temp-file + atomic rename, so concurrent
+//! hook processes never corrupt or tear a file.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -56,9 +61,9 @@ pub struct SessionEntry {
     /// Unix epoch milliseconds at `SessionStart`. Zero if unknown.
     #[serde(default)]
     pub started_at_ms: u64,
-    /// The session's `/rename` display name, captured from its (container-local)
-    /// session JSON so restore can show it after `sbx rm` destroys that JSON.
-    /// `None` until the session is named. See [`set_name`].
+    /// The session's `/rename` display name, read from its (container-local)
+    /// session JSON on each reconcile so restore can show it after `sbx rm`
+    /// destroys that JSON. `None` until the session is named.
     #[serde(default)]
     pub name: Option<String>,
 }
@@ -74,7 +79,7 @@ pub struct Registry {
 
 impl Default for Registry {
     // Hand-written (not derived): a derived `Default` would set `version` to 0,
-    // which `upsert` would then persist — the `serde(default)` only fills the
+    // which a write would then persist — the `serde(default)` only fills the
     // field when it's *absent* on read, not for `Default::default()`.
     fn default() -> Self {
         Registry {
@@ -84,10 +89,30 @@ impl Default for Registry {
     }
 }
 
+/// The local (laptop) session registry — a flat list, since there's only ever
+/// one machine's worth of sessions (no sandbox names to key by). Stored in its
+/// own file (`local-sessions.json`) so host hooks and the in-sandbox writer
+/// never share a file or lock.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LocalRegistry {
+    #[serde(default = "current_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub sessions: Vec<SessionEntry>,
+}
+
+impl Default for LocalRegistry {
+    fn default() -> Self {
+        LocalRegistry {
+            version: current_version(),
+            sessions: Vec::new(),
+        }
+    }
+}
+
 /// The sandbox this process is running inside, or `None` on the host.
 ///
-/// Returns `Some(name)` only when the sandbox marker env var is present, so
-/// host Claude sessions (which fire the same hooks) never touch the registry.
+/// Returns `Some(name)` only when the sandbox marker env var is present.
 pub fn current_sandbox() -> Option<String> {
     std::env::var_os(ENV_SANDBOX_MARKER)?;
     let name = std::env::var(ENV_SANDBOX_NAME)
@@ -98,41 +123,77 @@ pub fn current_sandbox() -> Option<String> {
     Some(name)
 }
 
-/// Path to the shared registry file. Honors `CLAUDECTL_SANDBOX_REGISTRY`
-/// (used by tests to avoid stomping the real file); otherwise the
-/// host-shared `~/.local/share/claudectl` mount.
-pub fn registry_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("CLAUDECTL_SANDBOX_REGISTRY") {
-        return PathBuf::from(path);
-    }
+fn registry_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".local/share/claudectl/sandbox-sessions.json")
+    home.join(".local/share/claudectl")
 }
 
-/// Read the registry. A missing or unparseable file yields an empty registry —
-/// callers treat "no registry" and "empty registry" identically, and a
-/// corrupt file should never block a restore attempt or a hook.
+/// Path to the sandbox registry file (`sandbox-sessions.json`). Honors
+/// `CLAUDECTL_SANDBOX_REGISTRY` (tests, to avoid stomping the real file).
+pub fn sandbox_registry_path() -> PathBuf {
+    std::env::var_os("CLAUDECTL_SANDBOX_REGISTRY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| registry_dir().join("sandbox-sessions.json"))
+}
+
+/// Path to the local (laptop) registry file (`local-sessions.json`). Honors
+/// `CLAUDECTL_LOCAL_REGISTRY` (tests).
+pub fn local_registry_path() -> PathBuf {
+    std::env::var_os("CLAUDECTL_LOCAL_REGISTRY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| registry_dir().join("local-sessions.json"))
+}
+
+/// Read the sandbox registry. A missing or unparseable file yields an empty
+/// registry — callers treat "no registry" and "empty registry" identically, and
+/// a corrupt file must never block a restore attempt or a hook.
 pub fn load() -> Registry {
-    match fs::read(registry_path()) {
+    match fs::read(sandbox_registry_path()) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => Registry::default(),
     }
 }
 
-/// Replace a sandbox's entire slice with `entries` — the current live-session
-/// set for that sandbox. This is the whole write model: the in-sandbox writer
-/// reconciles the registry to claudectl's live session list on each hook event,
-/// so the file always mirrors what the sandbox's claudectl UI shows (idle
-/// sessions included, dead ones dropped). An empty `entries` removes the
-/// sandbox key. Writes only when the slice actually changes, so it's cheap to
-/// call on every event.
-pub fn replace_slice(sandbox: &str, entries: Vec<SessionEntry>) -> io::Result<()> {
-    with_lock(|| {
+/// Read the local registry (same missing/corrupt tolerance as [`load`]).
+pub fn load_local() -> LocalRegistry {
+    match fs::read(local_registry_path()) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => LocalRegistry::default(),
+    }
+}
+
+/// Reconcile the machine's local (laptop) sessions to `entries` — the current
+/// live set on the host. The whole write model: a hook reconciles on every
+/// event, so the flat `local-sessions.json` always mirrors what claudectl shows
+/// (idle sessions included, dead ones dropped). Writes only when the set
+/// changes. The caller picks this vs [`replace_sandbox_slice`] on the sandbox
+/// marker ([`current_sandbox`]), so a sandbox can never mis-route here — even
+/// one named "host".
+pub fn replace_local(entries: Vec<SessionEntry>) -> io::Result<()> {
+    let path = local_registry_path();
+    with_lock(&path, || {
+        let mut registry = load_local();
+        if registry.sessions == entries {
+            return Ok(());
+        }
+        registry.sessions = entries;
+        write_atomic(&path, &serialize(&registry)?)
+    })
+}
+
+/// Reconcile one sandbox's slice (keyed by `sandbox` name) of
+/// `sandbox-sessions.json` to its current live set, same write model as
+/// [`replace_local`]. Empty `entries` removes the key. Other sandboxes' slices
+/// are untouched, and an abrupt `sbx rm` fires no further hooks, so the slice
+/// freezes at its last live state — exactly what `--restore-sbx-sessions`
+/// restores.
+pub fn replace_sandbox_slice(sandbox: &str, entries: Vec<SessionEntry>) -> io::Result<()> {
+    let path = sandbox_registry_path();
+    with_lock(&path, || {
         let mut registry = load();
-        let current = registry.sandboxes.get(sandbox);
-        let unchanged = match (current, entries.is_empty()) {
+        let unchanged = match (registry.sandboxes.get(sandbox), entries.is_empty()) {
             (None, true) => true,
             (Some(existing), false) => *existing == entries,
             _ => false,
@@ -145,29 +206,32 @@ pub fn replace_slice(sandbox: &str, entries: Vec<SessionEntry>) -> io::Result<()
         } else {
             registry.sandboxes.insert(sandbox.to_string(), entries);
         }
-        write_atomic(&registry)
+        write_atomic(&path, &serialize(&registry)?)
     })
 }
 
-/// Serialize `registry` and commit it via temp-file + atomic rename, so a
-/// reader never observes a half-written file.
-fn write_atomic(registry: &Registry) -> io::Result<()> {
-    let path = registry_path();
+/// Pretty JSON with a trailing newline.
+fn serialize<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Commit `bytes` to `path` via temp-file + atomic rename, so a reader never
+/// observes a half-written file.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut bytes = serde_json::to_vec_pretty(registry)?;
-    bytes.push(b'\n');
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, &bytes)?;
-    fs::rename(&tmp, &path)
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)
 }
 
-/// Run `body` while holding an exclusive advisory lock on a sidecar lock file,
-/// so concurrent hook processes serialize their read-modify-write cycles.
+/// Run `body` while holding an exclusive advisory lock on `path`'s sidecar lock
+/// file, so concurrent hook processes serialize their read-modify-write cycles.
 /// The lock releases when the file descriptor closes at the end of scope.
-fn with_lock<T>(body: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
-    let path = registry_path();
+fn with_lock<T>(path: &Path, body: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -223,7 +287,10 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             // SAFETY: env access here is serialized by the held `ENV_LOCK`.
-            unsafe { std::env::set_var("CLAUDECTL_SANDBOX_REGISTRY", dir.join("registry.json")) };
+            unsafe {
+                std::env::set_var("CLAUDECTL_SANDBOX_REGISTRY", dir.join("sandbox.json"));
+                std::env::set_var("CLAUDECTL_LOCAL_REGISTRY", dir.join("local.json"));
+            }
             TempRegistry { dir, _lock: lock }
         }
     }
@@ -231,7 +298,10 @@ mod tests {
     impl Drop for TempRegistry {
         fn drop(&mut self) {
             // SAFETY: still holding `ENV_LOCK` via `_lock`.
-            unsafe { std::env::remove_var("CLAUDECTL_SANDBOX_REGISTRY") };
+            unsafe {
+                std::env::remove_var("CLAUDECTL_SANDBOX_REGISTRY");
+                std::env::remove_var("CLAUDECTL_LOCAL_REGISTRY");
+            }
             let _ = fs::remove_dir_all(&self.dir);
         }
     }
@@ -254,9 +324,9 @@ mod tests {
     }
 
     #[test]
-    fn replace_slice_sets_and_roundtrips() {
+    fn replace_sandbox_slice_sets_and_roundtrips() {
         let _guard = TempRegistry::new("roundtrip");
-        replace_slice("linera-agent", vec![entry("aaa", "/work/a")]).unwrap();
+        replace_sandbox_slice("linera-agent", vec![entry("aaa", "/work/a")]).unwrap();
         let registry = load();
         let slice = registry.sandboxes.get("linera-agent").unwrap();
         assert_eq!(slice.len(), 1);
@@ -265,11 +335,13 @@ mod tests {
     }
 
     #[test]
-    fn replace_slice_overwrites_the_whole_slice() {
+    fn replace_sandbox_slice_overwrites_the_whole_slice() {
         let _guard = TempRegistry::new("overwrite");
-        replace_slice("linera-agent", vec![entry("aaa", "/a"), entry("bbb", "/b")]).unwrap();
+        replace_sandbox_slice("linera-agent", vec![entry("aaa", "/a"), entry("bbb", "/b")])
+            .unwrap();
         // New live set: "aaa" ended, "ccc" started.
-        replace_slice("linera-agent", vec![entry("bbb", "/b"), entry("ccc", "/c")]).unwrap();
+        replace_sandbox_slice("linera-agent", vec![entry("bbb", "/b"), entry("ccc", "/c")])
+            .unwrap();
         let registry = load();
         let ids: Vec<_> = registry
             .sandboxes
@@ -286,19 +358,19 @@ mod tests {
     }
 
     #[test]
-    fn replace_slice_empty_removes_the_sandbox() {
+    fn replace_sandbox_slice_empty_removes_the_sandbox() {
         let _guard = TempRegistry::new("empty");
-        replace_slice("linera-agent", vec![entry("aaa", "/a")]).unwrap();
-        replace_slice("linera-agent", vec![]).unwrap();
+        replace_sandbox_slice("linera-agent", vec![entry("aaa", "/a")]).unwrap();
+        replace_sandbox_slice("linera-agent", vec![]).unwrap();
         assert!(!load().sandboxes.contains_key("linera-agent"));
     }
 
     #[test]
-    fn replace_slice_keeps_sandboxes_independent() {
+    fn replace_sandbox_slice_keeps_sandboxes_independent() {
         let _guard = TempRegistry::new("independent");
-        replace_slice("linera-agent", vec![entry("aaa", "/a")]).unwrap();
-        replace_slice("pm-task", vec![entry("bbb", "/b")]).unwrap();
-        replace_slice("linera-agent", vec![]).unwrap();
+        replace_sandbox_slice("linera-agent", vec![entry("aaa", "/a")]).unwrap();
+        replace_sandbox_slice("pm-task", vec![entry("bbb", "/b")]).unwrap();
+        replace_sandbox_slice("linera-agent", vec![]).unwrap();
         let registry = load();
         assert!(!registry.sandboxes.contains_key("linera-agent"));
         assert_eq!(registry.sandboxes.get("pm-task").unwrap().len(), 1);
@@ -309,7 +381,7 @@ mod tests {
         let _guard = TempRegistry::new("name-roundtrip");
         let mut named = entry("aaa", "/a");
         named.name = Some("faucet-migration".to_string());
-        replace_slice("linera-agent", vec![named]).unwrap();
+        replace_sandbox_slice("linera-agent", vec![named]).unwrap();
         let registry = load();
         assert_eq!(
             registry.sandboxes.get("linera-agent").unwrap()[0]
@@ -317,6 +389,32 @@ mod tests {
                 .as_deref(),
             Some("faucet-migration")
         );
+    }
+
+    #[test]
+    fn local_and_sandbox_registries_are_independent() {
+        let _guard = TempRegistry::new("local-routing");
+        // Local and sandbox sessions live in separate files, written by
+        // separate functions — the host and a sandbox never share a slice.
+        replace_sandbox_slice("linera-agent", vec![entry("sbx", "/s")]).unwrap();
+        replace_local(vec![entry("loc", "/l")]).unwrap();
+
+        // The local sessions land in the flat local file, versioned like the sandbox one.
+        let local = load_local();
+        assert_eq!(local.version, current_version());
+        assert_eq!(local.sessions.len(), 1);
+        assert_eq!(local.sessions[0].session_id, "loc");
+
+        // ...and never appear in the sandbox registry, not even under a "host" key
+        // (a sandbox literally named "host" still routes to the sandbox file).
+        let sandbox = load();
+        assert!(!sandbox.sandboxes.contains_key("host"));
+        assert_eq!(sandbox.sandboxes.get("linera-agent").unwrap().len(), 1);
+
+        // Emptying the local set clears its file without touching the sandbox slice.
+        replace_local(vec![]).unwrap();
+        assert!(load_local().sessions.is_empty());
+        assert_eq!(load().sandboxes.get("linera-agent").unwrap().len(), 1);
     }
 
     #[test]

@@ -1177,8 +1177,9 @@ pub fn launch_session(
 }
 
 /// Spawn a brand-new terminal window that runs `command` in `cwd`, executed
-/// via a login shell so PATH (and thus `sbx` / `sc`) resolves. Used by
-/// `--restore-sessions` to relaunch `sc --resume <id>` after `sbx rm`.
+/// via a login shell so PATH (and thus `sbx` / `sc`) resolves. Used by the
+/// restore commands to relaunch `claude --resume` (`--restore-sessions`, local)
+/// or `sc --resume` (`--restore-sbx-sessions`, after `sbx rm`).
 ///
 /// Implemented for Ghostty on macOS — the terminal the agent sandbox runs in.
 /// Other terminals return `Err` so the caller can fall back to printing the
@@ -1198,8 +1199,8 @@ pub fn spawn_command_window(cwd: &str, command: &str) -> Result<String, String> 
 }
 
 /// Whether [`spawn_command_window`] can open a new window in the current
-/// terminal. `--restore-sessions` uses this to decide between spawning windows
-/// and printing the `sc --resume` commands for manual use.
+/// terminal. The restore commands use this to decide between spawning windows
+/// and printing the `--resume` commands for manual use.
 pub fn can_spawn_command_window() -> bool {
     matches!(detect_terminal(), Terminal::Ghostty) && cfg!(target_os = "macos")
 }
