@@ -245,7 +245,21 @@ fn supported_actions(terminal: &Terminal) -> Vec<TerminalAction> {
             TerminalAction::Approve,
         ],
         Terminal::WezTerm => vec![TerminalAction::Launch, TerminalAction::Switch],
-        Terminal::Ghostty | Terminal::Warp | Terminal::ITerm2 | Terminal::Apple => vec![
+        Terminal::Ghostty | Terminal::ITerm2 | Terminal::Apple => {
+            let mut actions = Vec::new();
+            // Visible launch works via the AppleScript spawn backends, which need
+            // a macOS host (that is where `osascript` lives).
+            if cfg!(target_os = "macos") {
+                actions.push(TerminalAction::Launch);
+            }
+            actions.extend([
+                TerminalAction::Switch,
+                TerminalAction::Input,
+                TerminalAction::Approve,
+            ]);
+            actions
+        }
+        Terminal::Warp => vec![
             TerminalAction::Switch,
             TerminalAction::Input,
             TerminalAction::Approve,
@@ -267,6 +281,20 @@ pub(crate) fn build_claude_args(prompt: Option<&str>, resume: Option<&str>) -> V
     args
 }
 
+/// A `claude …` invocation as a single shell command string, each argument
+/// shell-quoted (so a prompt with spaces or quotes stays one argument). Used by
+/// the launch backends that run a command string rather than an argv — tmux and
+/// the macOS AppleScript terminals.
+pub(crate) fn build_claude_command(prompt: Option<&str>, resume: Option<&str>) -> String {
+    let mut parts = vec!["claude".to_string()];
+    parts.extend(
+        build_claude_args(prompt, resume)
+            .iter()
+            .map(|arg| shell_escape(arg)),
+    );
+    parts.join(" ")
+}
+
 pub(crate) fn shell_escape(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\"'\"'"))
 }
@@ -280,9 +308,12 @@ pub(crate) fn applescript_escape(text: &str) -> String {
 /// An AppleScript expression that evaluates to a shell command string:
 /// `cd <cwd> && exec <command>`. `cwd` is shell-quoted at runtime via
 /// AppleScript's `quoted form of` (so spaces/quotes in a path are safe), and
-/// `command` is embedded after AppleScript-escaping — callers pass a command the
-/// restore path has already allowlist-validated (session id only), so it carries
-/// no shell metacharacters. Shared by the iTerm2 and Apple Terminal backends,
+/// `command` is embedded after AppleScript-escaping. `command` must arrive
+/// **already shell-quoted** by the caller — restore builds it from an
+/// allowlist-validated session id (`<binary> --resume <id>`), and launch builds
+/// it via [`build_claude_command`] (every arg `shell_escape`d) — so the
+/// AppleScript-escape layer only has to keep the shell string intact, not
+/// neutralize metacharacters. Shared by the iTerm2 and Apple Terminal backends,
 /// which run it via `do script` / `write text` respectively.
 pub(crate) fn applescript_cd_exec(cwd: &str, command: &str) -> String {
     format!(
@@ -968,15 +999,24 @@ fn doctor_report_for(terminal: Terminal) -> DoctorReport {
                     .to_string(),
             );
 
-            for action in supported_actions(&Terminal::Ghostty) {
-                actions.push(action_check(action, status, detail, fix.clone()));
-            }
+            let launch_detail = if apple_script_ready {
+                "Ghostty opens a new window running `claude` via its AppleScript API."
+            } else {
+                "Ghostty launch requires `osascript`."
+            };
             actions.push(action_check(
                 TerminalAction::Launch,
-                DoctorStatus::Unsupported,
-                "Visible launch is only implemented for tmux, Kitty, and WezTerm.",
-                None::<String>,
+                status,
+                launch_detail,
+                fix.clone(),
             ));
+            for action in [
+                TerminalAction::Switch,
+                TerminalAction::Input,
+                TerminalAction::Approve,
+            ] {
+                actions.push(action_check(action, status, detail, fix.clone()));
+            }
             notes.push("Ghostty does not need Kitty-style remote control setup, but macOS may still prompt for automation access.".to_string());
         }
         #[cfg(target_os = "macos")]
@@ -1013,12 +1053,38 @@ fn doctor_report_for(terminal: Terminal) -> DoctorReport {
             let system_events_ready = system_events_check.status == DoctorStatus::Ready;
             prerequisites.push(system_events_check);
 
-            actions.push(action_check(
-                TerminalAction::Launch,
-                DoctorStatus::Unsupported,
-                "Visible launch is only implemented for tmux, Kitty, and WezTerm.",
-                None::<String>,
-            ));
+            // Launch (iTerm2/Apple) uses the AppleScript spawn backend, which
+            // needs only `osascript` — not System Events. Warp has no launch
+            // backend, so it stays unsupported.
+            let launch_check = if matches!(terminal, Terminal::Warp) {
+                action_check(
+                    TerminalAction::Launch,
+                    DoctorStatus::Unsupported,
+                    "Visible launch is not implemented for Warp.",
+                    None::<String>,
+                )
+            } else if apple_script_ready {
+                action_check(
+                    TerminalAction::Launch,
+                    DoctorStatus::Ready,
+                    format!(
+                        "{} opens a new window running `claude` via AppleScript.",
+                        terminal_name(&terminal)
+                    ),
+                    None::<String>,
+                )
+            } else {
+                action_check(
+                    TerminalAction::Launch,
+                    DoctorStatus::Blocked,
+                    format!("{} launch requires `osascript`.", terminal_name(&terminal)),
+                    Some(
+                        "Ensure `/usr/bin/osascript` is available and rerun the doctor."
+                            .to_string(),
+                    ),
+                )
+            };
+            actions.push(launch_check);
 
             let status = if apple_script_ready && system_events_ready {
                 DoctorStatus::Ready
@@ -1101,8 +1167,17 @@ fn doctor_report_for(terminal: Terminal) -> DoctorReport {
                 )
             };
 
-            for action in [
+            // Visible launch in these AppleScript terminals needs a macOS host;
+            // the bridge only carries switch/input/approve control hooks, so
+            // launch stays unavailable on Linux/sandbox (matching
+            // `supported_actions`, which drops Launch off macOS).
+            actions.push(action_check(
                 TerminalAction::Launch,
+                DoctorStatus::Unsupported,
+                "Visible launch in this terminal is only available on a macOS host.",
+                None::<String>,
+            ));
+            for action in [
                 TerminalAction::Switch,
                 TerminalAction::Input,
                 TerminalAction::Approve,
@@ -1190,8 +1265,20 @@ pub fn launch_session(
         Terminal::Tmux => tmux::launch(cwd, prompt, resume),
         Terminal::WezTerm => wezterm::launch(cwd, prompt, resume),
         Terminal::WindowsTerm => windows_terminal::launch(cwd, prompt, resume),
+        // macOS terminals reuse the AppleScript spawn backends, running the
+        // built `claude …` command in a fresh window (same path restore uses).
+        // Gated to a macOS host so a Linux/sandbox build — where `detect_terminal`
+        // can still report a forwarded `TERM_PROGRAM` — falls through to the
+        // `other` arm's "not supported" message instead of the osa-bridge path,
+        // matching `supported_actions`/`spawn_window_supported`.
+        #[cfg(target_os = "macos")]
+        Terminal::Ghostty => ghostty::spawn_window(cwd, &build_claude_command(prompt, resume)),
+        #[cfg(target_os = "macos")]
+        Terminal::ITerm2 => iterm2::spawn_window(cwd, &build_claude_command(prompt, resume)),
+        #[cfg(target_os = "macos")]
+        Terminal::Apple => apple::spawn_window(cwd, &build_claude_command(prompt, resume)),
         other => Err(format!(
-            "Visible session launch is not supported in {}. Start `claude` manually, use tmux/Kitty/WezTerm/GNOME Terminal/Windows Terminal on WSL, or run `claudectl --doctor` for setup guidance.",
+            "Visible session launch is not supported in {}. Start `claude` manually, use Ghostty/iTerm2/Apple Terminal on macOS or tmux/Kitty/WezTerm/GNOME Terminal/Windows Terminal on Linux/WSL, or run `claudectl --doctor` for setup guidance.",
             terminal_name(&other)
         )),
     }
@@ -1592,6 +1679,36 @@ mod tests {
         assert_eq!(spawn_window_supported(&Terminal::Ghostty), expected);
         assert_eq!(spawn_window_supported(&Terminal::ITerm2), expected);
         assert_eq!(spawn_window_supported(&Terminal::Apple), expected);
+    }
+
+    #[test]
+    fn macos_terminals_advertise_launch_only_on_a_macos_host() {
+        // Launch reuses the AppleScript spawn backends, so it tracks the same
+        // macOS-host gate; Warp has no spawn backend and never launches.
+        let expected = cfg!(target_os = "macos");
+        for terminal in [Terminal::Ghostty, Terminal::ITerm2, Terminal::Apple] {
+            assert_eq!(
+                supported_actions(&terminal).contains(&TerminalAction::Launch),
+                expected,
+                "{terminal:?}"
+            );
+        }
+        assert!(!supported_actions(&Terminal::Warp).contains(&TerminalAction::Launch));
+    }
+
+    #[test]
+    fn build_claude_command_shell_escapes_every_arg() {
+        // Each argument is single-quoted, so a prompt with spaces stays one arg.
+        assert_eq!(
+            build_claude_command(Some("ship it"), Some("abc-123")),
+            "claude '--resume' 'abc-123' '-p' 'ship it'"
+        );
+        // A quote in the prompt is escaped, never terminates the argument.
+        assert_eq!(
+            build_claude_command(Some("don't"), None),
+            r#"claude '-p' 'don'"'"'t'"#
+        );
+        assert_eq!(build_claude_command(None, None), "claude");
     }
 
     #[test]

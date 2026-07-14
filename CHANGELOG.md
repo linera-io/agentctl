@@ -26,6 +26,12 @@ All notable changes to claudectl are documented here.
   on the sandbox marker so the two never share a file).
 
 ### Added
+- **`--new` / `n` can launch a visible session on macOS terminals.** Launching a
+  new (or resumed) session was Linux/WSL-only (GNOME Terminal, Kitty, WezTerm,
+  tmux, Windows Terminal). It now also works in **Ghostty**, **iTerm2**, and
+  **Apple Terminal** on macOS, reusing the AppleScript window-spawn backends: the
+  detected terminal opens a new window running `claude` in the target directory.
+  `--doctor` and the capability hint report launch readiness for these terminals.
 - **Session restore now spawns windows in more terminals.** Restore
   (`--restore-sessions` / `--restore-sbx-sessions`) previously opened a window
   per session only in Ghostty (macOS); every other terminal fell back to
