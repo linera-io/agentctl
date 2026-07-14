@@ -173,7 +173,16 @@ fn restore_slice(
                 spawned += 1;
             }
             Err(error) => {
+                // A nominally-supported terminal can still fail to spawn at
+                // runtime (Kitty without `allow_remote_control`, no running mux,
+                // a detached ssh session where the terminal binary is absent).
+                // Never lose the session: surface the error AND print the command
+                // so the user can paste it, exactly like the can't-spawn branch.
                 eprintln!("  [fail] {}: {error}", entry_label(entry));
+                println!(
+                    "  {}  {cwd}\n      $ {command}   (spawn failed — run it manually)",
+                    entry_label(entry)
+                );
                 skipped += 1;
             }
         }

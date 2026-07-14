@@ -26,6 +26,17 @@ All notable changes to claudectl are documented here.
   on the sandbox marker so the two never share a file).
 
 ### Added
+- **Session restore now spawns windows in more terminals.** Restore
+  (`--restore-sessions` / `--restore-sbx-sessions`) previously opened a window
+  per session only in Ghostty (macOS); every other terminal fell back to
+  printing the resume commands. It now spawns natively in **iTerm2** and
+  **Apple Terminal** on macOS (AppleScript, same host-direct / sandbox-osa-bridge
+  path as Ghostty), and in **GNOME Terminal**, **Kitty**, **WezTerm** (each via
+  its own CLI, wrapped in `bash -lc` so `PATH` resolves `claude`/`sc`) and
+  **tmux** (a new window inheriting claudectl's PATH). The detected terminal is
+  used automatically; anything still unsupported (Warp, Windows Terminal,
+  unknown) — or any terminal whose spawn fails at runtime (e.g. Kitty without
+  `allow_remote_control`) — falls back to printing the resume command to paste.
 - **`--restore-sessions`** — bring back your local (laptop) Claude sessions,
   e.g. after a Ghostty "Restart to Complete Update" drops every window. Host
   hooks mirror each live local session into `~/.local/share/claudectl/`

@@ -271,6 +271,27 @@ pub(crate) fn shell_escape(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\"'\"'"))
 }
 
+/// Escape a string for embedding inside an AppleScript double-quoted literal.
+/// Shared by the AppleScript terminal backends (Ghostty, iTerm2, Apple Terminal).
+pub(crate) fn applescript_escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// An AppleScript expression that evaluates to a shell command string:
+/// `cd <cwd> && exec <command>`. `cwd` is shell-quoted at runtime via
+/// AppleScript's `quoted form of` (so spaces/quotes in a path are safe), and
+/// `command` is embedded after AppleScript-escaping — callers pass a command the
+/// restore path has already allowlist-validated (session id only), so it carries
+/// no shell metacharacters. Shared by the iTerm2 and Apple Terminal backends,
+/// which run it via `do script` / `write text` respectively.
+pub(crate) fn applescript_cd_exec(cwd: &str, command: &str) -> String {
+    format!(
+        r#"("cd " & quoted form of "{}" & " && exec {}")"#,
+        applescript_escape(cwd),
+        applescript_escape(command),
+    )
+}
+
 pub fn detect_terminal() -> Terminal {
     if std::env::var("TMUX").is_ok() {
         return Terminal::Tmux;
@@ -1176,21 +1197,33 @@ pub fn launch_session(
     }
 }
 
-/// Spawn a brand-new terminal window that runs `command` in `cwd`, executed
-/// via a login shell so PATH (and thus `sbx` / `sc`) resolves. Used by the
+/// Spawn a brand-new terminal window that runs `command` in `cwd`. Used by the
 /// restore commands to relaunch `claude --resume` (`--restore-sessions`, local)
 /// or `sc --resume` (`--restore-sbx-sessions`, after `sbx rm`).
 ///
-/// Implemented for Ghostty on macOS — the terminal the agent sandbox runs in.
-/// Other terminals return `Err` so the caller can fall back to printing the
-/// command for the user to paste.
+/// Implemented for the terminals in [`spawn_window_supported`]: the macOS
+/// AppleScript terminals (Ghostty, iTerm2, Apple Terminal) and the Linux CLI
+/// terminals (GNOME Terminal, Kitty, WezTerm, tmux). Any other terminal returns
+/// `Err` so the caller can fall back to printing the command for the user to
+/// paste.
 ///
-/// `command` is interpreted by `bash -lc`, so callers must not build it from
-/// untrusted or unsanitized input (`cwd` is passed as a literal argv token and
-/// is not shell-interpreted).
+/// The GNOME Terminal / Kitty / WezTerm backends run `command` via `bash -lc`
+/// so PATH (and thus `sbx`/`sc`) resolves; tmux runs it in a new window with the
+/// PATH of the client that issued the restore (which is claudectl's own, so
+/// `claude`/`sc` resolve); the AppleScript backends `cd` into `cwd` then `exec`
+/// it. `command` is interpolated into a shell string, so callers must not build
+/// it from untrusted input — the restore path allowlist-validates the session id
+/// first, and `cwd` is either a literal argv token (Linux) or shell-quoted via
+/// AppleScript `quoted form of` (macOS).
 pub fn spawn_command_window(cwd: &str, command: &str) -> Result<String, String> {
     match detect_terminal() {
         Terminal::Ghostty => ghostty::spawn_window(cwd, command),
+        Terminal::ITerm2 => iterm2::spawn_window(cwd, command),
+        Terminal::Apple => apple::spawn_window(cwd, command),
+        Terminal::Gnome => gnome_terminal::spawn_window(cwd, command),
+        Terminal::Kitty => kitty::spawn_window(cwd, command),
+        Terminal::WezTerm => wezterm::spawn_window(cwd, command),
+        Terminal::Tmux => tmux::spawn_window(cwd, command),
         other => Err(format!(
             "window spawn is not implemented for {}",
             terminal_name(&other)
@@ -1202,7 +1235,19 @@ pub fn spawn_command_window(cwd: &str, command: &str) -> Result<String, String> 
 /// terminal. The restore commands use this to decide between spawning windows
 /// and printing the `--resume` commands for manual use.
 pub fn can_spawn_command_window() -> bool {
-    matches!(detect_terminal(), Terminal::Ghostty) && cfg!(target_os = "macos")
+    spawn_window_supported(&detect_terminal())
+}
+
+/// Terminals [`spawn_command_window`] can open a window in. The AppleScript
+/// terminals need a macOS host (that is where restore runs and where `osascript`
+/// lives); the CLI terminals drive a cross-platform binary, so they work on
+/// whichever host runs them.
+fn spawn_window_supported(terminal: &Terminal) -> bool {
+    match terminal {
+        Terminal::Ghostty | Terminal::ITerm2 | Terminal::Apple => cfg!(target_os = "macos"),
+        Terminal::Gnome | Terminal::Kitty | Terminal::WezTerm | Terminal::Tmux => true,
+        Terminal::Warp | Terminal::WindowsTerm | Terminal::Unknown(_) => false,
+    }
 }
 
 pub fn switch_to_terminal(session: &ClaudeSession) -> Result<(), String> {
@@ -1522,6 +1567,32 @@ fn dispatch_terminal_bridge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_terminals_support_window_spawn_on_any_host() {
+        // CLI-driven backends run a cross-platform binary, so they are supported
+        // regardless of the host OS.
+        assert!(spawn_window_supported(&Terminal::Gnome));
+        assert!(spawn_window_supported(&Terminal::Kitty));
+        assert!(spawn_window_supported(&Terminal::WezTerm));
+        assert!(spawn_window_supported(&Terminal::Tmux));
+    }
+
+    #[test]
+    fn terminals_without_a_spawn_backend_are_unsupported() {
+        assert!(!spawn_window_supported(&Terminal::Warp));
+        assert!(!spawn_window_supported(&Terminal::WindowsTerm));
+        assert!(!spawn_window_supported(&Terminal::Unknown("xterm".into())));
+    }
+
+    #[test]
+    fn applescript_terminals_track_the_macos_host_gate() {
+        // Ghostty/iTerm2/Apple drive AppleScript, which needs a macOS host.
+        let expected = cfg!(target_os = "macos");
+        assert_eq!(spawn_window_supported(&Terminal::Ghostty), expected);
+        assert_eq!(spawn_window_supported(&Terminal::ITerm2), expected);
+        assert_eq!(spawn_window_supported(&Terminal::Apple), expected);
+    }
 
     #[test]
     fn help_summary_lists_kitty_actions() {
