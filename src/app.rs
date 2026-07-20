@@ -895,21 +895,16 @@ impl App {
             }
             true
         });
-        // Clean up old finished_at entries + their session files
-        let expired: Vec<u32> = self
-            .finished_at
-            .iter()
-            .filter(|(_, t)| now.duration_since(**t).as_secs() >= 60)
-            .map(|(pid, _)| *pid)
-            .collect();
-        for pid in &expired {
-            let sessions_dir = dirs_home().join(".claude/sessions");
-            let _ = std::fs::remove_file(sessions_dir.join(format!("{pid}.json")));
-            // Sidecar written by the agent-sandbox bootstrap (host TTY +
-            // terminal target). Both files are per-PID; both go together so
-            // a recycled PID can't pick up another session's host terminal.
-            let _ = std::fs::remove_file(sessions_dir.join(format!("{pid}.terminal.json")));
-        }
+        // Clean up old finished_at entries. The in-memory map is the ONLY
+        // thing cleaned here: claudectl never deletes Claude Code's session
+        // pointer files (`~/.claude/sessions/{pid}.json`) or their sidecars.
+        // "Finished" only means the pid is absent from THIS process's `ps`
+        // view — a TUI running inside the sandbox sees every host session as
+        // Finished (host pids don't exist in the sandbox PID namespace) and
+        // used to delete live sessions' pointer files through the shared
+        // mount, silently emptying the `--restore-sessions` registry. Dead
+        // sidecars are swept by the reaper, which checks liveness in the
+        // right namespace.
         self.finished_at
             .retain(|_, t| now.duration_since(*t).as_secs() < 60);
 
