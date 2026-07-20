@@ -221,7 +221,18 @@ pub fn record_hook_event(payload: &serde_json::Value) -> io::Result<()> {
         return Ok(());
     };
 
-    // Session registry: whenever any hook fires, reconcile the registry to
+    // SessionEnd is the one event that removes state instead of updating it.
+    // It also deliberately skips the registry reconcile below: SessionEnd
+    // fires while a session tears down — a terminal-app quit fires it for
+    // every session at once, with pointer files vanishing as the live set
+    // collapses to empty — and a snapshot taken then erases exactly the
+    // entries `--restore-sessions` needs seconds later. Genuinely closed
+    // sessions still drop out on the next event from any surviving session.
+    if event == "SessionEnd" {
+        return HookState::remove(&session_id);
+    }
+
+    // Session registry: on every other hook event, reconcile the registry to
     // claudectl's current live-session set. The file then always mirrors what
     // claudectl shows here — idle sessions kept, dead ones dropped — so
     // `--restore-sessions` (host) / `--restore-sbx-sessions` bring back exactly
@@ -251,11 +262,6 @@ pub fn record_hook_event(payload: &serde_json::Value) -> io::Result<()> {
             Some(sandbox) => crate::sandbox_registry::replace_sandbox_slice(&sandbox, entries),
             None => crate::sandbox_registry::replace_local(entries),
         };
-    }
-
-    // SessionEnd is the one event that removes state instead of updating it.
-    if event == "SessionEnd" {
-        return HookState::remove(&session_id);
     }
 
     let mut state = HookState::load(&session_id).unwrap_or_default();

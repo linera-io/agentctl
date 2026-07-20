@@ -14,9 +14,11 @@
 //! current live-session set — routing on the sandbox marker
 //! ([`current_sandbox`]): [`replace_sandbox_slice`] inside a sandbox, else
 //! [`replace_local`]. A session is tracked iff its process is alive; the writer
-//! never deletes a session file. An abrupt teardown never fires `SessionEnd`, so
-//! the set stays frozen at its last live state — exactly what the matching
-//! restore command brings back.
+//! never deletes a session file. `SessionEnd` is the one event that does NOT
+//! reconcile: it fires during teardown (a Ghostty quit DOES fire it, for every
+//! session at once), when the live set is collapsing toward empty — so the set
+//! stays frozen at its last live state, exactly what the matching restore
+//! command brings back.
 //!
 //! Each file has its own `.lock` sidecar; writes are serialized with an
 //! advisory `flock` and committed via temp-file + atomic rename, so concurrent
@@ -272,6 +274,8 @@ mod tests {
     /// holding the env lock so no other test observes our `CLAUDECTL_*` vars.
     struct TempRegistry {
         dir: std::path::PathBuf,
+        /// `Some(previous)` when the test also pointed `HOME` at the temp dir.
+        saved_home: Option<Option<std::ffi::OsString>>,
         _lock: MutexGuard<'static, ()>,
     }
 
@@ -291,7 +295,25 @@ mod tests {
                 std::env::set_var("CLAUDECTL_SANDBOX_REGISTRY", dir.join("sandbox.json"));
                 std::env::set_var("CLAUDECTL_LOCAL_REGISTRY", dir.join("local.json"));
             }
-            TempRegistry { dir, _lock: lock }
+            TempRegistry {
+                dir,
+                saved_home: None,
+                _lock: lock,
+            }
+        }
+
+        /// Like [`TempRegistry::new`], but also points `HOME` at the temp dir,
+        /// so code that derives paths from it — `discovery::live_sessions`
+        /// reading `~/.claude/sessions`, hook state under `~/.claudectl` —
+        /// sees an isolated, empty view instead of the real machine's.
+        fn with_home(tag: &str) -> Self {
+            let mut fixture = Self::new(tag);
+            fixture.saved_home = Some(std::env::var_os("HOME"));
+            // SAFETY: env access serialized by the `ENV_LOCK` held in `_lock`.
+            unsafe {
+                std::env::set_var("HOME", &fixture.dir);
+            }
+            fixture
         }
     }
 
@@ -301,6 +323,12 @@ mod tests {
             unsafe {
                 std::env::remove_var("CLAUDECTL_SANDBOX_REGISTRY");
                 std::env::remove_var("CLAUDECTL_LOCAL_REGISTRY");
+                if let Some(previous) = self.saved_home.take() {
+                    match previous {
+                        Some(home) => std::env::set_var("HOME", home),
+                        None => std::env::remove_var("HOME"),
+                    }
+                }
             }
             let _ = fs::remove_dir_all(&self.dir);
         }
@@ -415,6 +443,32 @@ mod tests {
         replace_local(vec![]).unwrap();
         assert!(load_local().sessions.is_empty());
         assert_eq!(load().sandboxes.get("linera-agent").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn session_end_hook_preserves_the_registry() {
+        let _fixture = TempRegistry::with_home("session-end-preserves");
+        // SAFETY: env access is serialized by the `ENV_LOCK` held by `_fixture`.
+        unsafe {
+            std::env::remove_var(ENV_SANDBOX_MARKER);
+            std::env::remove_var(ENV_SANDBOX_NAME);
+        }
+        replace_local(vec![entry("aaa", "/work/a")]).unwrap();
+
+        // Terminal-app quit: by the time a dying session's SessionEnd hook
+        // fires, its pointer file is gone and the live set is collapsing to
+        // empty. The registry must keep its last live state — that is exactly
+        // what `--restore-sessions` reads seconds later.
+        let end = serde_json::json!({"hook_event_name": "SessionEnd", "session_id": "aaa"});
+        crate::hook_state::record_hook_event(&end).unwrap();
+        assert_eq!(load_local().sessions, vec![entry("aaa", "/work/a")]);
+
+        // Every other event still mirrors the live set (empty here), so
+        // genuinely closed sessions drop out as soon as any surviving session
+        // does anything.
+        let stop = serde_json::json!({"hook_event_name": "Stop", "session_id": "aaa"});
+        crate::hook_state::record_hook_event(&stop).unwrap();
+        assert!(load_local().sessions.is_empty());
     }
 
     #[test]
