@@ -29,6 +29,7 @@ mod rules;
 mod sandbox_registry;
 mod session;
 mod session_recorder;
+mod terminal_owner;
 mod terminals;
 mod theme;
 mod transcript;

@@ -328,6 +328,10 @@ pub fn run(dry_run: bool) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
+    if !dry_run {
+        prune_closed_sessions();
+    }
+
     if !sbx_available() {
         writeln!(
             io::stderr(),
@@ -438,6 +442,91 @@ pub fn run(dry_run: bool) -> io::Result<()> {
     apply_plan(&dead_pids, &alive_pids)?;
 
     Ok(())
+}
+
+/// How long to let the world settle between observing a session gone and
+/// judging whether its terminal is gone too.
+///
+/// A quit tears sessions down before the terminal process itself finishes
+/// exiting; sampled in that window a session that died *with* its terminal looks
+/// like one the user closed. Waiting this long — after the departure is already
+/// observed — lets a co-dying terminal exit, so its owner reads gone and the
+/// session is kept. Bounded best-effort: a terminal that lingers longer than
+/// this still risks a spurious prune, which is why a session closed within one
+/// interval of a quit is a documented limit rather than a guarantee. Off-lock,
+/// so a generous value costs only latency on the pruning of genuinely-closed
+/// sessions, once per reaper tick.
+const SETTLE_DELAY: Duration = Duration::from_secs(3);
+
+/// Drop sessions the user closed from the restore registry.
+///
+/// The reaper owns this because nothing else can. The registry is otherwise
+/// only written by hooks; a hook needs a live session to fire it, and it must
+/// not forget anyway (a hook can't observe another terminal mid-quit safely).
+/// Close every session and the registry freezes exactly as it was — which is
+/// how `--restore-sessions` came to resurrect sessions closed two days earlier.
+/// Running on a timer means the verdict lands within one interval of the close,
+/// with or without anything else on the machine.
+///
+/// The pass is **purely subtractive**: it keeps every live session untouched
+/// (owners are the hooks' to attribute) and only removes departed ones whose
+/// terminal is gone too. It orders its observations so a quit can't fool it —
+/// scan, settle, scan again, then sample owners:
+///
+/// 1. Two live scans around [`SETTLE_DELAY`]; their union is "still live". A
+///    session missing from only one scan (a torn read, or one that started
+///    mid-pass) is thus left alone rather than pruned.
+/// 2. The owner sample is taken *after* the settle, so a terminal that co-died
+///    with its sessions has had time to exit and reads gone — its sessions kept.
+///
+/// Every observation can fail closed: a failed live scan (not merely an empty
+/// one) or a failed `ps` aborts the pass without touching the registry, so a
+/// transient error never destroys restore data.
+///
+/// The corollary is a real dependency: **a host that never runs the reaper has
+/// no prune path at all**, and the original bug returns. Nothing at restore time
+/// can substitute, because the evidence — that the terminal outlived the
+/// session — stops existing once that terminal exits. Two consequences worth
+/// knowing: a session closed within one interval of a terminal quit may still
+/// be restored, and an entry whose terminal really did die lingers until some
+/// later restore consumes it.
+///
+/// Host-only: inside a sandbox the host process table is meaningless.
+/// Best-effort — the registry must never take the reaper down.
+fn prune_closed_sessions() {
+    prune_closed_sessions_after(SETTLE_DELAY)
+}
+
+fn prune_closed_sessions_after(settle: Duration) {
+    use std::collections::HashSet;
+
+    if crate::sandbox_registry::current_sandbox().is_some() {
+        return;
+    }
+
+    let live_ids = |sessions: Vec<crate::session::ClaudeSession>| -> HashSet<String> {
+        sessions.into_iter().map(|s| s.session_id).collect()
+    };
+
+    // Observe departures before judging owners, and fail closed on a scan error
+    // (a failed enumeration must never read as "everyone closed").
+    let Some(before) = crate::discovery::try_live_sessions().map(live_ids) else {
+        return;
+    };
+    std::thread::sleep(settle);
+    let Some(after) = crate::discovery::try_live_sessions().map(live_ids) else {
+        return;
+    };
+    let Some(table) = crate::terminal_owner::ProcessTable::snapshot() else {
+        return;
+    };
+
+    let live: HashSet<String> = before.union(&after).cloned().collect();
+    if let Err(e) = crate::sandbox_registry::update_local(|current| {
+        crate::sandbox_registry::retain_restorable(current, &live, |owner| table.is_alive(owner))
+    }) {
+        let _ = writeln!(io::stderr(), "reaper: registry prune failed: {e}");
+    }
 }
 
 fn sbx_available() -> bool {
@@ -1054,6 +1143,162 @@ WantedBy=timers.target\n"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- registry prune (end-to-end through the real scan/ps path) ------
+
+    /// Write a live session pointer file for `pid` under `$HOME/.claude/sessions`,
+    /// so `discovery::live_sessions()` reports it live.
+    fn write_live_pointer(pid: u32, session_id: &str) {
+        let dir = home_dir().unwrap().join(".claude").join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{pid}.json")),
+            format!(r#"{{"pid":{pid},"sessionId":"{session_id}","cwd":"/work","startedAt":1}}"#),
+        )
+        .unwrap();
+    }
+
+    /// The current process's own owner — a provably-alive terminal instance,
+    /// resolved exactly as the reaper would.
+    fn own_live_owner() -> crate::terminal_owner::TerminalOwner {
+        crate::terminal_owner::ProcessTable::snapshot()
+            .unwrap()
+            .owner_of(std::process::id())
+            .expect("this test process has a resolvable owner")
+    }
+
+    fn seed(entries: Vec<crate::sandbox_registry::SessionEntry>) {
+        crate::sandbox_registry::update_local(|_| entries).unwrap();
+    }
+
+    fn registry_ids() -> Vec<String> {
+        crate::sandbox_registry::load_local()
+            .sessions
+            .into_iter()
+            .map(|e| e.session_id)
+            .collect()
+    }
+
+    #[test]
+    fn prune_keeps_live_and_dead_owner_drops_hand_closed() {
+        let _fixture = crate::sandbox_registry::tests::TempRegistry::with_home("reaper-prune-e2e");
+        // SAFETY: env access is serialized by the ENV_LOCK held by `_fixture`.
+        unsafe {
+            std::env::remove_var("LINERA_SANDBOX");
+            std::env::remove_var("SANDBOX_NAME");
+        }
+        let live_owner = own_live_owner();
+        write_live_pointer(std::process::id(), "live-session");
+
+        seed(vec![
+            // Live: pointer file present, this process is its pid → left alone.
+            crate::sandbox_registry::SessionEntry {
+                session_id: "live-session".into(),
+                cwd: "/work".into(),
+                transcript: String::new(),
+                started_at_ms: 1,
+                name: None,
+                pid: Some(std::process::id()),
+                owner_pid: Some(live_owner.pid),
+                owner_started_at: Some(live_owner.started_at.clone()),
+            },
+            // Departed, owner (this test's terminal) still alive → hand-closed → pruned.
+            crate::sandbox_registry::SessionEntry {
+                session_id: "hand-closed".into(),
+                cwd: "/work".into(),
+                transcript: String::new(),
+                started_at_ms: 2,
+                name: None,
+                pid: Some(4_000_000),
+                owner_pid: Some(live_owner.pid),
+                owner_started_at: Some(live_owner.started_at),
+            },
+            // Departed, owner gone (impossible pid) → died with its terminal → kept.
+            crate::sandbox_registry::SessionEntry {
+                session_id: "terminal-died".into(),
+                cwd: "/work".into(),
+                transcript: String::new(),
+                started_at_ms: 3,
+                name: None,
+                pid: Some(4_000_001),
+                owner_pid: Some(4_000_002),
+                owner_started_at: Some("some-dead-terminal".into()),
+            },
+        ]);
+
+        prune_closed_sessions_after(Duration::ZERO);
+
+        let mut kept = registry_ids();
+        kept.sort();
+        assert_eq!(kept, ["live-session", "terminal-died"]);
+    }
+
+    #[test]
+    fn prune_does_nothing_when_the_session_scan_fails() {
+        // No `$HOME/.claude/sessions` directory → the scan errors (not "empty"),
+        // and a failed scan must never be read as "everyone closed". P5.
+        let _fixture =
+            crate::sandbox_registry::tests::TempRegistry::with_home("reaper-prune-failclosed");
+        // SAFETY: env access is serialized by the ENV_LOCK held by `_fixture`.
+        unsafe {
+            std::env::remove_var("LINERA_SANDBOX");
+            std::env::remove_var("SANDBOX_NAME");
+        }
+        let live_owner = own_live_owner();
+        // A hand-closed session that WOULD be pruned if the scan were trusted.
+        seed(vec![crate::sandbox_registry::SessionEntry {
+            session_id: "would-be-pruned".into(),
+            cwd: "/work".into(),
+            transcript: String::new(),
+            started_at_ms: 1,
+            name: None,
+            pid: Some(4_000_000),
+            owner_pid: Some(live_owner.pid),
+            owner_started_at: Some(live_owner.started_at),
+        }]);
+
+        prune_closed_sessions_after(Duration::ZERO);
+
+        assert_eq!(
+            registry_ids(),
+            ["would-be-pruned"],
+            "a failed scan must leave the registry untouched"
+        );
+    }
+
+    #[test]
+    fn prune_is_a_noop_inside_a_sandbox() {
+        let _fixture =
+            crate::sandbox_registry::tests::TempRegistry::with_home("reaper-prune-sandbox");
+        // SAFETY: env access is serialized by the ENV_LOCK held by `_fixture`.
+        unsafe {
+            std::env::set_var("LINERA_SANDBOX", "1");
+            std::env::set_var("SANDBOX_NAME", "linera-agent");
+        }
+        seed(vec![crate::sandbox_registry::SessionEntry {
+            session_id: "host-entry".into(),
+            cwd: "/work".into(),
+            transcript: String::new(),
+            started_at_ms: 1,
+            name: None,
+            pid: Some(4_000_000),
+            owner_pid: Some(4_000_001),
+            owner_started_at: Some("dead".into()),
+        }]);
+
+        prune_closed_sessions_after(Duration::ZERO);
+
+        // SAFETY: still holding ENV_LOCK via `_fixture`.
+        unsafe {
+            std::env::remove_var("LINERA_SANDBOX");
+            std::env::remove_var("SANDBOX_NAME");
+        }
+        assert_eq!(
+            registry_ids(),
+            ["host-entry"],
+            "the reaper must not touch the local registry from inside a sandbox"
+        );
+    }
 
     fn sc(pid: u32, host_tty: &str, alive: bool) -> SandboxSidecar {
         SandboxSidecar {
