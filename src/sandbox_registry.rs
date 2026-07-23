@@ -17,14 +17,15 @@
 //! teardown (a Ghostty quit DOES fire it, for every session at once), when the
 //! live set is collapsing toward empty.
 //!
-//! The local file is a merge ([`reconcile_entries`]), not a mirror. A session
+//! The local file is a merge ([`merge_live_keep_all`]), not a mirror. A session
 //! that is no longer live survives in it while we can show its terminal died
 //! with it ([`is_restore_worthy`]) — and **only the reaper is allowed to decide
-//! that**. Hooks add and refresh, never forget: a hook fires from one session
-//! while a different terminal may be mid-quit, and one unconfirmed look then
-//! would delete exactly the restore set that quit is about to need. Leaving
-//! pruning to nobody was the previous bug (closed sessions lived on forever and
-//! got resurrected days later); leaving it to everybody was the one before that.
+//! that** ([`retain_restorable`]). Hooks add and refresh, never forget: a hook
+//! fires from one session while a different terminal may be mid-quit, and one
+//! unconfirmed look then would delete exactly the restore set that quit is
+//! about to need. Leaving pruning to nobody was the previous bug (closed
+//! sessions lived on forever and got resurrected days later); leaving it to
+//! everybody was the one before that.
 //!
 //! The sandbox slice keeps the plain mirror model: `sbx rm` fires no hooks at
 //! all, so its slice freezes on its own.
@@ -155,26 +156,38 @@ pub fn merge_live_keep_all(
 /// closed. Purely subtractive — it never adds or re-attributes, so it can't
 /// clobber an owner a hook just recorded.
 ///
-/// `live_ids` is the union of two live scans taken around a settle delay, so a
-/// session that was briefly missing (a torn pointer read, or one that started
-/// mid-pass) still counts as live and is left alone. A session absent from both
-/// is departed, and kept only if [`is_restore_worthy`] — its terminal gone too.
+/// An entry is kept when any of these hold:
+/// - its session is in `live_ids` — the union of two live scans taken around a
+///   settle delay, so a session briefly missing from one scan (a torn pointer
+///   read, or one that started mid-pass) still counts as live;
+/// - `process_alive(entry)` — its recorded session process exists *right now*.
+///   The scans and table are frozen before the registry lock is taken, but this
+///   closure runs inside it, and a hook may have registered a brand-new session
+///   in between; without a now-check the reaper would prune that live session's
+///   entry, and an idle session would never re-register. Start-time-blind by
+///   design: a recycled pid keeps a departed entry one process-lifetime longer,
+///   which errs toward keeping;
+/// - [`is_restore_worthy`] — departed, and its terminal died with it.
 ///
-/// `owner_alive` must be evaluated against a process table sampled *after* that
+/// `owner_alive` must be evaluated against a process table sampled *after* the
 /// settle delay: only then has a terminal that co-died with its sessions had
 /// time to exit, so its owner reads gone and its sessions are correctly kept.
-pub fn retain_restorable<F>(
+pub fn retain_restorable<P, F>(
     current: &[SessionEntry],
     live_ids: &std::collections::HashSet<String>,
+    process_alive: P,
     owner_alive: F,
 ) -> Vec<SessionEntry>
 where
+    P: Fn(&SessionEntry) -> bool,
     F: Fn(&TerminalOwner) -> bool,
 {
     current
         .iter()
         .filter(|entry| {
-            live_ids.contains(&entry.session_id) || is_restore_worthy(entry, &owner_alive)
+            live_ids.contains(&entry.session_id)
+                || process_alive(entry)
+                || is_restore_worthy(entry, &owner_alive)
         })
         .cloned()
         .collect()
@@ -562,7 +575,7 @@ pub(crate) mod tests {
         // A Ghostty quit: sessions gone, app gone (owner not alive in the
         // post-settle sample). The whole point of the registry — these stay.
         let current = [owned_entry("aaa", 15601), owned_entry("bbb", 15601)];
-        let kept = retain_restorable(&current, &live_set(&[]), terminals_running(&[]));
+        let kept = retain_restorable(&current, &live_set(&[]), |_| false, terminals_running(&[]));
         assert_eq!(ids(&kept), ["aaa", "bbb"]);
     }
 
@@ -570,7 +583,12 @@ pub(crate) mod tests {
     fn reaper_drops_sessions_closed_under_a_terminal_that_is_still_running() {
         // /exit or ⌘W: sessions gone, Ghostty still there. The user closed them.
         let current = [owned_entry("aaa", 15601), owned_entry("bbb", 15601)];
-        let kept = retain_restorable(&current, &live_set(&[]), terminals_running(&[15601]));
+        let kept = retain_restorable(
+            &current,
+            &live_set(&[]),
+            |_| false,
+            terminals_running(&[15601]),
+        );
         assert!(kept.is_empty());
     }
 
@@ -579,14 +597,24 @@ pub(crate) mod tests {
         // In either scan's live set → left alone, whatever its owner looks like.
         // This is what keeps the reaper from clobbering a hook's fresh entry.
         let current = [owned_entry("live", 15601)];
-        let kept = retain_restorable(&current, &live_set(&["live"]), terminals_running(&[15601]));
+        let kept = retain_restorable(
+            &current,
+            &live_set(&["live"]),
+            |_| false,
+            terminals_running(&[15601]),
+        );
         assert_eq!(ids(&kept), ["live"]);
     }
 
     #[test]
     fn reaper_judges_each_terminal_separately() {
         let current = [owned_entry("from-dead", 111), owned_entry("from-live", 222)];
-        let kept = retain_restorable(&current, &live_set(&[]), terminals_running(&[222]));
+        let kept = retain_restorable(
+            &current,
+            &live_set(&[]),
+            |_| false,
+            terminals_running(&[222]),
+        );
         assert_eq!(ids(&kept), ["from-dead"]);
     }
 
@@ -598,7 +626,12 @@ pub(crate) mod tests {
             owner_started_at: Some("some-older-boot".to_string()),
             ..owned_entry("aaa", 15601)
         }];
-        let kept = retain_restorable(&current, &live_set(&[]), terminals_running(&[15601]));
+        let kept = retain_restorable(
+            &current,
+            &live_set(&[]),
+            |_| false,
+            terminals_running(&[15601]),
+        );
         assert_eq!(ids(&kept), ["aaa"], "recycled pid must not count as alive");
     }
 
@@ -606,7 +639,7 @@ pub(crate) mod tests {
     fn reaper_drops_departed_entries_that_carry_no_owner() {
         // Legacy entries (pre-owner) can't be judged → dropped once departed.
         let current = [entry("legacy", "/work")];
-        let kept = retain_restorable(&current, &live_set(&[]), terminals_running(&[]));
+        let kept = retain_restorable(&current, &live_set(&[]), |_| false, terminals_running(&[]));
         assert!(kept.is_empty());
     }
 
@@ -619,9 +652,27 @@ pub(crate) mod tests {
         let kept = retain_restorable(
             &current,
             &live_set(&["flickered"]),
+            |_| false,
             terminals_running(&[15601]),
         );
         assert_eq!(ids(&kept), ["flickered"]);
+    }
+
+    #[test]
+    fn reaper_keeps_an_entry_whose_process_is_alive_right_now() {
+        // A session that registered itself after both scans (its hook won the
+        // flock first) is in neither scan and its terminal is alive — but its
+        // process is running. Pruning it would silently drop a live session
+        // that may never fire another hook. The now-check inside the locked
+        // closure is what closes that window.
+        let current = [owned_entry("just-started", 15601)];
+        let kept = retain_restorable(
+            &current,
+            &live_set(&[]),
+            |_| true,
+            terminals_running(&[15601]),
+        );
+        assert_eq!(ids(&kept), ["just-started"]);
     }
 
     #[test]
@@ -836,7 +887,12 @@ pub(crate) mod tests {
         let kept = merge_live_keep_all(&previous, vec![]);
         assert_eq!(ids(&kept), ["closed-by-hand"]);
 
-        let pruned = retain_restorable(&previous, &live_set(&[]), terminals_running(&[15601]));
+        let pruned = retain_restorable(
+            &previous,
+            &live_set(&[]),
+            |_| false,
+            terminals_running(&[15601]),
+        );
         assert!(pruned.is_empty());
     }
 

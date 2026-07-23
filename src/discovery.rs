@@ -321,7 +321,8 @@ fn cwd_to_slug(cwd: &str) -> String {
 
 /// Whether `pid` is a running process. `kill(pid, 0)` returns 0 for a live
 /// process; pid 0 is rejected since it would signal the whole process group.
-fn pid_alive(pid: u32) -> bool {
+/// Is a process with this pid running right now? (`kill -0`; start-time-blind.)
+pub(crate) fn pid_alive(pid: u32) -> bool {
     pid != 0 && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
 }
 

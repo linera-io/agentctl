@@ -521,12 +521,35 @@ fn prune_closed_sessions_after(settle: Duration) {
         return;
     };
 
-    let live: HashSet<String> = before.union(&after).cloned().collect();
+    let live = still_live(before, after);
     if let Err(e) = crate::sandbox_registry::update_local(|current| {
-        crate::sandbox_registry::retain_restorable(current, &live, |owner| table.is_alive(owner))
+        crate::sandbox_registry::retain_restorable(
+            current,
+            &live,
+            // The scans and the table are frozen by now, but this closure runs
+            // inside the registry flock, where it can see an entry a hook wrote
+            // for a session that started after both scans. The now-check keeps
+            // it: pruning would drop a live session's entry, and an idle
+            // session never fires the hook that would re-add it.
+            |entry| entry.pid.is_some_and(crate::discovery::pid_alive),
+            |owner| table.is_alive(owner),
+        )
     }) {
         let _ = writeln!(io::stderr(), "reaper: registry prune failed: {e}");
     }
+}
+
+/// The sessions to treat as still live: seen by *either* scan.
+///
+/// The union — never the intersection — is the torn-read forgiveness the
+/// two-scan design exists for: a pointer file mid-rewrite (or a session starting
+/// mid-pass) is missing from one scan only, and demanding both would judge it
+/// departed and prune it.
+fn still_live(
+    before: std::collections::HashSet<String>,
+    after: std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    before.union(&after).cloned().collect()
 }
 
 fn sbx_available() -> bool {
@@ -1275,6 +1298,12 @@ mod tests {
             std::env::set_var("LINERA_SANDBOX", "1");
             std::env::set_var("SANDBOX_NAME", "linera-agent");
         }
+        // The seeded entry must be one a full prune pass WOULD drop (departed,
+        // dead pid, owner alive), and the sessions dir must be readable — else
+        // this test passes for the wrong reason (fail-closed abort, or an entry
+        // every path keeps) and can't detect a broken in-sandbox guard.
+        std::fs::create_dir_all(home_dir().unwrap().join(".claude").join("sessions")).unwrap();
+        let live_owner = own_live_owner();
         seed(vec![crate::sandbox_registry::SessionEntry {
             session_id: "host-entry".into(),
             cwd: "/work".into(),
@@ -1282,8 +1311,8 @@ mod tests {
             started_at_ms: 1,
             name: None,
             pid: Some(4_000_000),
-            owner_pid: Some(4_000_001),
-            owner_started_at: Some("dead".into()),
+            owner_pid: Some(live_owner.pid),
+            owner_started_at: Some(live_owner.started_at),
         }]);
 
         prune_closed_sessions_after(Duration::ZERO);
@@ -1298,6 +1327,52 @@ mod tests {
             ["host-entry"],
             "the reaper must not touch the local registry from inside a sandbox"
         );
+    }
+
+    #[test]
+    fn prune_keeps_a_session_that_registered_after_both_scans() {
+        // The post-scan window: a session starts after scan #2, its hook writes
+        // the entry before the reaper's locked closure runs. Absent from both
+        // scans, owner alive — only the in-closure now-check (its pid is
+        // running) saves it. Modeled with this test's own pid and NO pointer
+        // file, so the scans genuinely miss it.
+        let _fixture =
+            crate::sandbox_registry::tests::TempRegistry::with_home("reaper-postscan-race");
+        // SAFETY: env access is serialized by the ENV_LOCK held by `_fixture`.
+        unsafe {
+            std::env::remove_var("LINERA_SANDBOX");
+            std::env::remove_var("SANDBOX_NAME");
+        }
+        std::fs::create_dir_all(home_dir().unwrap().join(".claude").join("sessions")).unwrap();
+        let live_owner = own_live_owner();
+        seed(vec![crate::sandbox_registry::SessionEntry {
+            session_id: "registered-after-scans".into(),
+            cwd: "/work".into(),
+            transcript: String::new(),
+            started_at_ms: 1,
+            name: None,
+            pid: Some(std::process::id()),
+            owner_pid: Some(live_owner.pid),
+            owner_started_at: Some(live_owner.started_at),
+        }]);
+
+        prune_closed_sessions_after(Duration::ZERO);
+
+        assert_eq!(
+            registry_ids(),
+            ["registered-after-scans"],
+            "a live process's entry must survive even when both scans missed it"
+        );
+    }
+
+    #[test]
+    fn still_live_is_the_union_not_the_intersection() {
+        // Torn-read forgiveness: present in either scan counts as live. An
+        // intersection would judge a flickering session departed and prune it.
+        let one = |id: &str| std::collections::HashSet::from([id.to_string()]);
+        let live = still_live(one("only-in-first"), one("only-in-second"));
+        assert!(live.contains("only-in-first"));
+        assert!(live.contains("only-in-second"));
     }
 
     fn sc(pid: u32, host_tty: &str, alive: bool) -> SandboxSidecar {

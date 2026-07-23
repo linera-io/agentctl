@@ -262,6 +262,16 @@ pub fn record_live_sessions(check: &crate::terminal_owner::OwnerCheck) -> io::Re
 /// process (`matches_process`) — including a recorded `None`, so a session we
 /// once failed to attribute isn't re-sampled on every event — and pay for a
 /// `ps` only when meeting a genuinely new process.
+///
+/// A cached owner is reused only while its process still exists. A session can
+/// outlive its terminal without departing — iTerm2's session restoration keeps
+/// the whole `login → shell → claude` tree alive under `iTermServer` across an
+/// app crash or update-relaunch — and an owner frozen at record time would then
+/// stay dead forever, turning every later hand-close of that session into
+/// "died with its terminal" restore material. Re-walking once the owner is gone
+/// lands on whatever now anchors the survivor (for iTerm2, the server), whose
+/// liveness gives correct verdicts again. The aliveness probe is a `kill -0`,
+/// not a `ps`, so the zero-fork steady state stands.
 fn resolve_owner(
     known: &[crate::sandbox_registry::SessionEntry],
     session: &crate::session::ClaudeSession,
@@ -275,7 +285,10 @@ fn resolve_owner(
         entry.session_id == session.session_id
             && entry.matches_process(session.pid, session.started_at)
     }) {
-        Some(cached) => cached.owner(),
+        Some(cached) => match cached.owner() {
+            Some(owner) if !crate::discovery::pid_alive(owner.pid) => check.owner_of(session.pid),
+            cached_owner => cached_owner,
+        },
         None => check.owner_of(session.pid),
     }
 }
@@ -653,6 +666,59 @@ mod tests {
         let unknown = json!({"hook_event_name": "Mystery", "session_id": "x"});
         // Unknown events return Ok(()) without writing.
         assert!(record_hook_event(&unknown).is_ok());
+    }
+
+    #[test]
+    fn resolve_owner_rewalks_when_the_cached_owner_died() {
+        // The iTerm2 crash-relaunch shape: the session process survives its
+        // recorded terminal. The cache hit must notice the owner is gone and
+        // re-resolve instead of freezing the dead owner into the entry forever.
+        let session = crate::session::ClaudeSession::from_raw(crate::session::RawSession {
+            pid: std::process::id(),
+            session_id: "aaa".to_string(),
+            cwd: "/work".to_string(),
+            started_at: 42,
+            name: None,
+        });
+        let cached_with_dead_owner = crate::sandbox_registry::SessionEntry {
+            session_id: "aaa".to_string(),
+            cwd: "/work".to_string(),
+            transcript: String::new(),
+            started_at_ms: 42,
+            name: None,
+            pid: Some(std::process::id()),
+            owner_pid: Some(2_000_000_000),
+            owner_started_at: Some("long-gone".to_string()),
+        };
+        let check = crate::terminal_owner::OwnerCheck::lazy();
+        let resolved = resolve_owner(
+            std::slice::from_ref(&cached_with_dead_owner),
+            &session,
+            false,
+            &check,
+        );
+        // Re-walked from this live process: lands on a real, alive ancestor —
+        // not the recorded corpse.
+        assert_ne!(
+            resolved.as_ref().map(|owner| owner.pid),
+            Some(2_000_000_000),
+            "a dead cached owner must not be reused"
+        );
+
+        // And a cached owner whose process is alive IS reused verbatim (the
+        // zero-fork steady state): our own real owner, exact lstart string.
+        let live_owner = crate::terminal_owner::ProcessTable::snapshot()
+            .unwrap()
+            .owner_of(std::process::id())
+            .expect("test process has an owner");
+        let cached_alive = crate::sandbox_registry::SessionEntry {
+            owner_pid: Some(live_owner.pid),
+            owner_started_at: Some(live_owner.started_at.clone()),
+            ..cached_with_dead_owner
+        };
+        let check = crate::terminal_owner::OwnerCheck::lazy();
+        let resolved = resolve_owner(std::slice::from_ref(&cached_alive), &session, false, &check);
+        assert_eq!(resolved, Some(live_owner));
     }
 
     #[test]
