@@ -28,6 +28,7 @@ pub mod rules;
 pub mod sandbox_registry;
 pub mod session;
 pub mod session_recorder;
+pub mod terminal_owner;
 pub mod terminals;
 pub mod theme;
 pub mod transcript;

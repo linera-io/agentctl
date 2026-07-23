@@ -246,8 +246,17 @@ Mitigations, in order of preference:
    Linux uses a systemd user timer. Tune with `--reaper-interval N`
    (range 10..=3600 seconds). Reverse with `claudectl --uninstall-reaper`.
 
-The reaper is a no-op on hosts without `sbx` in `PATH`, so it's safe to
-install unconditionally.
+The periodic job does one more thing, and it is not sandbox-specific: it
+keeps the session-restore registry honest. Sessions you close by hand are
+pruned from it, so `--restore-sessions` after a terminal restart brings back
+the sessions that died *with* the terminal and not ones you closed days ago.
+That verdict is only observable while the terminal is still running, so
+nothing at restore time can reconstruct it — **if you use
+`--restore-sessions`, install the reaper.** Without it, closed sessions
+accumulate in the registry and come back on the next restore.
+
+The orphan-hunting half is a no-op on hosts without `sbx` in `PATH`, and the
+registry half is host-only, so the job is safe to install unconditionally.
 
 Sandbox layout differs across teams. Override the defaults via env vars:
 

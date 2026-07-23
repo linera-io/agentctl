@@ -25,10 +25,22 @@ pub fn projects_dir() -> PathBuf {
 /// session files. A session is a live process, not a timestamp, so liveness is
 /// decided only by `kill -0` on its PID.
 pub fn live_sessions() -> Vec<ClaudeSession> {
-    let entries = match fs::read_dir(sessions_dir()) {
-        Ok(entries) => entries,
-        Err(_) => return Vec::new(),
-    };
+    try_live_sessions().unwrap_or_default()
+}
+
+/// Like [`live_sessions`], but `None` when the sessions directory could not be
+/// read at all — as distinct from `Some(vec![])` for a directory that is
+/// readable and genuinely empty.
+///
+/// The reaper needs that distinction before it prunes: an empty scan means
+/// "every session closed" (fair to prune), but a *failed* scan must never be
+/// read as that, or a transient FS error would delete every live session's
+/// restore entry. An unreadable/unparseable individual pointer file still just
+/// skips that one session (a torn mid-write read is momentary, and the reaper's
+/// two-scan window forgives it); only a failure to enumerate the directory at
+/// all is reported as `None`.
+pub fn try_live_sessions() -> Option<Vec<ClaudeSession>> {
+    let entries = fs::read_dir(sessions_dir()).ok()?;
     let mut sessions = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -45,7 +57,7 @@ pub fn live_sessions() -> Vec<ClaudeSession> {
             sessions.push(ClaudeSession::from_raw(raw));
         }
     }
-    sessions
+    Some(sessions)
 }
 
 /// Canonical transcript path for a session:
@@ -309,7 +321,8 @@ fn cwd_to_slug(cwd: &str) -> String {
 
 /// Whether `pid` is a running process. `kill(pid, 0)` returns 0 for a live
 /// process; pid 0 is rejected since it would signal the whole process group.
-fn pid_alive(pid: u32) -> bool {
+/// Is a process with this pid running right now? (`kill -0`; start-time-blind.)
+pub(crate) fn pid_alive(pid: u32) -> bool {
     pid != 0 && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
 }
 

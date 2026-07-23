@@ -1346,6 +1346,9 @@ root  --resume\n";
             transcript: String::new(),
             started_at_ms: 0,
             name: Some("mimir-timeouts".to_string()),
+            pid: None,
+            owner_pid: None,
+            owner_started_at: None,
         };
         assert_eq!(entry_label(&entry), "mimir-timeouts (c3df00ed)");
         entry.name = None;

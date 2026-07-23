@@ -204,6 +204,95 @@ pub fn try_read_hook_payload() -> io::Result<Option<serde_json::Value>> {
     Ok(Some(value))
 }
 
+/// Record the live host (or sandbox) sessions into the restore registry.
+///
+/// This is the hook write, and it only ever adds and refreshes — it never
+/// forgets. A hook fires from one session while a *different* terminal may be
+/// mid-quit, so no hook is in a position to decide a session is gone for good;
+/// that verdict belongs to the reaper (see [`crate::reaper`]), which samples
+/// after the dust settles. Departed entries are therefore kept verbatim here.
+///
+/// Host side is a merge; inside a sandbox it stays a plain mirror of the live
+/// set (`sbx rm` fires no hooks, so that slice freezes by itself, and container
+/// pids say nothing about the host terminal anyway). Routing is on the sandbox
+/// marker rather than a slice name, so a sandbox can never write the host's
+/// file — even one named "host".
+pub fn record_live_sessions(check: &crate::terminal_owner::OwnerCheck) -> io::Result<()> {
+    let sandbox = crate::sandbox_registry::current_sandbox();
+    // Read only to reuse owners already resolved; the authoritative copy is
+    // re-read under the lock in update_local below.
+    let known = match sandbox {
+        Some(_) => Vec::new(),
+        None => crate::sandbox_registry::load_local().sessions,
+    };
+
+    let live: Vec<_> = crate::discovery::live_sessions()
+        .into_iter()
+        .map(|session| {
+            let owner = resolve_owner(&known, &session, sandbox.is_some(), check);
+            let transcript = crate::discovery::transcript_path(&session.session_id, &session.cwd)
+                .to_string_lossy()
+                .into_owned();
+            let name = (!session.session_name.is_empty()).then_some(session.session_name);
+            crate::sandbox_registry::SessionEntry {
+                session_id: session.session_id,
+                cwd: session.cwd,
+                transcript,
+                started_at_ms: session.started_at,
+                name,
+                pid: Some(session.pid),
+                owner_pid: owner.as_ref().map(|owner| owner.pid),
+                owner_started_at: owner.map(|owner| owner.started_at),
+            }
+        })
+        .collect();
+
+    match sandbox {
+        Some(sandbox) => crate::sandbox_registry::replace_sandbox_slice(&sandbox, live),
+        None => crate::sandbox_registry::update_local(|previous| {
+            crate::sandbox_registry::merge_live_keep_all(previous, live)
+        }),
+    }
+}
+
+/// The owner to record for a live session.
+///
+/// Inside a sandbox: none — a container pid says nothing about the host
+/// terminal. On the host: reuse the owner already recorded for this exact
+/// process (`matches_process`) — including a recorded `None`, so a session we
+/// once failed to attribute isn't re-sampled on every event — and pay for a
+/// `ps` only when meeting a genuinely new process.
+///
+/// A cached owner is reused only while its process still exists. A session can
+/// outlive its terminal without departing — iTerm2's session restoration keeps
+/// the whole `login → shell → claude` tree alive under `iTermServer` across an
+/// app crash or update-relaunch — and an owner frozen at record time would then
+/// stay dead forever, turning every later hand-close of that session into
+/// "died with its terminal" restore material. Re-walking once the owner is gone
+/// lands on whatever now anchors the survivor (for iTerm2, the server), whose
+/// liveness gives correct verdicts again. The aliveness probe is a `kill -0`,
+/// not a `ps`, so the zero-fork steady state stands.
+fn resolve_owner(
+    known: &[crate::sandbox_registry::SessionEntry],
+    session: &crate::session::ClaudeSession,
+    in_sandbox: bool,
+    check: &crate::terminal_owner::OwnerCheck,
+) -> Option<crate::terminal_owner::TerminalOwner> {
+    if in_sandbox {
+        return None;
+    }
+    match known.iter().find(|entry| {
+        entry.session_id == session.session_id
+            && entry.matches_process(session.pid, session.started_at)
+    }) {
+        Some(cached) => match cached.owner() {
+            Some(owner) if !crate::discovery::pid_alive(owner.pid) => check.owner_of(session.pid),
+            cached_owner => cached_owner,
+        },
+        None => check.owner_of(session.pid),
+    }
+}
+
 /// Apply a Claude Code hook payload to the per-session state file.
 ///
 /// Unknown event names are ignored (best-effort — Claude Code may add new
@@ -222,47 +311,23 @@ pub fn record_hook_event(payload: &serde_json::Value) -> io::Result<()> {
     };
 
     // SessionEnd is the one event that removes state instead of updating it.
-    // It also deliberately skips the registry reconcile below: SessionEnd
-    // fires while a session tears down — a terminal-app quit fires it for
-    // every session at once, with pointer files vanishing as the live set
-    // collapses to empty — and a snapshot taken then erases exactly the
-    // entries `--restore-sessions` needs seconds later. Genuinely closed
-    // sessions still drop out on the next event from any surviving session.
+    // It also deliberately skips the registry write below: SessionEnd fires
+    // while a session tears down — a terminal-app quit fires it for every
+    // session at once, with pointer files vanishing as the live set collapses
+    // to empty — and recording then erases exactly the entries
+    // `--restore-sessions` needs seconds later. Forgetting a session is left to
+    // the reaper, which runs on a timer and can tell one the user closed from
+    // one its terminal took down with it.
     if event == "SessionEnd" {
         return HookState::remove(&session_id);
     }
 
-    // Session registry: on every other hook event, reconcile the registry to
-    // claudectl's current live-session set. The file then always mirrors what
-    // claudectl shows here — idle sessions kept, dead ones dropped — so
-    // `--restore-sessions` (host) / `--restore-sbx-sessions` bring back exactly
-    // that set after a Ghostty restart / `sbx rm`. We route on the sandbox
-    // marker (not a slice name), so a sandbox can never write the host's file.
-    // Reconcile writes only when the set changes, so running on every event is
-    // cheap; best-effort so registry I/O never blocks the hook.
-    {
-        let entries = crate::discovery::live_sessions()
-            .into_iter()
-            .map(|session| {
-                let transcript =
-                    crate::discovery::transcript_path(&session.session_id, &session.cwd)
-                        .to_string_lossy()
-                        .into_owned();
-                let name = (!session.session_name.is_empty()).then_some(session.session_name);
-                crate::sandbox_registry::SessionEntry {
-                    session_id: session.session_id,
-                    cwd: session.cwd,
-                    transcript,
-                    started_at_ms: session.started_at,
-                    name,
-                }
-            })
-            .collect();
-        let _ = match crate::sandbox_registry::current_sandbox() {
-            Some(sandbox) => crate::sandbox_registry::replace_sandbox_slice(&sandbox, entries),
-            None => crate::sandbox_registry::replace_local(entries),
-        };
-    }
+    // Session registry: every other hook event records the live set, so
+    // `--restore-sessions` (host) / `--restore-sbx-sessions` bring back the
+    // right sessions after a Ghostty restart / `sbx rm`. Best-effort — registry
+    // I/O never blocks the hook, and it only adds/refreshes (never forgets), so
+    // the steady state costs no `ps` at all.
+    let _ = record_live_sessions(&crate::terminal_owner::OwnerCheck::lazy());
 
     let mut state = HookState::load(&session_id).unwrap_or_default();
     state.session_id = session_id;
@@ -589,15 +654,71 @@ mod tests {
 
     #[test]
     fn record_event_routes_correctly() {
-        // We can't write to the real state dir in tests; just exercise the
-        // payload-parsing path with an unknown event to confirm graceful
-        // handling, plus the no-session-id early return.
+        // Every event but SessionEnd reconciles the registry before the event
+        // match, so this needs the fixture even though it only asserts on
+        // parsing — without it the test rewrites the developer's real
+        // `local-sessions.json` (and races the other fixture-holding tests).
+        let _fixture =
+            crate::sandbox_registry::tests::TempRegistry::with_home("record-event-routes");
         let no_sid = json!({"hook_event_name": "Stop"});
         assert!(record_hook_event(&no_sid).is_ok());
 
         let unknown = json!({"hook_event_name": "Mystery", "session_id": "x"});
         // Unknown events return Ok(()) without writing.
         assert!(record_hook_event(&unknown).is_ok());
+    }
+
+    #[test]
+    fn resolve_owner_rewalks_when_the_cached_owner_died() {
+        // The iTerm2 crash-relaunch shape: the session process survives its
+        // recorded terminal. The cache hit must notice the owner is gone and
+        // re-resolve instead of freezing the dead owner into the entry forever.
+        let session = crate::session::ClaudeSession::from_raw(crate::session::RawSession {
+            pid: std::process::id(),
+            session_id: "aaa".to_string(),
+            cwd: "/work".to_string(),
+            started_at: 42,
+            name: None,
+        });
+        let cached_with_dead_owner = crate::sandbox_registry::SessionEntry {
+            session_id: "aaa".to_string(),
+            cwd: "/work".to_string(),
+            transcript: String::new(),
+            started_at_ms: 42,
+            name: None,
+            pid: Some(std::process::id()),
+            owner_pid: Some(2_000_000_000),
+            owner_started_at: Some("long-gone".to_string()),
+        };
+        let check = crate::terminal_owner::OwnerCheck::lazy();
+        let resolved = resolve_owner(
+            std::slice::from_ref(&cached_with_dead_owner),
+            &session,
+            false,
+            &check,
+        );
+        // Re-walked from this live process: lands on a real, alive ancestor —
+        // not the recorded corpse.
+        assert_ne!(
+            resolved.as_ref().map(|owner| owner.pid),
+            Some(2_000_000_000),
+            "a dead cached owner must not be reused"
+        );
+
+        // And a cached owner whose process is alive IS reused verbatim (the
+        // zero-fork steady state): our own real owner, exact lstart string.
+        let live_owner = crate::terminal_owner::ProcessTable::snapshot()
+            .unwrap()
+            .owner_of(std::process::id())
+            .expect("test process has an owner");
+        let cached_alive = crate::sandbox_registry::SessionEntry {
+            owner_pid: Some(live_owner.pid),
+            owner_started_at: Some(live_owner.started_at.clone()),
+            ..cached_with_dead_owner
+        };
+        let check = crate::terminal_owner::OwnerCheck::lazy();
+        let resolved = resolve_owner(std::slice::from_ref(&cached_alive), &session, false, &check);
+        assert_eq!(resolved, Some(live_owner));
     }
 
     #[test]
