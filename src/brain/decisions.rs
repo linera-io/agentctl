@@ -803,6 +803,7 @@ mod tests {
             terminal_id: None,
             host_terminal_target: None,
             sidecar_loaded: false,
+            sidecar_attempts: 0,
             terminal: None,
             terminal_resolved: false,
             status: SessionStatus::Processing,

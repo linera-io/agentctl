@@ -1,6 +1,10 @@
 use crate::session::{ClaudeSession, SessionStatus};
 use std::collections::{HashMap, HashSet};
 
+/// How many enrich ticks a session without any sidecar source is re-probed
+/// before absence is accepted as final (~1 minute at the 2s TUI interval).
+const SIDECAR_PROBE_ATTEMPTS: u8 = 30;
+
 /// Check which PIDs are alive and fetch TTY, CPU%, MEM, command args — all via `ps`.
 /// No sysinfo dependency needed.
 pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
@@ -80,8 +84,7 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
         // The terminal sidecar is written exactly once at session start by
         // sandbox-bootstrap-inner and is invariant for the lifetime of the
         // pid; reading it every tick was 40+ syscalls + JSON parses for no
-        // information gain. `sidecar_loaded` flips on the first attempt
-        // (success or absence) so we only do the I/O once per session.
+        // information gain, so a SUCCESSFUL probe is cached forever.
         if !session.sidecar_loaded {
             // The sidecar file can be gone (swept alongside a destroyed
             // registry, or its dir recreated) while the session lives on. The
@@ -95,8 +98,20 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
                 }
                 session.terminal_id = s.terminal_id;
                 session.host_terminal_target = s.host_terminal_target;
+                session.sidecar_loaded = true;
+            } else {
+                // Absence is NOT cached on the first attempt: a first-tick
+                // probe can lose a race (registry mid-write, transient /proc
+                // read failure under startup load), and a row frozen without
+                // routing keeps Tab-switching broken for the TUI's whole
+                // lifetime — observed live on a 30-session dashboard. Retry
+                // with a bounded budget so host-native sessions (which never
+                // have a sidecar) still settle to zero I/O.
+                session.sidecar_attempts = session.sidecar_attempts.saturating_add(1);
+                if session.sidecar_attempts >= SIDECAR_PROBE_ATTEMPTS {
+                    session.sidecar_loaded = true;
+                }
             }
-            session.sidecar_loaded = true;
         }
 
         // Resolve which terminal this session runs in, once, from its own
