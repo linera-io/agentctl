@@ -146,6 +146,12 @@ pub struct ClaudeSession {
     /// never mutated, so re-reading every tick burned ~70 ms / tick at
     /// 40 sandboxed sessions for no information gain.
     pub sidecar_loaded: bool,
+    /// Failed sidecar probes so far. A first-tick probe can lose a race
+    /// (registry mid-write, transient /proc hiccup) and a session frozen
+    /// without routing keeps Tab-switching broken for the TUI's lifetime,
+    /// so absence is retried with a bounded budget instead of being cached
+    /// as final on the first attempt.
+    pub sidecar_attempts: u8,
     /// Which terminal application this session runs in, detected once from the
     /// session process's own environment (TERM_PROGRAM / GHOSTTY_RESOURCES_DIR /
     /// KITTY_WINDOW_ID / …). Lets claudectl focus/input/approve a session that
@@ -372,6 +378,7 @@ impl ClaudeSession {
             terminal_id: None,
             host_terminal_target: None,
             sidecar_loaded: false,
+            sidecar_attempts: 0,
             terminal: None,
             terminal_resolved: false,
             status: SessionStatus::Idle,

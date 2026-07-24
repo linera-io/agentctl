@@ -166,6 +166,14 @@ pub fn merge_discovered_sessions(
             if let Some(mut prev) = existing.remove(&new.pid) {
                 prev.elapsed = new.elapsed;
                 prev.started_at = new.started_at;
+                // A row born before its discovery source settled (first-tick
+                // race) can carry an empty cwd; later scans know it. Backfill —
+                // cwd feeds transcript resolution and the terminal-switch tab
+                // lookup, so a permanently empty cwd keeps both broken.
+                if prev.cwd.is_empty() && !new.cwd.is_empty() {
+                    prev.cwd = new.cwd;
+                    prev.project_name = new.project_name;
+                }
                 // An empty discovered name carries no information (ps-backstop
                 // rows have none) — never erase a name the TUI already knows,
                 // e.g. one recovered from the transcript's custom-title.
@@ -3381,6 +3389,35 @@ mod tests {
         assert_eq!(
             s.last_user_message_ts, 10_000,
             "transcript-derived timestamps preserved"
+        );
+    }
+
+    #[test]
+    fn merge_backfills_empty_cwd_from_later_discovery() {
+        // A row born in a first-tick race can have an empty cwd; once a later
+        // scan knows it, the merge must adopt it (cwd drives transcript
+        // resolution and the terminal-switch tab lookup) — while a non-empty
+        // cwd must never be clobbered.
+        let mut existing = named_session(42, "s", "proj", 0);
+        existing.cwd = String::new();
+        existing.project_name = String::new();
+
+        let mut fresh = named_session(42, "s", "proj", 0);
+        fresh.cwd = "/Users/ndr/work".into();
+        fresh.project_name = "work".into();
+
+        let (merged, _) = merge_discovered_sessions(vec![existing], vec![fresh]);
+        assert_eq!(merged[0].cwd, "/Users/ndr/work", "empty cwd backfilled");
+        assert_eq!(merged[0].project_name, "work");
+
+        let mut known = named_session(7, "s", "proj", 0);
+        known.cwd = "/Users/ndr/known".into();
+        let mut empty = named_session(7, "s", "proj", 0);
+        empty.cwd = String::new();
+        let (merged, _) = merge_discovered_sessions(vec![known], vec![empty]);
+        assert_eq!(
+            merged[0].cwd, "/Users/ndr/known",
+            "known cwd never clobbered by an empty one"
         );
     }
 
