@@ -46,6 +46,15 @@ pub struct TranscriptMessage {
 pub enum TranscriptEvent {
     WaitingForTask,
     Message(TranscriptMessage),
+    /// The session's display name, recorded in the transcript itself:
+    /// `{"type":"custom-title","customTitle":…}` (an explicit `/rename`) or
+    /// `{"type":"agent-name","agentName":…}` (auto-derived). This is the only
+    /// name source that survives Claude Code deleting the session pointer
+    /// file mid-session and the restore registry losing its entry.
+    SessionName {
+        name: String,
+        explicit: bool,
+    },
 }
 
 pub fn parse_line(line: &str) -> Option<TranscriptEvent> {
@@ -53,6 +62,28 @@ pub fn parse_line(line: &str) -> Option<TranscriptEvent> {
 
     if is_waiting_for_task(&entry) {
         return Some(TranscriptEvent::WaitingForTask);
+    }
+
+    match entry.get("type").and_then(|v| v.as_str()) {
+        Some("custom-title") => {
+            let name = entry.get("customTitle")?.as_str()?.trim().to_string();
+            if !name.is_empty() {
+                return Some(TranscriptEvent::SessionName {
+                    name,
+                    explicit: true,
+                });
+            }
+        }
+        Some("agent-name") => {
+            let name = entry.get("agentName")?.as_str()?.trim().to_string();
+            if !name.is_empty() {
+                return Some(TranscriptEvent::SessionName {
+                    name,
+                    explicit: false,
+                });
+            }
+        }
+        _ => {}
     }
 
     let msg = entry.get("message")?;
@@ -314,6 +345,27 @@ mod tests {
         assert!(parse_rfc3339_utc_ms("").is_none());
         assert!(parse_rfc3339_utc_ms("not-a-date").is_none());
         assert!(parse_rfc3339_utc_ms("2026-13-01T00:00:00Z").is_none());
+    }
+
+    #[test]
+    fn parse_line_recovers_custom_title_and_agent_name() {
+        let title = r#"{"type":"custom-title","customTitle":"resume-old-sessions-audit","sessionId":"3c20ad09-d564-429d-868c-d3a67dcace79"}"#;
+        let Some(TranscriptEvent::SessionName { name, explicit }) = parse_line(title) else {
+            panic!("expected SessionName from custom-title");
+        };
+        assert_eq!(name, "resume-old-sessions-audit");
+        assert!(explicit, "custom-title is an explicit /rename");
+
+        let agent = r#"{"type":"agent-name","agentName":"auto-topic","sessionId":"x"}"#;
+        let Some(TranscriptEvent::SessionName { name, explicit }) = parse_line(agent) else {
+            panic!("expected SessionName from agent-name");
+        };
+        assert_eq!(name, "auto-topic");
+        assert!(!explicit, "agent-name is auto-derived");
+
+        // Blank or absent names are not events.
+        assert!(parse_line(r#"{"type":"custom-title","customTitle":"  "}"#).is_none());
+        assert!(parse_line(r#"{"type":"agent-name"}"#).is_none());
     }
 
     #[test]

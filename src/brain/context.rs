@@ -268,6 +268,9 @@ fn read_all_transcript_entries(path: &Path) -> Vec<TranscriptEntry> {
                         blocks: vec![TranscriptBlock::Text("[waiting for user input]".into())],
                     });
                 }
+                // Naming metadata, not conversation content — the brain's
+                // context already carries the session name separately.
+                TranscriptEvent::SessionName { .. } => {}
             }
         }
     }

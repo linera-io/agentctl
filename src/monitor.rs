@@ -106,6 +106,16 @@ pub fn update_tokens(session: &mut ClaudeSession) {
                             TranscriptEvent::WaitingForTask => {
                                 is_waiting_for_task = true;
                             }
+                            TranscriptEvent::SessionName { name, explicit } => {
+                                // Recover the display name from the transcript
+                                // when every other source is gone (pointer file
+                                // deleted mid-session, registry entry lost). An
+                                // explicit `/rename` title always wins; an
+                                // auto-derived agent-name only fills a blank.
+                                if explicit || session.session_name.is_empty() {
+                                    session.session_name = name;
+                                }
+                            }
                             TranscriptEvent::Message(message) => {
                                 is_waiting_for_task = false;
                                 last_type = match message.role {

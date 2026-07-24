@@ -135,13 +135,129 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
     }
 }
 
-/// True iff the first whitespace-split token of `command` (i.e. argv0),
-/// after stripping any leading path, is exactly `"claude"`. This excludes
-/// `claudectl`, `grep claude`, and `bash -lc '... claude ...'`.
+/// True iff `command`'s argv0, after stripping any leading path, is exactly
+/// `"claude"`. This excludes `claudectl`, `grep claude`, and
+/// `bash -lc '... claude ...'`.
 fn is_claude_process(command: &str) -> bool {
-    let argv0 = command.split_whitespace().next().unwrap_or("");
-    let basename = argv0.rsplit('/').next().unwrap_or(argv0);
-    basename == "claude"
+    claude_argv0_token_count(command).is_some()
+}
+
+/// How many whitespace-split tokens of `command` make up a claude argv0 —
+/// `Some(n)` when the process is claude, `None` otherwise.
+///
+/// ps prints argv0 verbatim, so a binary under a space-containing directory
+/// (`/Users/x/My Tools/claude`) splits across tokens. When the first token
+/// alone isn't `claude` but looks like a path start, prefix tokens are
+/// re-joined until the joined string's basename is exactly `claude` — i.e.
+/// the component after the LAST `/` must be `claude` alone, so
+/// `/usr/bin/env claude` ("env claude") and `grep claude` never match.
+fn claude_argv0_token_count(command: &str) -> Option<usize> {
+    let basename = |s: &str| s.rsplit('/').next().unwrap_or(s).to_string();
+    let mut tokens = command.split_whitespace();
+    let first = tokens.next()?;
+    if basename(first) == "claude" {
+        return Some(1);
+    }
+    if !(first.starts_with('/') || first.starts_with('~') || first.starts_with('.')) {
+        return None;
+    }
+    let mut joined = String::from(first);
+    for (extra, token) in tokens.take(7).enumerate() {
+        joined.push(' ');
+        joined.push_str(token);
+        if basename(&joined) == "claude" {
+            return Some(extra + 2);
+        }
+    }
+    None
+}
+
+/// A live `claude` process visible in the caller's pid namespace, from one
+/// `ps x` snapshot.
+pub struct LiveClaudeProc {
+    /// Unix epoch ms the process started, derived from ps `etime` (elapsed
+    /// time), so no timezone-dependent `lstart` parsing is involved.
+    pub started_at_ms: u64,
+    /// Everything after argv0 on the command line (`--resume <id>`, prompt…).
+    pub args: String,
+}
+
+/// Snapshot every live `claude` process in this pid namespace: pid →
+/// [`LiveClaudeProc`]. `None` when `ps` itself failed — callers must degrade
+/// to their previous liveness source (bare `kill -0`), never to "no sessions".
+///
+/// This is the ground truth the session scan anchors on: Claude Code deletes
+/// its `~/.claude/sessions/<pid>.json` pointer on session-end events that
+/// don't kill the process (auto-compact, `/clear`, remote-control attach), so
+/// neither pointer files nor the restore registry can be trusted to cover the
+/// live set. The process table always does, and reading it in the caller's
+/// own namespace also makes the check sandbox-correct: a host pointer file
+/// seen through the shared `~/.claude` mount can only pass if its pid is a
+/// *claude* process here, not merely any process (pid collisions across
+/// namespaces are common).
+pub fn live_claude_procs() -> Option<HashMap<u32, LiveClaudeProc>> {
+    // `x` (not `ax`): only the invoking user's processes, tty-less included.
+    // The pointer scan is scoped to $HOME, so the process-table source must
+    // stay scoped to the same user — `ax` would surface other users' claude
+    // sessions on a shared machine.
+    let output = std::process::Command::new("ps")
+        .args(["x", "-o", "pid=,etime=,command="])
+        .env_clear()
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut procs = HashMap::new();
+    for line in stdout.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        let Ok(pid) = fields[0].parse::<u32>() else {
+            continue;
+        };
+        let Some(elapsed_secs) = parse_etime(fields[1]) else {
+            continue;
+        };
+        let command = fields[2..].join(" ");
+        let Some(argv0_tokens) = claude_argv0_token_count(&command) else {
+            continue;
+        };
+        let args = command
+            .split_whitespace()
+            .skip(argv0_tokens)
+            .collect::<Vec<_>>()
+            .join(" ");
+        procs.insert(
+            pid,
+            LiveClaudeProc {
+                started_at_ms: now_ms.saturating_sub(elapsed_secs * 1000),
+                args,
+            },
+        );
+    }
+    Some(procs)
+}
+
+/// Parse ps `etime` (`[[dd-]hh:]mm:ss`) into elapsed seconds.
+fn parse_etime(etime: &str) -> Option<u64> {
+    let (days, clock) = match etime.split_once('-') {
+        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
+        None => (0, etime),
+    };
+    let parts: Vec<&str> = clock.split(':').collect();
+    let (hours, minutes, seconds): (u64, u64, u64) = match parts.as_slice() {
+        [h, m, s] => (h.parse().ok()?, m.parse().ok()?, s.parse().ok()?),
+        [m, s] => (0, m.parse().ok()?, s.parse().ok()?),
+        _ => return None,
+    };
+    Some(((days * 24 + hours) * 60 + minutes) * 60 + seconds)
 }
 
 struct TerminalSidecar {
@@ -253,7 +369,7 @@ fn extract_session_meta(cmd: &[&str], session: &mut ClaudeSession) {
     }
 }
 
-fn looks_like_uuid(s: &str) -> bool {
+pub(crate) fn looks_like_uuid(s: &str) -> bool {
     s.len() == 36
         && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
         && s.matches('-').count() == 4
@@ -288,5 +404,28 @@ mod tests {
     #[test]
     fn is_claude_process_rejects_grep_claude() {
         assert!(!is_claude_process("grep claude"));
+    }
+
+    #[test]
+    fn parse_etime_all_forms() {
+        assert_eq!(parse_etime("03:22"), Some(3 * 60 + 22));
+        assert_eq!(parse_etime("01:02:03"), Some(3600 + 2 * 60 + 3));
+        assert_eq!(
+            parse_etime("2-01:02:03"),
+            Some(2 * 86_400 + 3600 + 2 * 60 + 3)
+        );
+        assert_eq!(parse_etime("00:00"), Some(0));
+        assert_eq!(parse_etime("garbage"), None);
+        assert_eq!(parse_etime(""), None);
+    }
+
+    #[test]
+    fn live_claude_procs_snapshot_contains_no_self() {
+        // claudectl's own test binary is not argv0 `claude`, so a live
+        // snapshot must never include our own pid (guards the argv0 filter
+        // against regressing into a substring match).
+        if let Some(procs) = live_claude_procs() {
+            assert!(!procs.contains_key(&std::process::id()));
+        }
     }
 }
