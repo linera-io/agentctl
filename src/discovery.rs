@@ -127,18 +127,24 @@ fn extend_with_pointerless_live(
     sessions: &mut Vec<ClaudeSession>,
     is_alive: &impl Fn(u32) -> bool,
 ) {
-    merge_pointerless_live(sessions, registry_slice_for_current_scope(), is_alive);
+    merge_pointerless_live(
+        sessions,
+        registry_slice_for_current_scope(),
+        is_alive,
+        &proc_cwd,
+    );
 }
 
 /// Pure core of [`extend_with_pointerless_live`]: append each `registry` entry
 /// that is (a) not already among `sessions` (deduped by `session_id`), (b) has a
 /// recorded pid, and (c) is alive per `is_alive`. Side-effecting inputs — the
-/// registry slice and the liveness probe — are injected so this is deterministic
-/// to unit-test.
+/// registry slice, the liveness probe, and the cwd resolver — are injected so
+/// this is deterministic to unit-test.
 fn merge_pointerless_live(
     sessions: &mut Vec<ClaudeSession>,
     registry: Vec<crate::sandbox_registry::SessionEntry>,
     is_alive: &impl Fn(u32) -> bool,
+    resolve_cwd: &impl Fn(u32) -> Option<String>,
 ) {
     let seen: HashSet<String> = sessions.iter().map(|s| s.session_id.clone()).collect();
     for entry in registry {
@@ -149,10 +155,22 @@ fn merge_pointerless_live(
         if !is_alive(pid) {
             continue;
         }
+        // A registry entry recorded with an empty cwd would otherwise be
+        // immortal: this supplemented session (carrying the empty cwd) is
+        // what the next hook re-records, so the bad value round-trips
+        // forever, starving transcript resolution and the terminal-switch
+        // cwd fallback. Repair it from the live process; the next registry
+        // write then persists the repaired value. A recorded non-empty cwd
+        // is never second-guessed.
+        let cwd = if entry.cwd.is_empty() {
+            resolve_cwd(pid).unwrap_or_default()
+        } else {
+            entry.cwd
+        };
         sessions.push(ClaudeSession::from_raw(RawSession {
             pid,
             session_id: entry.session_id,
-            cwd: entry.cwd,
+            cwd,
             started_at: entry.started_at_ms,
             name: entry.name,
         }));
@@ -599,7 +617,12 @@ mod tests {
     #[test]
     fn merge_adds_alive_pointerless_registry_session() {
         let mut sessions = Vec::new();
-        merge_pointerless_live(&mut sessions, vec![entry("s1", Some(4242))], &|_| true);
+        merge_pointerless_live(
+            &mut sessions,
+            vec![entry("s1", Some(4242))],
+            &|_| true,
+            &|_| None,
+        );
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "s1");
         assert_eq!(sessions[0].pid, 4242);
@@ -617,9 +640,34 @@ mod tests {
             &mut sessions,
             vec![entry("s1", Some(111)), entry("s2", Some(222))],
             &|_| true,
+            &|_| None,
         );
         let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
         assert_eq!(ids, vec!["s1", "s2"], "s1 kept once, s2 added");
+    }
+
+    #[test]
+    fn merge_repairs_empty_recorded_cwd_from_live_process() {
+        // Regression: a registry entry once recorded with an empty cwd
+        // round-tripped forever (supplement → re-record → supplement…),
+        // permanently starving transcript resolution and the terminal-switch
+        // cwd fallback. The supplement must repair it from the live process —
+        // and never second-guess a non-empty recorded cwd.
+        let mut sessions = Vec::new();
+        let mut empty_cwd = entry("repair-me", Some(100));
+        empty_cwd.cwd = String::new();
+        let recorded = entry("keep-me", Some(200)); // cwd "/Users/ndr/work"
+        merge_pointerless_live(
+            &mut sessions,
+            vec![empty_cwd, recorded],
+            &|_| true,
+            &|pid| (pid == 100).then(|| "/Users/ndr/live".to_string()),
+        );
+        assert_eq!(sessions[0].cwd, "/Users/ndr/live", "empty cwd repaired");
+        assert_eq!(
+            sessions[1].cwd, "/Users/ndr/work",
+            "recorded cwd not second-guessed"
+        );
     }
 
     #[test]
@@ -634,6 +682,7 @@ mod tests {
                 entry("alive", Some(alive)),
             ],
             &move |pid| pid == alive,
+            &|_| None,
         );
         let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
         assert_eq!(

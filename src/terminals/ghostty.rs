@@ -1,6 +1,23 @@
 use super::{applescript_escape, run_osascript};
 use crate::session::ClaudeSession;
 
+/// A session with no routing data at all cannot be matched to any Ghostty
+/// surface — fail with an actionable claudectl error instead of shipping an
+/// AppleScript guaranteed to die with an empty lookup key (seen live as
+/// `execution error: No Ghostty terminal found for  (-2700)` after a registry
+/// briefly recorded sessions without cwds).
+fn require_routing_data(session: &ClaudeSession) -> Result<(), String> {
+    if session.terminal_id.is_none() && session.tty.is_empty() && session.cwd.is_empty() {
+        return Err(format!(
+            "no terminal routing data for {} (pid {}): no surface id, tty, or cwd yet — \
+             give the dashboard a few refresh ticks and retry",
+            session.display_name(),
+            session.pid
+        ));
+    }
+    Ok(())
+}
+
 /// Find the best matching Ghostty terminal for a session.
 ///
 /// Matching priority (most precise first):
@@ -71,6 +88,7 @@ fn find_terminal_script(session: &ClaudeSession) -> String {
 }
 
 pub fn switch(session: &ClaudeSession) -> Result<(), String> {
+    require_routing_data(session)?;
     let find = find_terminal_script(session);
 
     let script = format!(
@@ -87,6 +105,7 @@ pub fn switch(session: &ClaudeSession) -> Result<(), String> {
 }
 
 pub fn send_input(session: &ClaudeSession, text: &str) -> Result<(), String> {
+    require_routing_data(session)?;
     let find = find_terminal_script(session);
 
     // Strip trailing newline — we append AppleScript `return` instead so the
@@ -113,6 +132,7 @@ pub fn send_input(session: &ClaudeSession, text: &str) -> Result<(), String> {
 }
 
 pub fn approve(session: &ClaudeSession) -> Result<(), String> {
+    require_routing_data(session)?;
     let find = find_terminal_script(session);
 
     let script = format!(
@@ -161,6 +181,72 @@ pub fn spawn_window(cwd: &str, command: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::session::{ClaudeSession, RawSession};
+
+    fn routed_session(
+        terminal_id: Option<&str>,
+        tty: &str,
+        cwd: &str,
+        name: &str,
+    ) -> ClaudeSession {
+        let mut session = ClaudeSession::from_raw(RawSession {
+            pid: 42,
+            session_id: "sess-42".into(),
+            cwd: cwd.into(),
+            started_at: 0,
+            name: (!name.is_empty()).then(|| name.to_string()),
+        });
+        session.terminal_id = terminal_id.map(str::to_string);
+        session.tty = tty.into();
+        session
+    }
+
+    #[test]
+    fn find_script_prefers_surface_id_over_everything() {
+        let script = find_terminal_script(&routed_session(
+            Some("9B65C6AC"),
+            "/dev/ttys019",
+            "/Users/ndr",
+            "my-session",
+        ));
+        assert!(script.contains(r#"whose id is "9B65C6AC""#));
+        assert!(!script.contains("working directory"), "id match is final");
+    }
+
+    #[test]
+    fn find_script_matches_tty_then_falls_back_to_cwd() {
+        let script = find_terminal_script(&routed_session(None, "/dev/ttys019", "/Users/ndr", ""));
+        assert!(script.contains(r#"whose tty contains "/dev/ttys019""#));
+        assert!(script.contains(r#"whose working directory is "/Users/ndr""#));
+        assert!(script.contains(r#"error "No Ghostty terminal found for /Users/ndr""#));
+    }
+
+    #[test]
+    fn find_script_disambiguates_shared_cwd_by_title() {
+        let script = find_terminal_script(&routed_session(None, "", "/Users/ndr", "my-session"));
+        assert!(!script.contains("whose tty"), "no tty -> no tty clause");
+        assert!(script.contains(r#"name of candidate contains "my-session""#));
+    }
+
+    #[test]
+    fn switch_fails_fast_without_any_routing_data() {
+        // Regression: a session with no surface id, tty, or cwd used to ship
+        // an AppleScript that could only die with an empty lookup key
+        // (`No Ghostty terminal found for  (-2700)`). It must fail on our
+        // side with an actionable message instead, before reaching the
+        // bridge/osascript.
+        let session = routed_session(None, "", "", "");
+        for result in [
+            switch(&session),
+            send_input(&session, "hi"),
+            approve(&session),
+        ] {
+            let err = result.expect_err("routing-data-less session must fail fast");
+            assert!(
+                err.contains("no terminal routing data"),
+                "actionable claudectl error, got: {err}"
+            );
+        }
+    }
 
     #[test]
     fn new_window_script_uses_native_new_window_with_cwd_and_command() {
