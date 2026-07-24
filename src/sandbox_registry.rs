@@ -13,16 +13,22 @@
 //! On every hook, `hook_state::record_hook_event` reconciles — routing on the
 //! sandbox marker ([`current_sandbox`]): [`replace_sandbox_slice`] inside a
 //! sandbox, else the local path. The writer never deletes a session file.
-//! `SessionEnd` is the one event that does not reconcile at all: it fires during
-//! teardown (a Ghostty quit DOES fire it, for every session at once), when the
-//! live set is collapsing toward empty.
+//! `SessionEnd` is the one event that does not reconcile the live set: it fires
+//! during teardown (a Ghostty quit DOES fire it, for every session at once),
+//! when the live set is collapsing toward empty. It does, however, take one
+//! targeted action — see [`forget_session`] below.
 //!
 //! The local file is a merge ([`merge_live_keep_all`]), not a mirror. A session
 //! that is no longer live survives in it while we can show its terminal died
-//! with it ([`is_restore_worthy`]) — and **only the reaper is allowed to decide
-//! that** ([`retain_restorable`]). Hooks add and refresh, never forget: a hook
-//! fires from one session while a different terminal may be mid-quit, and one
-//! unconfirmed look then would delete exactly the restore set that quit is
+//! with it ([`is_restore_worthy`]). Two — and only two — things may drop an
+//! entry: the reaper ([`retain_restorable`]), which settle-samples the owner to
+//! confirm a departed session's terminal died too; and [`forget_session`], the
+//! SessionEnd path for a session the user *deliberately* closed (a prompt-level
+//! exit reason that can't fire during a terminal quit — see
+//! `hook_state::is_deliberate_user_close`), which is durable and immediate and
+//! so closes the reaper's timing gap. The general reconcile still never forgets:
+//! a hook fires from one session while a different terminal may be mid-quit, and
+//! one unconfirmed look then would delete exactly the restore set that quit is
 //! about to need. Leaving pruning to nobody was the previous bug (closed
 //! sessions lived on forever and got resurrected days later); leaving it to
 //! everybody was the one before that.
@@ -364,6 +370,40 @@ pub fn replace_sandbox_slice(sandbox: &str, entries: Vec<SessionEntry>) -> io::R
     })
 }
 
+/// Durably forget `session_id` from the restore registry for the current scope
+/// — the current sandbox's slice inside a sandbox, else the host-local registry.
+///
+/// Called when a SessionEnd `reason` proves the user *deliberately* closed the
+/// session (see `hook_state::is_deliberate_user_close`). Unlike the reaper's
+/// timer-based prune — which can only tell "the user closed it" from "the
+/// terminal died under it" while the terminal is still alive, and so misses a
+/// close that is followed by a terminal quit before its next tick — this is
+/// immediate and permanent: once forgotten here, no later terminal death can
+/// resurrect the session through `--restore-sessions`. A no-op if the id is
+/// absent (idempotent), so a duplicate SessionEnd or a race with the reaper is
+/// harmless.
+pub fn forget_session(session_id: &str) -> io::Result<()> {
+    match current_sandbox() {
+        Some(sandbox) => {
+            let remaining: Vec<SessionEntry> = load()
+                .sandboxes
+                .remove(&sandbox)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|entry| entry.session_id != session_id)
+                .collect();
+            replace_sandbox_slice(&sandbox, remaining)
+        }
+        None => update_local(|current| {
+            current
+                .iter()
+                .filter(|entry| entry.session_id != session_id)
+                .cloned()
+                .collect()
+        }),
+    }
+}
+
 /// Pretty JSON with a trailing newline.
 fn serialize<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
@@ -697,6 +737,21 @@ pub(crate) mod tests {
         let _guard = TempRegistry::new("missing");
         let registry = load();
         assert!(registry.sandboxes.is_empty());
+    }
+
+    #[test]
+    fn forget_session_removes_only_the_named_host_entry() {
+        let _guard = TempRegistry::new("forget-session");
+        update_local(|_| vec![entry("aaa", "/a"), entry("bbb", "/b")]).unwrap();
+        forget_session("aaa").unwrap();
+        assert_eq!(
+            ids(&load_local().sessions),
+            ["bbb"],
+            "only 'aaa' is forgotten"
+        );
+        // Idempotent: forgetting an absent id leaves the registry untouched.
+        forget_session("zzz").unwrap();
+        assert_eq!(ids(&load_local().sessions), ["bbb"]);
     }
 
     #[test]

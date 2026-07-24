@@ -293,6 +293,23 @@ fn resolve_owner(
     }
 }
 
+/// Whether a `SessionEnd` `reason` means the user *deliberately* ended the
+/// session, rather than the process/terminal being torn down under it.
+///
+/// Claude Code reports a prompt-level exit — Ctrl-D / Ctrl-C at the prompt, or
+/// `/logout` — as `prompt_input_exit` / `logout`. A terminal that dies (window
+/// quit, crash, SIGHUP) tears the process down and reports `host_exit` /
+/// `nonzero_exit` / `other`, and `/clear` (which does NOT end the session)
+/// reports `clear`. So these two reasons are the durable, false-positive-free
+/// signal that the user closed this session on purpose: safe to forget from the
+/// restore registry immediately, and — because they never fire during a
+/// terminal quit — acting on them can't erase the terminal-death casualties
+/// `--restore-sessions` exists to bring back. Anything else stays the reaper's
+/// job (it settle-samples the owner to make the same call, within its window).
+fn is_deliberate_user_close(reason: &str) -> bool {
+    matches!(reason, "prompt_input_exit" | "logout")
+}
+
 /// Apply a Claude Code hook payload to the per-session state file.
 ///
 /// Unknown event names are ignored (best-effort — Claude Code may add new
@@ -311,14 +328,26 @@ pub fn record_hook_event(payload: &serde_json::Value) -> io::Result<()> {
     };
 
     // SessionEnd is the one event that removes state instead of updating it.
-    // It also deliberately skips the registry write below: SessionEnd fires
-    // while a session tears down — a terminal-app quit fires it for every
-    // session at once, with pointer files vanishing as the live set collapses
-    // to empty — and recording then erases exactly the entries
-    // `--restore-sessions` needs seconds later. Forgetting a session is left to
-    // the reaper, which runs on a timer and can tell one the user closed from
-    // one its terminal took down with it.
+    // It also deliberately skips the *live-set* registry write below: SessionEnd
+    // fires while a session tears down — a terminal-app quit fires it for every
+    // session at once, with pointer files vanishing as the live set collapses to
+    // empty — and mirroring the live set then erases exactly the entries
+    // `--restore-sessions` needs seconds later.
+    //
+    // But when the `reason` proves the user DELIBERATELY closed this session (a
+    // prompt-level exit / `/logout`, never a terminal teardown — see
+    // is_deliberate_user_close), we forget it from the restore registry right
+    // now, durably. That closes the reaper's timing gap: the reaper can only
+    // distinguish "user closed it" from "terminal died under it" while the
+    // terminal is still alive, so a close followed by a terminal quit before the
+    // reaper's next tick would otherwise be resurrected. Because these reasons
+    // never fire during a terminal quit, acting on them can't wipe a
+    // terminal-death casualty that restore should bring back.
     if event == "SessionEnd" {
+        let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        if is_deliberate_user_close(reason) {
+            let _ = crate::sandbox_registry::forget_session(&session_id);
+        }
         return HookState::remove(&session_id);
     }
 
@@ -719,6 +748,61 @@ mod tests {
         let check = crate::terminal_owner::OwnerCheck::lazy();
         let resolved = resolve_owner(std::slice::from_ref(&cached_alive), &session, false, &check);
         assert_eq!(resolved, Some(live_owner));
+    }
+
+    #[test]
+    fn is_deliberate_user_close_only_true_for_prompt_exit_and_logout() {
+        assert!(is_deliberate_user_close("prompt_input_exit"));
+        assert!(is_deliberate_user_close("logout"));
+        // Terminal-teardown / process-death reasons must NOT count: forgetting on
+        // those would resurrect the exact bug — dropping terminal-death casualties
+        // that `--restore-sessions` should bring back. `clear` doesn't end the
+        // session at all.
+        for teardown in ["other", "host_exit", "nonzero_exit", "clear", ""] {
+            assert!(
+                !is_deliberate_user_close(teardown),
+                "{teardown:?} must not count as a deliberate close"
+            );
+        }
+    }
+
+    #[test]
+    fn session_end_forgets_the_entry_only_on_a_deliberate_close() {
+        let _fixture =
+            crate::sandbox_registry::tests::TempRegistry::with_home("session-end-forget");
+        let seed = |id: &str| crate::sandbox_registry::SessionEntry {
+            session_id: id.to_string(),
+            cwd: "/work".to_string(),
+            transcript: String::new(),
+            started_at_ms: 1,
+            name: None,
+            pid: Some(std::process::id()),
+            owner_pid: None,
+            owner_started_at: None,
+        };
+        crate::sandbox_registry::update_local(|_| vec![seed("closed"), seed("kept")]).unwrap();
+
+        // A terminal-teardown SessionEnd leaves the entry for the reaper/restore.
+        record_hook_event(
+            &json!({"hook_event_name": "SessionEnd", "session_id": "kept", "reason": "other"}),
+        )
+        .unwrap();
+        // A deliberate prompt exit forgets it durably, right now.
+        record_hook_event(&json!({
+            "hook_event_name": "SessionEnd", "session_id": "closed", "reason": "prompt_input_exit"
+        }))
+        .unwrap();
+
+        let ids: Vec<String> = crate::sandbox_registry::load_local()
+            .sessions
+            .into_iter()
+            .map(|entry| entry.session_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["kept".to_string()],
+            "'closed' forgotten on prompt_input_exit; 'kept' left by reason 'other'"
+        );
     }
 
     #[test]
