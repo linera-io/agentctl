@@ -83,7 +83,13 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
         // information gain. `sidecar_loaded` flips on the first attempt
         // (success or absence) so we only do the I/O once per session.
         if !session.sidecar_loaded {
-            if let Some(s) = read_terminal_sidecar(pid) {
+            // The sidecar file can be gone (swept alongside a destroyed
+            // registry, or its dir recreated) while the session lives on. The
+            // same routing facts are still in the session process's own
+            // environment — the sidecar was written FROM that environment at
+            // bootstrap — so fall back to reading it there. Without this,
+            // Tab-switching to a recovered session has no target.
+            if let Some(s) = read_terminal_sidecar(pid).or_else(|| sidecar_from_proc_env(pid)) {
                 if let Some(host_tty) = s.host_tty {
                     session.tty = host_tty;
                 }
@@ -135,13 +141,129 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
     }
 }
 
-/// True iff the first whitespace-split token of `command` (i.e. argv0),
-/// after stripping any leading path, is exactly `"claude"`. This excludes
-/// `claudectl`, `grep claude`, and `bash -lc '... claude ...'`.
+/// True iff `command`'s argv0, after stripping any leading path, is exactly
+/// `"claude"`. This excludes `claudectl`, `grep claude`, and
+/// `bash -lc '... claude ...'`.
 fn is_claude_process(command: &str) -> bool {
-    let argv0 = command.split_whitespace().next().unwrap_or("");
-    let basename = argv0.rsplit('/').next().unwrap_or(argv0);
-    basename == "claude"
+    claude_argv0_token_count(command).is_some()
+}
+
+/// How many whitespace-split tokens of `command` make up a claude argv0 —
+/// `Some(n)` when the process is claude, `None` otherwise.
+///
+/// ps prints argv0 verbatim, so a binary under a space-containing directory
+/// (`/Users/x/My Tools/claude`) splits across tokens. When the first token
+/// alone isn't `claude` but looks like a path start, prefix tokens are
+/// re-joined until the joined string's basename is exactly `claude` — i.e.
+/// the component after the LAST `/` must be `claude` alone, so
+/// `/usr/bin/env claude` ("env claude") and `grep claude` never match.
+fn claude_argv0_token_count(command: &str) -> Option<usize> {
+    let basename = |s: &str| s.rsplit('/').next().unwrap_or(s).to_string();
+    let mut tokens = command.split_whitespace();
+    let first = tokens.next()?;
+    if basename(first) == "claude" {
+        return Some(1);
+    }
+    if !(first.starts_with('/') || first.starts_with('~') || first.starts_with('.')) {
+        return None;
+    }
+    let mut joined = String::from(first);
+    for (extra, token) in tokens.take(7).enumerate() {
+        joined.push(' ');
+        joined.push_str(token);
+        if basename(&joined) == "claude" {
+            return Some(extra + 2);
+        }
+    }
+    None
+}
+
+/// A live `claude` process visible in the caller's pid namespace, from one
+/// `ps x` snapshot.
+pub struct LiveClaudeProc {
+    /// Unix epoch ms the process started, derived from ps `etime` (elapsed
+    /// time), so no timezone-dependent `lstart` parsing is involved.
+    pub started_at_ms: u64,
+    /// Everything after argv0 on the command line (`--resume <id>`, prompt…).
+    pub args: String,
+}
+
+/// Snapshot every live `claude` process in this pid namespace: pid →
+/// [`LiveClaudeProc`]. `None` when `ps` itself failed — callers must degrade
+/// to their previous liveness source (bare `kill -0`), never to "no sessions".
+///
+/// This is the ground truth the session scan anchors on: Claude Code deletes
+/// its `~/.claude/sessions/<pid>.json` pointer on session-end events that
+/// don't kill the process (auto-compact, `/clear`, remote-control attach), so
+/// neither pointer files nor the restore registry can be trusted to cover the
+/// live set. The process table always does, and reading it in the caller's
+/// own namespace also makes the check sandbox-correct: a host pointer file
+/// seen through the shared `~/.claude` mount can only pass if its pid is a
+/// *claude* process here, not merely any process (pid collisions across
+/// namespaces are common).
+pub fn live_claude_procs() -> Option<HashMap<u32, LiveClaudeProc>> {
+    // `x` (not `ax`): only the invoking user's processes, tty-less included.
+    // The pointer scan is scoped to $HOME, so the process-table source must
+    // stay scoped to the same user — `ax` would surface other users' claude
+    // sessions on a shared machine.
+    let output = std::process::Command::new("ps")
+        .args(["x", "-o", "pid=,etime=,command="])
+        .env_clear()
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut procs = HashMap::new();
+    for line in stdout.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        let Ok(pid) = fields[0].parse::<u32>() else {
+            continue;
+        };
+        let Some(elapsed_secs) = parse_etime(fields[1]) else {
+            continue;
+        };
+        let command = fields[2..].join(" ");
+        let Some(argv0_tokens) = claude_argv0_token_count(&command) else {
+            continue;
+        };
+        let args = command
+            .split_whitespace()
+            .skip(argv0_tokens)
+            .collect::<Vec<_>>()
+            .join(" ");
+        procs.insert(
+            pid,
+            LiveClaudeProc {
+                started_at_ms: now_ms.saturating_sub(elapsed_secs * 1000),
+                args,
+            },
+        );
+    }
+    Some(procs)
+}
+
+/// Parse ps `etime` (`[[dd-]hh:]mm:ss`) into elapsed seconds.
+fn parse_etime(etime: &str) -> Option<u64> {
+    let (days, clock) = match etime.split_once('-') {
+        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
+        None => (0, etime),
+    };
+    let parts: Vec<&str> = clock.split(':').collect();
+    let (hours, minutes, seconds): (u64, u64, u64) = match parts.as_slice() {
+        [h, m, s] => (h.parse().ok()?, m.parse().ok()?, s.parse().ok()?),
+        [m, s] => (0, m.parse().ok()?, s.parse().ok()?),
+        _ => return None,
+    };
+    Some(((days * 24 + hours) * 60 + minutes) * 60 + seconds)
 }
 
 struct TerminalSidecar {
@@ -225,6 +347,69 @@ fn parse_host_terminal_target(
     None
 }
 
+/// Rebuild the terminal sidecar from the session process's environment when
+/// the sidecar FILE is gone. sandbox-bootstrap-inner exports these variables
+/// into every session it launches and then writes the sidecar from them, so
+/// the environment is the authoritative source the file merely caches.
+/// Linux-only: sidecars exist only for sandbox sessions, and the sandbox is
+/// Linux, where /proc/<pid>/environ is readable (claudectl runs as root
+/// there).
+#[cfg(target_os = "linux")]
+fn sidecar_from_proc_env(pid: u32) -> Option<TerminalSidecar> {
+    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let mut vars: HashMap<String, String> = HashMap::new();
+    for chunk in raw.split(|byte| *byte == 0) {
+        let entry = String::from_utf8_lossy(chunk);
+        if let Some((key, value)) = entry.split_once('=') {
+            vars.insert(key.to_string(), value.to_string());
+        }
+    }
+    sidecar_from_env_map(&vars)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sidecar_from_proc_env(_pid: u32) -> Option<TerminalSidecar> {
+    None
+}
+
+/// Pure core of [`sidecar_from_proc_env`]: map the bootstrap-exported
+/// environment to sidecar fields. Probe order for the host-terminal target
+/// mirrors [`parse_host_terminal_target`]: kitty first (strongest single
+/// signal), then tmux, then wezterm.
+#[cfg(target_os = "linux")]
+fn sidecar_from_env_map(vars: &HashMap<String, String>) -> Option<TerminalSidecar> {
+    let get = |key: &str| {
+        vars.get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let host_tty = get("SANDBOX_HOST_TTY");
+    let terminal_id = get("SANDBOX_HOST_TERMINAL_ID");
+    let host_terminal_target =
+        if let (Some(window_id), Some(socket)) = (get("KITTY_WINDOW_ID"), get("KITTY_LISTEN_ON")) {
+            Some(crate::session::HostTerminalTarget::Kitty { socket, window_id })
+        } else if let (Some(tmux), Some(pane)) = (get("TMUX"), get("TMUX_PANE")) {
+            let socket = tmux.split(',').next().unwrap_or(&tmux).to_string();
+            Some(crate::session::HostTerminalTarget::Tmux { socket, pane })
+        } else {
+            get("WEZTERM_PANE")
+                .and_then(|pane| pane.parse::<u64>().ok())
+                .map(|pane_id| crate::session::HostTerminalTarget::WezTerm {
+                    pane_id,
+                    unix_socket: get("WEZTERM_UNIX_SOCKET"),
+                })
+        };
+    if host_tty.is_none() && terminal_id.is_none() && host_terminal_target.is_none() {
+        return None;
+    }
+    Some(TerminalSidecar {
+        host_tty,
+        terminal_id,
+        host_terminal_target,
+    })
+}
+
 fn extract_session_meta(cmd: &[&str], session: &mut ClaudeSession) {
     // If the session JSON already provided a name (via /rename or auto-name),
     // don't overwrite it from the process command line.
@@ -253,7 +438,7 @@ fn extract_session_meta(cmd: &[&str], session: &mut ClaudeSession) {
     }
 }
 
-fn looks_like_uuid(s: &str) -> bool {
+pub(crate) fn looks_like_uuid(s: &str) -> bool {
     s.len() == 36
         && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
         && s.matches('-').count() == 4
@@ -288,5 +473,69 @@ mod tests {
     #[test]
     fn is_claude_process_rejects_grep_claude() {
         assert!(!is_claude_process("grep claude"));
+    }
+
+    #[test]
+    fn parse_etime_all_forms() {
+        assert_eq!(parse_etime("03:22"), Some(3 * 60 + 22));
+        assert_eq!(parse_etime("01:02:03"), Some(3600 + 2 * 60 + 3));
+        assert_eq!(
+            parse_etime("2-01:02:03"),
+            Some(2 * 86_400 + 3600 + 2 * 60 + 3)
+        );
+        assert_eq!(parse_etime("00:00"), Some(0));
+        assert_eq!(parse_etime("garbage"), None);
+        assert_eq!(parse_etime(""), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sidecar_from_env_map_recovers_routing_fields() {
+        let vars: HashMap<String, String> = [
+            ("SANDBOX_HOST_TTY", "/dev/ttys037"),
+            (
+                "SANDBOX_HOST_TERMINAL_ID",
+                "9B65C6AC-B586-4943-ADB8-298D0759AF13",
+            ),
+            ("SANDBOX_NAME", "linera-agent"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let sidecar = sidecar_from_env_map(&vars).expect("host tty + terminal id recovered");
+        assert_eq!(sidecar.host_tty.as_deref(), Some("/dev/ttys037"));
+        assert_eq!(
+            sidecar.terminal_id.as_deref(),
+            Some("9B65C6AC-B586-4943-ADB8-298D0759AF13")
+        );
+        assert!(sidecar.host_terminal_target.is_none());
+
+        let tmux: HashMap<String, String> =
+            [("TMUX", "/tmp/tmux-0/default,42,3"), ("TMUX_PANE", "%7")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let Some(crate::session::HostTerminalTarget::Tmux { socket, pane }) =
+            sidecar_from_env_map(&tmux).and_then(|s| s.host_terminal_target)
+        else {
+            panic!("expected tmux target");
+        };
+        assert_eq!(socket, "/tmp/tmux-0/default");
+        assert_eq!(pane, "%7");
+
+        assert!(
+            sidecar_from_env_map(&HashMap::new()).is_none(),
+            "no routing vars -> no sidecar"
+        );
+    }
+
+    #[test]
+    fn live_claude_procs_snapshot_contains_no_self() {
+        // claudectl's own test binary is not argv0 `claude`, so a live
+        // snapshot must never include our own pid (guards the argv0 filter
+        // against regressing into a substring match).
+        if let Some(procs) = live_claude_procs() {
+            assert!(!procs.contains_key(&std::process::id()));
+        }
     }
 }

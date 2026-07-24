@@ -166,13 +166,24 @@ pub fn merge_discovered_sessions(
             if let Some(mut prev) = existing.remove(&new.pid) {
                 prev.elapsed = new.elapsed;
                 prev.started_at = new.started_at;
-                prev.session_name = new.session_name;
+                // An empty discovered name carries no information (ps-backstop
+                // rows have none) — never erase a name the TUI already knows,
+                // e.g. one recovered from the transcript's custom-title.
+                if !new.session_name.is_empty() {
+                    prev.session_name = new.session_name;
+                }
                 // Claude Code can rotate `sessionId` under the same OS PID
                 // (/clear, compaction, resume-into-new-file). The transcript
                 // file path changes but `do_refresh_io` skips re-resolution
                 // while jsonl_path.is_some(), so without this the TUI keeps
                 // reading the abandoned transcript and "Last" never advances.
-                if prev.session_id != new.session_id {
+                //
+                // An EMPTY new id is not a rotation: it is a ps-backstop row
+                // whose `--resume` uuid is unknown (discovery lost both the
+                // pointer and the registry entry). Adopting it would erase a
+                // known identity and reset the JSONL offset, double-counting
+                // the transcript on re-read. Keep what we know.
+                if !new.session_id.is_empty() && prev.session_id != new.session_id {
                     prev.session_id = new.session_id;
                     prev.jsonl_path = None;
                     prev.jsonl_offset = 0;
@@ -3370,6 +3381,32 @@ mod tests {
         assert_eq!(
             s.last_user_message_ts, 10_000,
             "transcript-derived timestamps preserved"
+        );
+    }
+
+    #[test]
+    fn merge_keeps_known_name_and_id_over_empty_ps_backstop_row() {
+        // A ps-backstop row (pointer + registry both lost) carries no name and
+        // possibly no session_id. Merging it must not erase the identity the
+        // TUI already holds, nor reset the JSONL offset (which would
+        // double-count the transcript on re-read).
+        let mut existing = named_session(42, "known-name", "proj", 1_000);
+        existing.session_id = "known-id".into();
+        existing.jsonl_path = Some(std::path::PathBuf::from("/tmp/known-id.jsonl"));
+        existing.jsonl_offset = 4096;
+
+        let mut fresh = named_session(42, "", "proj", 0);
+        fresh.session_id = String::new();
+        fresh.jsonl_path = None;
+
+        let (merged, _) = merge_discovered_sessions(vec![existing], vec![fresh]);
+        assert_eq!(merged.len(), 1);
+        let s = &merged[0];
+        assert_eq!(s.session_name, "known-name", "empty name must not clobber");
+        assert_eq!(s.session_id, "known-id", "empty id is not a rotation");
+        assert_eq!(
+            s.jsonl_offset, 4096,
+            "identity kept, so accumulated offset kept"
         );
     }
 

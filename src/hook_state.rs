@@ -228,6 +228,11 @@ pub fn record_live_sessions(check: &crate::terminal_owner::OwnerCheck) -> io::Re
 
     let live: Vec<_> = crate::discovery::live_sessions()
         .into_iter()
+        // A process-table-discovered session whose `--resume` id is unknown
+        // has an empty session_id: it is displayable but not restorable
+        // (nothing to `--resume`), and the registry is keyed by session_id,
+        // so recording it would collide every such session on "".
+        .filter(|session| !session.session_id.is_empty())
         .map(|session| {
             let owner = resolve_owner(&known, &session, sandbox.is_some(), check);
             let transcript = crate::discovery::transcript_path(&session.session_id, &session.cwd)
@@ -354,8 +359,10 @@ pub fn record_hook_event(payload: &serde_json::Value) -> io::Result<()> {
     // Session registry: every other hook event records the live set, so
     // `--restore-sessions` (host) / `--restore-sbx-sessions` bring back the
     // right sessions after a Ghostty restart / `sbx rm`. Best-effort — registry
-    // I/O never blocks the hook, and it only adds/refreshes (never forgets), so
-    // the steady state costs no `ps` at all.
+    // I/O never blocks the hook, and it only adds/refreshes (never forgets).
+    // Cost: one `ps x` snapshot per event (~40ms on a busy machine) — the
+    // price of discovery that survives Claude Code deleting pointer files
+    // mid-session; owner resolution itself stays fork-free in steady state.
     let _ = record_live_sessions(&crate::terminal_owner::OwnerCheck::lazy());
 
     let mut state = HookState::load(&session_id).unwrap_or_default();
