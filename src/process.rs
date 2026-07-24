@@ -83,7 +83,13 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
         // information gain. `sidecar_loaded` flips on the first attempt
         // (success or absence) so we only do the I/O once per session.
         if !session.sidecar_loaded {
-            if let Some(s) = read_terminal_sidecar(pid) {
+            // The sidecar file can be gone (swept alongside a destroyed
+            // registry, or its dir recreated) while the session lives on. The
+            // same routing facts are still in the session process's own
+            // environment — the sidecar was written FROM that environment at
+            // bootstrap — so fall back to reading it there. Without this,
+            // Tab-switching to a recovered session has no target.
+            if let Some(s) = read_terminal_sidecar(pid).or_else(|| sidecar_from_proc_env(pid)) {
                 if let Some(host_tty) = s.host_tty {
                     session.tty = host_tty;
                 }
@@ -341,6 +347,69 @@ fn parse_host_terminal_target(
     None
 }
 
+/// Rebuild the terminal sidecar from the session process's environment when
+/// the sidecar FILE is gone. sandbox-bootstrap-inner exports these variables
+/// into every session it launches and then writes the sidecar from them, so
+/// the environment is the authoritative source the file merely caches.
+/// Linux-only: sidecars exist only for sandbox sessions, and the sandbox is
+/// Linux, where /proc/<pid>/environ is readable (claudectl runs as root
+/// there).
+#[cfg(target_os = "linux")]
+fn sidecar_from_proc_env(pid: u32) -> Option<TerminalSidecar> {
+    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let mut vars: HashMap<String, String> = HashMap::new();
+    for chunk in raw.split(|byte| *byte == 0) {
+        let entry = String::from_utf8_lossy(chunk);
+        if let Some((key, value)) = entry.split_once('=') {
+            vars.insert(key.to_string(), value.to_string());
+        }
+    }
+    sidecar_from_env_map(&vars)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sidecar_from_proc_env(_pid: u32) -> Option<TerminalSidecar> {
+    None
+}
+
+/// Pure core of [`sidecar_from_proc_env`]: map the bootstrap-exported
+/// environment to sidecar fields. Probe order for the host-terminal target
+/// mirrors [`parse_host_terminal_target`]: kitty first (strongest single
+/// signal), then tmux, then wezterm.
+#[cfg(target_os = "linux")]
+fn sidecar_from_env_map(vars: &HashMap<String, String>) -> Option<TerminalSidecar> {
+    let get = |key: &str| {
+        vars.get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let host_tty = get("SANDBOX_HOST_TTY");
+    let terminal_id = get("SANDBOX_HOST_TERMINAL_ID");
+    let host_terminal_target =
+        if let (Some(window_id), Some(socket)) = (get("KITTY_WINDOW_ID"), get("KITTY_LISTEN_ON")) {
+            Some(crate::session::HostTerminalTarget::Kitty { socket, window_id })
+        } else if let (Some(tmux), Some(pane)) = (get("TMUX"), get("TMUX_PANE")) {
+            let socket = tmux.split(',').next().unwrap_or(&tmux).to_string();
+            Some(crate::session::HostTerminalTarget::Tmux { socket, pane })
+        } else {
+            get("WEZTERM_PANE")
+                .and_then(|pane| pane.parse::<u64>().ok())
+                .map(|pane_id| crate::session::HostTerminalTarget::WezTerm {
+                    pane_id,
+                    unix_socket: get("WEZTERM_UNIX_SOCKET"),
+                })
+        };
+    if host_tty.is_none() && terminal_id.is_none() && host_terminal_target.is_none() {
+        return None;
+    }
+    Some(TerminalSidecar {
+        host_tty,
+        terminal_id,
+        host_terminal_target,
+    })
+}
+
 fn extract_session_meta(cmd: &[&str], session: &mut ClaudeSession) {
     // If the session JSON already provided a name (via /rename or auto-name),
     // don't overwrite it from the process command line.
@@ -417,6 +486,47 @@ mod tests {
         assert_eq!(parse_etime("00:00"), Some(0));
         assert_eq!(parse_etime("garbage"), None);
         assert_eq!(parse_etime(""), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sidecar_from_env_map_recovers_routing_fields() {
+        let vars: HashMap<String, String> = [
+            ("SANDBOX_HOST_TTY", "/dev/ttys037"),
+            (
+                "SANDBOX_HOST_TERMINAL_ID",
+                "9B65C6AC-B586-4943-ADB8-298D0759AF13",
+            ),
+            ("SANDBOX_NAME", "linera-agent"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let sidecar = sidecar_from_env_map(&vars).expect("host tty + terminal id recovered");
+        assert_eq!(sidecar.host_tty.as_deref(), Some("/dev/ttys037"));
+        assert_eq!(
+            sidecar.terminal_id.as_deref(),
+            Some("9B65C6AC-B586-4943-ADB8-298D0759AF13")
+        );
+        assert!(sidecar.host_terminal_target.is_none());
+
+        let tmux: HashMap<String, String> =
+            [("TMUX", "/tmp/tmux-0/default,42,3"), ("TMUX_PANE", "%7")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let Some(crate::session::HostTerminalTarget::Tmux { socket, pane }) =
+            sidecar_from_env_map(&tmux).and_then(|s| s.host_terminal_target)
+        else {
+            panic!("expected tmux target");
+        };
+        assert_eq!(socket, "/tmp/tmux-0/default");
+        assert_eq!(pane, "%7");
+
+        assert!(
+            sidecar_from_env_map(&HashMap::new()).is_none(),
+            "no routing vars -> no sidecar"
+        );
     }
 
     #[test]
