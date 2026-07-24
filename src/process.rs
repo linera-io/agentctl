@@ -5,6 +5,33 @@ use std::collections::{HashMap, HashSet};
 /// before absence is accepted as final (~1 minute at the 2s TUI interval).
 const SIDECAR_PROBE_ATTEMPTS: u8 = 30;
 
+/// Apply one sidecar probe result to the session. A successful probe is
+/// cached forever (the sidecar is invariant per pid). Absence is NOT cached
+/// on the first attempt: a first-tick probe can lose a race (registry
+/// mid-write, transient /proc read failure under startup load), and a row
+/// frozen without routing keeps Tab-switching broken for the TUI's whole
+/// lifetime — observed live on a 30-session dashboard. Retried with a bounded
+/// budget so host-native sessions (which never have a sidecar) still settle
+/// to zero steady-state I/O.
+fn apply_sidecar_probe(session: &mut ClaudeSession, sidecar: Option<TerminalSidecar>) {
+    match sidecar {
+        Some(s) => {
+            if let Some(host_tty) = s.host_tty {
+                session.tty = host_tty;
+            }
+            session.terminal_id = s.terminal_id;
+            session.host_terminal_target = s.host_terminal_target;
+            session.sidecar_loaded = true;
+        }
+        None => {
+            session.sidecar_attempts = session.sidecar_attempts.saturating_add(1);
+            if session.sidecar_attempts >= SIDECAR_PROBE_ATTEMPTS {
+                session.sidecar_loaded = true;
+            }
+        }
+    }
+}
+
 /// Check which PIDs are alive and fetch TTY, CPU%, MEM, command args — all via `ps`.
 /// No sysinfo dependency needed.
 pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
@@ -92,26 +119,10 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
             // environment — the sidecar was written FROM that environment at
             // bootstrap — so fall back to reading it there. Without this,
             // Tab-switching to a recovered session has no target.
-            if let Some(s) = read_terminal_sidecar(pid).or_else(|| sidecar_from_proc_env(pid)) {
-                if let Some(host_tty) = s.host_tty {
-                    session.tty = host_tty;
-                }
-                session.terminal_id = s.terminal_id;
-                session.host_terminal_target = s.host_terminal_target;
-                session.sidecar_loaded = true;
-            } else {
-                // Absence is NOT cached on the first attempt: a first-tick
-                // probe can lose a race (registry mid-write, transient /proc
-                // read failure under startup load), and a row frozen without
-                // routing keeps Tab-switching broken for the TUI's whole
-                // lifetime — observed live on a 30-session dashboard. Retry
-                // with a bounded budget so host-native sessions (which never
-                // have a sidecar) still settle to zero I/O.
-                session.sidecar_attempts = session.sidecar_attempts.saturating_add(1);
-                if session.sidecar_attempts >= SIDECAR_PROBE_ATTEMPTS {
-                    session.sidecar_loaded = true;
-                }
-            }
+            apply_sidecar_probe(
+                session,
+                read_terminal_sidecar(pid).or_else(|| sidecar_from_proc_env(pid)),
+            );
         }
 
         // Resolve which terminal this session runs in, once, from its own
@@ -488,6 +499,53 @@ mod tests {
     #[test]
     fn is_claude_process_rejects_grep_claude() {
         assert!(!is_claude_process("grep claude"));
+    }
+
+    #[test]
+    fn sidecar_probe_retries_absence_then_settles_and_caches_success() {
+        // Regression: absence cached on the FIRST attempt froze a session
+        // without terminal routing for the TUI's lifetime.
+        let mut session = crate::session::ClaudeSession::from_raw(crate::session::RawSession {
+            pid: 42,
+            session_id: "s".into(),
+            cwd: "/w".into(),
+            started_at: 0,
+            name: None,
+        });
+
+        apply_sidecar_probe(&mut session, None);
+        assert!(
+            !session.sidecar_loaded,
+            "one miss must not settle the probe"
+        );
+
+        // A later success still lands and caches.
+        apply_sidecar_probe(
+            &mut session,
+            Some(TerminalSidecar {
+                host_tty: Some("/dev/ttys037".into()),
+                terminal_id: Some("9B65C6AC".into()),
+                host_terminal_target: None,
+            }),
+        );
+        assert!(session.sidecar_loaded);
+        assert_eq!(session.tty, "/dev/ttys037");
+        assert_eq!(session.terminal_id.as_deref(), Some("9B65C6AC"));
+
+        // Pure absence settles only after the bounded budget.
+        let mut never = crate::session::ClaudeSession::from_raw(crate::session::RawSession {
+            pid: 43,
+            session_id: "n".into(),
+            cwd: "/w".into(),
+            started_at: 0,
+            name: None,
+        });
+        for _ in 0..SIDECAR_PROBE_ATTEMPTS - 1 {
+            apply_sidecar_probe(&mut never, None);
+            assert!(!never.sidecar_loaded);
+        }
+        apply_sidecar_probe(&mut never, None);
+        assert!(never.sidecar_loaded, "budget exhausted -> settled");
     }
 
     #[test]

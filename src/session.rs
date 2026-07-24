@@ -79,7 +79,7 @@ impl TelemetryStatus {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RawSession {
     pub pid: u32,
     #[serde(rename = "sessionId")]

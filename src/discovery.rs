@@ -24,8 +24,8 @@ pub fn projects_dir() -> PathBuf {
 ///
 /// This only READS the session-pointer JSONs — claudectl never deletes a user's
 /// session files. A session is a live process, not a timestamp: liveness means
-/// its pid is a live `claude` process in this namespace (see
-/// [`session_liveness`]), degrading to bare `kill -0` if `ps` fails.
+/// its pid is a live `claude` process in this namespace (the snapshot check
+/// inside [`assemble_sessions`]), degrading to bare `kill -0` if `ps` fails.
 pub fn live_sessions() -> Vec<ClaudeSession> {
     try_live_sessions().unwrap_or_default()
 }
@@ -57,37 +57,100 @@ pub fn try_live_sessions() -> Option<Vec<ClaudeSession>> {
         };
         raw_sessions.push(raw);
     }
-    // Snapshot AFTER reading pointers: a session that starts mid-scan is then
-    // in the snapshot — its pointer may be missed this pass, but the ps
-    // supplement below still includes it. The other order would drop a
-    // just-started session entirely for one scan (pointer read, pid not yet
-    // in the snapshot).
-    let procs = crate::process::live_claude_procs();
-    let is_live = session_liveness(procs.as_ref());
-    let mut sessions: Vec<ClaudeSession> = raw_sessions
-        .into_iter()
-        .filter(|raw| is_live(raw.pid))
-        .map(ClaudeSession::from_raw)
-        .collect();
-    extend_with_pointerless_live(&mut sessions, &is_live);
-    extend_with_ps_live(&mut sessions, procs.as_ref());
-    Some(sessions)
+    Some(snapshot_and_assemble(
+        raw_sessions,
+        crate::process::live_claude_procs,
+        registry_slice_for_current_scope(),
+        &pid_alive,
+        &proc_cwd,
+        DeadPointers::Drop,
+    ))
 }
 
-/// The liveness predicate for one scan: with a process-table snapshot, a pid
-/// is live only if it is a *claude* process in this namespace right now —
-/// which rejects both recycled pids and, in a sandbox, host pids seen through
-/// the shared `~/.claude` mount that collide with unrelated in-namespace
-/// processes. Without a snapshot (`ps` failed) it degrades to bare `kill -0`,
-/// the pre-snapshot behavior — a scan must never lose sessions to a transient
-/// `ps` failure.
-fn session_liveness(
+/// What a scan does with a pointer file whose pid is dead.
+enum DeadPointers {
+    /// Keep the row — the display turns it into a 30s Finished tombstone
+    /// (`fetch_and_enrich` marks pids absent from `ps` as Finished).
+    Keep,
+    /// Drop it — the live set (registry writer, restore) must never contain
+    /// a dead session.
+    Drop,
+}
+
+/// Take the process-table snapshot AFTER the pointers have been read, then
+/// assemble. A session that starts mid-scan is then in the snapshot — its
+/// pointer may be missed this pass, but the ps supplement still includes it.
+/// The reverse order would drop a just-started session entirely for one scan
+/// (pointer read, pid not yet in the snapshot). Both wrappers go through this
+/// one function so the ordering exists in exactly one place, and a test pins
+/// it by injecting a recording snapshot closure after pre-read pointers.
+fn snapshot_and_assemble(
+    raw_pointers: Vec<RawSession>,
+    take_snapshot: impl FnOnce()
+        -> Option<std::collections::HashMap<u32, crate::process::LiveClaudeProc>>,
+    registry: Vec<crate::sandbox_registry::SessionEntry>,
+    pid_alive_probe: &impl Fn(u32) -> bool,
+    resolve_cwd: &impl Fn(u32) -> Option<String>,
+    dead_pointers: DeadPointers,
+) -> Vec<ClaudeSession> {
+    let procs = take_snapshot();
+    assemble_sessions(
+        raw_pointers,
+        procs.as_ref(),
+        registry,
+        pid_alive_probe,
+        resolve_cwd,
+        dead_pointers,
+    )
+}
+
+/// Pure composition of one discovery pass — THE seam where every source
+/// meets: pointer files (already read), the process-table snapshot, and the
+/// restore-registry slice. All I/O stays in the thin wrappers
+/// ([`try_live_sessions`], [`scan_sessions`]), so each regression scenario of
+/// the pipeline is testable with plain fixtures: this is where the
+/// pointerless-recovery, cross-namespace-leak, cwd-repair, and
+/// snapshot-ordering guarantees actually live.
+///
+/// Liveness: with a snapshot, a pid counts as live only if it is a *claude*
+/// process in this namespace right now — rejecting recycled pids and, through
+/// a shared/seeded `~/.claude`, other namespaces' pointers colliding with
+/// unrelated local pids. Without a snapshot (`ps` failed) it degrades to the
+/// injected `pid_alive_probe` (bare `kill -0` in production) — a transient
+/// `ps` failure must never shrink the result below the pointer scan.
+fn assemble_sessions(
+    raw_pointers: Vec<RawSession>,
     procs: Option<&std::collections::HashMap<u32, crate::process::LiveClaudeProc>>,
-) -> impl Fn(u32) -> bool + '_ {
-    move |pid| match procs {
+    registry: Vec<crate::sandbox_registry::SessionEntry>,
+    pid_alive_probe: &impl Fn(u32) -> bool,
+    resolve_cwd: &impl Fn(u32) -> Option<String>,
+    dead_pointers: DeadPointers,
+) -> Vec<ClaudeSession> {
+    let is_live = |pid: u32| match procs {
         Some(map) => map.contains_key(&pid),
-        None => pid_alive(pid),
+        None => pid_alive_probe(pid),
+    };
+    let mut sessions = Vec::new();
+    for raw in raw_pointers {
+        let keep = if is_live(raw.pid) {
+            true
+        } else {
+            match dead_pointers {
+                // A pointer whose pid is alive but NOT a claude process here
+                // is foreign (recycled pid, or another namespace's session
+                // colliding with an unrelated local process) — never a
+                // tombstone. A genuinely dead pid is tombstone material.
+                DeadPointers::Keep => !pid_alive_probe(raw.pid),
+                DeadPointers::Drop => false,
+            }
+        };
+        if keep {
+            sessions.push(ClaudeSession::from_raw(raw));
+        }
     }
+    merge_pointerless_live(&mut sessions, registry, &is_live, resolve_cwd);
+    extend_with_ps_live(&mut sessions, procs, resolve_cwd);
+    sessions
 }
 
 /// Re-add restore-registry sessions that are still process-alive but have NO
@@ -111,35 +174,18 @@ fn session_liveness(
 ///      on the next in-sandbox hook) keep it;
 ///   3. `--restore-sessions` / `--restore-sbx-sessions`, which read that registry.
 ///
-/// The registry slice is chosen by the sandbox marker so an in-sandbox scan
-/// supplements from that sandbox's slice (sandbox-namespace pids) and a host
-/// scan from the local registry (host pids) — `pid_alive` is always evaluated in
-/// the caller's own namespace, matching the pids it is checking. A failure to
+/// The registry slice is chosen by the sandbox marker (see
+/// [`registry_slice_for_current_scope`]) so an in-sandbox scan supplements
+/// from that sandbox's slice (sandbox-namespace pids) and a host scan from
+/// the local registry (host pids) — liveness is always evaluated in the
+/// caller's own namespace, matching the pids it is checking. A failure to
 /// read the registry degrades to no supplement (never fewer sessions than the
 /// pointer scan), so it can never turn a readable scan into a failed one.
 ///
-/// Liveness comes from the caller's [`session_liveness`] predicate: with a
-/// process-table snapshot it demands the pid be a live *claude* process in
-/// this namespace (rejecting recycled pids and cross-namespace collisions —
-/// a host session must never enter a sandbox slice, or vice versa); without
-/// one it degrades to bare `kill -0`.
-fn extend_with_pointerless_live(
-    sessions: &mut Vec<ClaudeSession>,
-    is_alive: &impl Fn(u32) -> bool,
-) {
-    merge_pointerless_live(
-        sessions,
-        registry_slice_for_current_scope(),
-        is_alive,
-        &proc_cwd,
-    );
-}
-
-/// Pure core of [`extend_with_pointerless_live`]: append each `registry` entry
-/// that is (a) not already among `sessions` (deduped by `session_id`), (b) has a
-/// recorded pid, and (c) is alive per `is_alive`. Side-effecting inputs — the
-/// registry slice, the liveness probe, and the cwd resolver — are injected so
-/// this is deterministic to unit-test.
+/// Appends each `registry` entry that is (a) not already among `sessions`
+/// (deduped by `session_id`), (b) has a recorded pid, and (c) is alive per
+/// `is_alive`. All side-effecting inputs are injected, so this is
+/// deterministic to unit-test.
 fn merge_pointerless_live(
     sessions: &mut Vec<ClaudeSession>,
     registry: Vec<crate::sandbox_registry::SessionEntry>,
@@ -234,37 +280,17 @@ pub fn scan_sessions() -> Vec<ClaudeSession> {
         }
     }
 
-    // Snapshot AFTER reading pointers (see try_live_sessions for why).
-    let procs = crate::process::live_claude_procs();
-    let is_live = session_liveness(procs.as_ref());
-    let mut sessions = Vec::new();
-    for raw in raw_sessions {
-        // A pointer whose pid is alive but is NOT a claude process here is
-        // foreign: either a pid recycled since the session died, or — through
-        // a shared/seeded `~/.claude` sessions dir — another namespace's
-        // session colliding with an unrelated local process. It is not one of
-        // this namespace's sessions, live or finished, so it gets no row.
-        // (Trade-off, deliberate: a crashed session whose lingering pointer's
-        // pid was later recycled by a non-claude process loses its Finished
-        // tombstone — previously such a pointer re-tombstoned every ~60s
-        // forever.) Dead pids ARE kept: fetch_and_enrich marks them Finished
-        // for the 30s tombstone view.
-        if pid_alive(raw.pid) && !is_live(raw.pid) {
-            continue;
-        }
-
-        // JSONL path resolved later by resolve_jsonl_paths() after command_args are populated
-        sessions.push(ClaudeSession::from_raw(raw));
-    }
-
-    // Sessions Claude Code has dropped the pointer file for but whose process is
-    // still alive (see extend_with_pointerless_live). Their JSONL/status/CPU are
-    // resolved by the same later passes (resolve_jsonl_paths, fetch_ps_data) via
-    // the recorded pid and session_id, so a re-added session shows with real data.
-    extend_with_pointerless_live(&mut sessions, &is_live);
-    extend_with_ps_live(&mut sessions, procs.as_ref());
-
-    sessions
+    // JSONL paths are resolved later by resolve_jsonl_paths() after
+    // command_args are populated; supplemented sessions get status/CPU from
+    // the same later passes, so re-added sessions show with real data.
+    snapshot_and_assemble(
+        raw_sessions,
+        crate::process::live_claude_procs,
+        registry_slice_for_current_scope(),
+        &pid_alive,
+        &proc_cwd,
+        DeadPointers::Keep,
+    )
 }
 
 /// Third discovery source, after the pointer scan and the registry
@@ -283,6 +309,7 @@ pub fn scan_sessions() -> Vec<ClaudeSession> {
 fn extend_with_ps_live(
     sessions: &mut Vec<ClaudeSession>,
     procs: Option<&std::collections::HashMap<u32, crate::process::LiveClaudeProc>>,
+    resolve_cwd: &impl Fn(u32) -> Option<String>,
 ) {
     let Some(procs) = procs else { return };
     let seen_pids: HashSet<u32> = sessions.iter().map(|s| s.pid).collect();
@@ -315,7 +342,7 @@ fn extend_with_ps_live(
         let mut session = ClaudeSession::from_raw(RawSession {
             pid,
             session_id,
-            cwd: proc_cwd(pid).unwrap_or_default(),
+            cwd: resolve_cwd(pid).unwrap_or_default(),
             started_at: proc_info.started_at_ms,
             name: None,
         });
@@ -717,7 +744,7 @@ mod tests {
             4084,
             &format!("--dangerously-skip-permissions --resume {uuid}"),
         )]);
-        extend_with_ps_live(&mut sessions, Some(&procs));
+        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].pid, 4084);
         assert_eq!(sessions[0].session_id, uuid);
@@ -739,7 +766,7 @@ mod tests {
             (333, &format!("--resume {uuid}")),
             (444, "some prompt text"),
         ]);
-        extend_with_ps_live(&mut sessions, Some(&procs));
+        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None);
         let rows: Vec<(u32, &str)> = sessions
             .iter()
             .map(|s| (s.pid, s.session_id.as_str()))
@@ -761,7 +788,7 @@ mod tests {
         let mut sessions = Vec::new();
         let args = format!("--resume {uuid}");
         let procs = proc_map(&[(100, &args), (200, &args)]);
-        extend_with_ps_live(&mut sessions, Some(&procs));
+        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None);
         let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
         assert_eq!(
             ids,
@@ -775,7 +802,7 @@ mod tests {
         let mut sessions = Vec::new();
         // `--resume my-named-session` is a name, not a uuid — identity unknown.
         let procs = proc_map(&[(555, "--resume my-named-session")]);
-        extend_with_ps_live(&mut sessions, Some(&procs));
+        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None);
         assert_eq!(sessions.len(), 1);
         assert_eq!(
             sessions[0].session_id, "",
@@ -786,26 +813,211 @@ mod tests {
     #[test]
     fn ps_extend_is_deterministic_and_noop_without_snapshot() {
         let mut sessions = Vec::new();
-        extend_with_ps_live(&mut sessions, None);
+        extend_with_ps_live(&mut sessions, None, &|_| None);
         assert!(sessions.is_empty(), "no ps snapshot -> no additions");
 
         let procs = proc_map(&[(30, ""), (10, ""), (20, "")]);
-        extend_with_ps_live(&mut sessions, Some(&procs));
+        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None);
         let pids: Vec<u32> = sessions.iter().map(|s| s.pid).collect();
         assert_eq!(pids, vec![10, 20, 30], "added in sorted pid order");
     }
 
+    // ------------------------------------------------------------------
+    // Composition-seam regression scenarios. Each replays a real incident
+    // (2026-07-24) end-to-end through assemble_sessions — the pipeline where
+    // pointer files, the ps snapshot, and the registry meet. If any of these
+    // fail, do NOT weaken the assertion: each one guards a way sessions were
+    // actually lost, leaked, or frozen in production.
+    // ------------------------------------------------------------------
+
+    fn raw_pointer(session_id: &str, pid: u32) -> RawSession {
+        RawSession {
+            pid,
+            session_id: session_id.into(),
+            cwd: "/Users/ndr".into(),
+            started_at: 1_784_900_000_000,
+            name: None,
+        }
+    }
+
+    fn assembled_ids(sessions: &[ClaudeSession]) -> Vec<(u32, String)> {
+        sessions
+            .iter()
+            .map(|s| (s.pid, s.session_id.clone()))
+            .collect()
+    }
+
     #[test]
-    fn session_liveness_uses_snapshot_membership_over_kill0() {
-        // pid 1 (launchd/init) is alive per kill -0 on every Unix, but it is
-        // not a claude process — a snapshot that omits it must veto it.
-        let procs = proc_map(&[(4242, "")]);
-        let is_live = session_liveness(Some(&procs));
-        assert!(is_live(4242));
-        assert!(
-            !is_live(1),
-            "alive-but-not-claude pid must not count as live"
+    fn regression_sessions_survive_total_pointer_and_registry_loss() {
+        // Incident: CC deleted every pointer mid-life AND an old binary's
+        // replace-style slice writes destroyed the registry — 30 live
+        // sessions became invisible and unrestorable. The process table must
+        // recover them, with `--resume` uuids as identity.
+        let uuid = "3c20ad09-d564-429d-868c-d3a67dcace79";
+        let procs = proc_map(&[(4084, &format!("--resume {uuid}"))]);
+        let sessions = assemble_sessions(
+            Vec::new(),
+            Some(&procs),
+            Vec::new(),
+            &|_| false,
+            &|_| Some("/Users/ndr".into()),
+            DeadPointers::Drop,
         );
+        assert_eq!(assembled_ids(&sessions), vec![(4084, uuid.to_string())]);
+        assert_eq!(sessions[0].cwd, "/Users/ndr");
+    }
+
+    #[test]
+    fn regression_pointerless_sessions_recover_from_registry() {
+        // Incident: CC deleted pointers mid-life; the registry still knew the
+        // sessions. They must appear with their recorded identity and never
+        // be double-added by the ps supplement.
+        let procs = proc_map(&[(111, ""), (222, "")]);
+        let sessions = assemble_sessions(
+            Vec::new(),
+            Some(&procs),
+            vec![entry("s1", Some(111)), entry("s2", Some(222))],
+            &|_| false,
+            &|_| None,
+            DeadPointers::Drop,
+        );
+        assert_eq!(
+            assembled_ids(&sessions),
+            vec![(111, "s1".into()), (222, "s2".into())],
+            "registry identities kept, ps supplement adds no duplicates"
+        );
+    }
+
+    #[test]
+    fn regression_foreign_pointer_never_enters_live_set_but_dead_ones_tombstone() {
+        // Incident: a host session's pointer, visible in-sandbox, collided
+        // with an unrelated in-namespace pid and got captured into the
+        // sandbox registry. Alive-but-not-claude pointer pids must be
+        // excluded everywhere; genuinely dead pids must still tombstone in
+        // the display variant only.
+        let pointers = vec![raw_pointer("foreign", 3824), raw_pointer("dead", 9001)];
+        let procs = proc_map(&[]);
+        let alive_probe = |pid: u32| pid == 3824; // 3824 alive (not claude), 9001 dead
+
+        let live = assemble_sessions(
+            pointers.clone(),
+            Some(&procs),
+            Vec::new(),
+            &alive_probe,
+            &|_| None,
+            DeadPointers::Drop,
+        );
+        assert!(
+            live.is_empty(),
+            "live set: foreign excluded, dead excluded; got {:?}",
+            assembled_ids(&live)
+        );
+
+        let display = assemble_sessions(
+            pointers,
+            Some(&procs),
+            Vec::new(),
+            &alive_probe,
+            &|_| None,
+            DeadPointers::Keep,
+        );
+        assert_eq!(
+            assembled_ids(&display),
+            vec![(9001, "dead".into())],
+            "display: dead pointer tombstones, foreign one never shows"
+        );
+    }
+
+    #[test]
+    fn regression_ps_failure_never_shrinks_the_scan() {
+        // A transient `ps` failure must degrade liveness to the injected
+        // probe (kill -0 in production), not lose sessions — and must not
+        // fabricate ps-discovered rows either.
+        let sessions = assemble_sessions(
+            vec![raw_pointer("p1", 100)],
+            None,
+            vec![entry("r1", Some(200))],
+            &|pid| pid == 100 || pid == 200,
+            &|_| None,
+            DeadPointers::Drop,
+        );
+        assert_eq!(
+            assembled_ids(&sessions),
+            vec![(100, "p1".into()), (200, "r1".into())],
+            "pointer + registry sessions survive on kill -0 alone"
+        );
+    }
+
+    #[test]
+    fn regression_just_started_session_is_never_invisible_for_a_scan() {
+        // Incident-adjacent: the snapshot must be taken AFTER the pointer
+        // read (the shared snapshot_and_assemble is the ONLY place either
+        // wrapper takes it), so a session that starts mid-scan — pointer
+        // missed, pid only in the later snapshot — is still discovered via
+        // the ps supplement. The recording closure proves the snapshot is
+        // taken lazily, inside the helper, with the pointers already fixed.
+        let snapshot_taken = std::cell::Cell::new(false);
+        let sessions = snapshot_and_assemble(
+            Vec::new(), // pointer read already finished: session 555 missed it
+            || {
+                snapshot_taken.set(true);
+                Some(proc_map(&[(555, "")]))
+            },
+            Vec::new(),
+            &|_| false,
+            &|_| Some("/Users/ndr/new".into()),
+            DeadPointers::Keep,
+        );
+        assert!(snapshot_taken.get(), "helper must take the snapshot itself");
+        assert_eq!(assembled_ids(&sessions), vec![(555, String::new())]);
+        assert_eq!(sessions[0].cwd, "/Users/ndr/new");
+    }
+
+    #[test]
+    fn regression_empty_recorded_cwd_is_repaired_in_the_full_pipeline() {
+        // Incident: one bad heal recorded 29 sessions with empty cwd; the
+        // supplement → re-record loop made it immortal. The assembled session
+        // must carry the repaired cwd so the next registry write persists it.
+        let procs = proc_map(&[(100, "")]);
+        let mut poisoned = entry("poisoned", Some(100));
+        poisoned.cwd = String::new();
+        let sessions = assemble_sessions(
+            Vec::new(),
+            Some(&procs),
+            vec![poisoned],
+            &|_| false,
+            &|pid| (pid == 100).then(|| "/Users/ndr".to_string()),
+            DeadPointers::Drop,
+        );
+        // Identity asserted too: a mutation that DROPS the poisoned entry
+        // (instead of repairing it) must fail here, not slip through because
+        // a ps-backstop row happened to occupy index 0.
+        assert_eq!(
+            assembled_ids(&sessions),
+            vec![(100, "poisoned".into())],
+            "the recorded identity survives the repair"
+        );
+        assert_eq!(sessions[0].cwd, "/Users/ndr", "cwd repaired at the seam");
+    }
+
+    #[test]
+    fn regression_duplicate_resume_wave_yields_one_identity_and_full_visibility() {
+        // Incident-class: duplicate resume waves leave several live
+        // `claude --resume X` processes. All must be visible; exactly one may
+        // carry X (registry keyed by id; restore must not double-spawn).
+        let uuid = "3c20ad09-d564-429d-868c-d3a67dcace79";
+        let args = format!("--resume {uuid}");
+        let procs = proc_map(&[(100, &args), (200, &args)]);
+        let sessions = assemble_sessions(
+            Vec::new(),
+            Some(&procs),
+            Vec::new(),
+            &|_| false,
+            &|_| None,
+            DeadPointers::Drop,
+        );
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, vec![uuid, ""], "one identity, both rows visible");
     }
 
     #[test]
