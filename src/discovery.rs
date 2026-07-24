@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -57,7 +58,85 @@ pub fn try_live_sessions() -> Option<Vec<ClaudeSession>> {
             sessions.push(ClaudeSession::from_raw(raw));
         }
     }
+    extend_with_pointerless_live(&mut sessions);
     Some(sessions)
+}
+
+/// Re-add restore-registry sessions that are still process-alive but have NO
+/// live pointer file, deduped against what the pointer scan already found.
+///
+/// Claude Code writes `~/.claude/sessions/<pid>.json` at SessionStart and
+/// removes it at session-end events (auto-compact, `/clear`, a remote-control
+/// detach/reattach) *even while the process keeps running*. So a pointer-only
+/// scan silently under-reports live sessions: a long-running session that has
+/// hit any of those events becomes invisible for the rest of its life. The
+/// restore registry — written while the pointer still existed, and pruned only
+/// by the reaper once the owning terminal dies — still holds those sessions, so
+/// we bring back every entry whose recorded pid is alive right now.
+///
+/// This single supplement reaches all three consumers of the scan, which is why
+/// it lives here rather than in the display alone:
+///   1. the live display ([`scan_sessions`]);
+///   2. the restore-registry writer (`record_hook_event` → `record_live_sessions`
+///      → [`live_sessions`]), so the host merge and — critically — the sandbox
+///      `replace_sandbox_slice` (which otherwise *drops* a pointer-less session
+///      on the next in-sandbox hook) keep it;
+///   3. `--restore-sessions` / `--restore-sbx-sessions`, which read that registry.
+///
+/// The registry slice is chosen by the sandbox marker so an in-sandbox scan
+/// supplements from that sandbox's slice (sandbox-namespace pids) and a host
+/// scan from the local registry (host pids) — `pid_alive` is always evaluated in
+/// the caller's own namespace, matching the pids it is checking. A failure to
+/// read the registry degrades to no supplement (never fewer sessions than the
+/// pointer scan), so it can never turn a readable scan into a failed one.
+///
+/// Liveness is a bare `kill -0`, start-time-blind — the same tradeoff the reaper
+/// makes: a recycled pid can keep a departed entry visible for at most one extra
+/// process lifetime, which errs toward showing a stale row rather than hiding a
+/// live one. The next scan after that pid truly frees drops it.
+fn extend_with_pointerless_live(sessions: &mut Vec<ClaudeSession>) {
+    merge_pointerless_live(sessions, registry_slice_for_current_scope(), pid_alive);
+}
+
+/// Pure core of [`extend_with_pointerless_live`]: append each `registry` entry
+/// that is (a) not already among `sessions` (deduped by `session_id`), (b) has a
+/// recorded pid, and (c) is alive per `is_alive`. Side-effecting inputs — the
+/// registry slice and the liveness probe — are injected so this is deterministic
+/// to unit-test.
+fn merge_pointerless_live(
+    sessions: &mut Vec<ClaudeSession>,
+    registry: Vec<crate::sandbox_registry::SessionEntry>,
+    is_alive: impl Fn(u32) -> bool,
+) {
+    let seen: HashSet<String> = sessions.iter().map(|s| s.session_id.clone()).collect();
+    for entry in registry {
+        if seen.contains(&entry.session_id) {
+            continue;
+        }
+        let Some(pid) = entry.pid else { continue };
+        if !is_alive(pid) {
+            continue;
+        }
+        sessions.push(ClaudeSession::from_raw(RawSession {
+            pid,
+            session_id: entry.session_id,
+            cwd: entry.cwd,
+            started_at: entry.started_at_ms,
+            name: entry.name,
+        }));
+    }
+}
+
+/// The restore-registry slice matching the current scan's scope: the current
+/// sandbox's slice when running inside a sandbox, else the host-local registry.
+fn registry_slice_for_current_scope() -> Vec<crate::sandbox_registry::SessionEntry> {
+    match crate::sandbox_registry::current_sandbox() {
+        Some(name) => crate::sandbox_registry::load()
+            .sandboxes
+            .remove(&name)
+            .unwrap_or_default(),
+        None => crate::sandbox_registry::load_local().sessions,
+    }
 }
 
 /// Canonical transcript path for a session:
@@ -109,6 +188,12 @@ pub fn scan_sessions() -> Vec<ClaudeSession> {
         // JSONL path resolved later by resolve_jsonl_paths() after command_args are populated
         sessions.push(ClaudeSession::from_raw(raw));
     }
+
+    // Sessions Claude Code has dropped the pointer file for but whose process is
+    // still alive (see extend_with_pointerless_live). Their JSONL/status/CPU are
+    // resolved by the same later passes (resolve_jsonl_paths, fetch_ps_data) via
+    // the recorded pid and session_id, so a re-added session shows with real data.
+    extend_with_pointerless_live(&mut sessions);
 
     sessions
 }
@@ -336,6 +421,76 @@ mod tests {
         assert!(!pid_alive(0));
         // A very high pid is almost certainly not a running process.
         assert!(!pid_alive(2_000_000_000));
+    }
+
+    fn entry(session_id: &str, pid: Option<u32>) -> crate::sandbox_registry::SessionEntry {
+        crate::sandbox_registry::SessionEntry {
+            session_id: session_id.to_string(),
+            cwd: "/Users/ndr/work".to_string(),
+            transcript: String::new(),
+            started_at_ms: 1_784_900_000_000,
+            name: Some(format!("name-{session_id}")),
+            pid,
+            owner_pid: None,
+            owner_started_at: None,
+        }
+    }
+
+    fn session(session_id: &str, pid: u32) -> ClaudeSession {
+        ClaudeSession::from_raw(RawSession {
+            pid,
+            session_id: session_id.to_string(),
+            cwd: "/Users/ndr/work".to_string(),
+            started_at: 1_784_900_000_000,
+            name: None,
+        })
+    }
+
+    #[test]
+    fn merge_adds_alive_pointerless_registry_session() {
+        let mut sessions = Vec::new();
+        merge_pointerless_live(&mut sessions, vec![entry("s1", Some(4242))], |_| true);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "s1");
+        assert_eq!(sessions[0].pid, 4242);
+        // Recorded fields survive the SessionEntry -> RawSession -> ClaudeSession hop.
+        assert_eq!(sessions[0].session_name, "name-s1");
+        assert_eq!(sessions[0].cwd, "/Users/ndr/work");
+    }
+
+    #[test]
+    fn merge_dedups_against_sessions_already_from_the_pointer_scan() {
+        // s1 is already present (its pointer file was found); the registry copy
+        // must not double-add it, even though it too is alive.
+        let mut sessions = vec![session("s1", 111)];
+        merge_pointerless_live(
+            &mut sessions,
+            vec![entry("s1", Some(111)), entry("s2", Some(222))],
+            |_| true,
+        );
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["s1", "s2"], "s1 kept once, s2 added");
+    }
+
+    #[test]
+    fn merge_skips_dead_pids_and_missing_pids() {
+        let mut sessions = Vec::new();
+        let alive = 4242u32;
+        merge_pointerless_live(
+            &mut sessions,
+            vec![
+                entry("dead", Some(9001)),
+                entry("no-pid", None),
+                entry("alive", Some(alive)),
+            ],
+            move |pid| pid == alive,
+        );
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["alive"],
+            "only the alive, pid-bearing entry is added"
+        );
     }
 
     #[test]
