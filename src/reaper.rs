@@ -128,7 +128,7 @@ pub(crate) fn parse_sbx_ls_for_single_running_sandbox(stdout: &str) -> Option<St
     None
 }
 
-fn sandbox_sessions_dir() -> String {
+pub(crate) fn sandbox_sessions_dir() -> String {
     resolve_or_default(
         std::env::var("CLAUDECTL_SANDBOX_SESSIONS_DIR")
             .ok()
