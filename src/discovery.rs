@@ -223,6 +223,7 @@ fn merge_pointerless_live(
             cwd,
             started_at: entry.started_at_ms,
             name: entry.name,
+            name_source: None,
         }));
     }
 }
@@ -368,6 +369,7 @@ fn extend_with_ps_live(
             cwd,
             started_at: proc_info.started_at_ms,
             name,
+            name_source: None,
         });
         session.command_args = proc_info.args.clone();
         found.push(session);
@@ -667,6 +669,7 @@ mod tests {
             cwd: "/Users/ndr/work".to_string(),
             started_at: 1_784_900_000_000,
             name: None,
+            name_source: None,
         })
     }
 
@@ -866,6 +869,7 @@ mod tests {
             cwd: "/Users/ndr".into(),
             started_at: 1_784_900_000_000,
             name: None,
+            name_source: None,
         }
     }
 
@@ -922,6 +926,35 @@ mod tests {
         assert_eq!(
             sessions[0].session_name, "resume-old-sessions-audit",
             "ps rediscovery must recover the title from the transcript"
+        );
+    }
+
+    #[test]
+    fn regression_derived_placeholder_assembles_as_unnamed() {
+        // 2026-07-28: Claude Code recreated a resumed session's pointer with
+        // a fresh derived placeholder ("ndr-5e", nameSource:"derived").
+        // Assembled verbatim it became the displayed title, and — as a Some
+        // name — the next hook write overwrote the stored real /rename title
+        // with it. Assembled as unnamed, the hook write records None and
+        // backfill_missing_names keeps the stored title instead.
+        let uuid = "d74ca77e-09ba-42cc-a148-290b6ed2ac98";
+        let mut raw = raw_pointer(uuid, 2647641);
+        raw.name = Some("ndr-5e".into());
+        raw.name_source = Some("derived".into());
+        let procs = proc_map(&[(2647641, &format!("--resume {uuid}"))]);
+        let sessions = assemble_sessions(
+            vec![raw],
+            Some(&procs),
+            Vec::new(),
+            &|_| false,
+            &|_| Some("/Users/ndr".into()),
+            &|_, _| None,
+            DeadPointers::Drop,
+        );
+        assert_eq!(sessions.len(), 1);
+        assert!(
+            sessions[0].session_name.is_empty(),
+            "a derived placeholder must never assemble into a title"
         );
     }
 

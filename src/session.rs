@@ -92,6 +92,28 @@ pub struct RawSession {
     /// over the cwd-derived `project_name` in `display_name()`.
     #[serde(default)]
     pub name: Option<String>,
+    /// Where `name` came from. Claude Code ≥ 2.1.220 mints a placeholder
+    /// name (`<cwd-basename>-<hex>`, e.g. "ndr-5e") at every session
+    /// start/resume and marks it `"nameSource": "derived"`; a real `/rename`
+    /// title carries no source marker. Absent in older pointer files.
+    #[serde(rename = "nameSource", default)]
+    pub name_source: Option<String>,
+}
+
+impl RawSession {
+    /// The session's title, with Claude Code's auto-derived placeholder
+    /// filtered out. A placeholder is minted fresh on every start/resume, so
+    /// ingesting it as a title both displays noise and — because the registry
+    /// merge lets an incoming `Some` name overwrite the stored one — clobbers
+    /// a real `/rename` title on resume. Treat it as "not named" so the
+    /// transcript/registry recovery paths supply the real title instead.
+    fn title(&self) -> Option<String> {
+        if self.name_source.as_deref() == Some("derived") {
+            None
+        } else {
+            self.name.clone()
+        }
+    }
 }
 
 /// Connection target for a host-side terminal when claudectl runs inside the
@@ -359,6 +381,7 @@ impl SubagentBreakdown {
 impl ClaudeSession {
     pub fn from_raw(raw: RawSession) -> Self {
         let project_name = raw.cwd.rsplit('/').next().unwrap_or("unknown").to_string();
+        let session_name = raw.title().unwrap_or_default();
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -397,7 +420,7 @@ impl ClaudeSession {
             total_output_tokens: 0,
             model: String::new(),
             command_args: String::new(),
-            session_name: raw.name.unwrap_or_default(),
+            session_name,
             jsonl_path: None,
             jsonl_offset: 0,
             last_message_ts: 0,
@@ -869,7 +892,51 @@ mod tests {
             cwd: "/tmp/project".into(),
             started_at: 0,
             name: None,
+            name_source: None,
         })
+    }
+
+    #[test]
+    fn regression_derived_pointer_name_is_not_a_title() {
+        // Verbatim pointer shape written by Claude Code 2.1.220 (2026-07-28):
+        // the auto-derived placeholder ("<cwd-basename>-<hex>") must not
+        // become the session title — displayed it is noise, and recorded it
+        // overwrites a real stored /rename title on resume.
+        let raw: RawSession = serde_json::from_str(
+            r#"{"pid":2647641,"sessionId":"d74ca77e-09ba-42cc-a148-290b6ed2ac98",
+                "cwd":"/Users/ndr","startedAt":1785261352874,
+                "name":"ndr-5e","nameSource":"derived"}"#,
+        )
+        .unwrap();
+        assert_eq!(raw.name_source.as_deref(), Some("derived"));
+        assert!(ClaudeSession::from_raw(raw).session_name.is_empty());
+    }
+
+    #[test]
+    fn renamed_pointer_title_is_kept() {
+        // A /rename title carries no nameSource marker.
+        let raw: RawSession = serde_json::from_str(
+            r#"{"pid":1018766,"sessionId":"944e1a21-95f9-4630-b422-ef2e9a90876e",
+                "cwd":"/Users/ndr","startedAt":1785153171968,
+                "name":"detect-bad-slow-validators"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ClaudeSession::from_raw(raw).session_name,
+            "detect-bad-slow-validators"
+        );
+    }
+
+    #[test]
+    fn unfamiliar_name_source_is_trusted() {
+        // Only "derived" marks a placeholder; any other (future) source is a
+        // real title and must survive.
+        let raw: RawSession = serde_json::from_str(
+            r#"{"pid":1,"sessionId":"s","cwd":"/x","startedAt":0,
+                "name":"my-title","nameSource":"custom"}"#,
+        )
+        .unwrap();
+        assert_eq!(ClaudeSession::from_raw(raw).session_name, "my-title");
     }
 
     #[test]

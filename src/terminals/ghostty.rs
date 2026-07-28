@@ -194,6 +194,7 @@ mod tests {
             cwd: cwd.into(),
             started_at: 0,
             name: (!name.is_empty()).then(|| name.to_string()),
+            name_source: None,
         });
         session.terminal_id = terminal_id.map(str::to_string);
         session.tty = tty.into();
@@ -274,6 +275,7 @@ mod tests {
             cwd: cwd.into(),
             started_at: 0,
             name: None,
+            name_source: None,
         };
         let mut s = ClaudeSession::from_raw(raw);
         s.session_name = name.into();

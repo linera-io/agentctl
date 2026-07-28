@@ -767,6 +767,7 @@ mod tests {
             cwd: project_cwd.into(),
             started_at: 0,
             name: None,
+            name_source: None,
         };
         let mut s = ClaudeSession::from_raw(raw);
         s.session_name = name.into();

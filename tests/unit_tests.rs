@@ -31,6 +31,7 @@ fn test_session_from_raw() {
         cwd: "/Users/test/projects/my-app".to_string(),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let session = ClaudeSession::from_raw(raw);
     assert_eq!(session.pid, 12345);
@@ -47,6 +48,7 @@ fn test_session_display_name_prefers_session_name() {
         cwd: "/tmp/foo".to_string(),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let mut session = ClaudeSession::from_raw(raw);
     session.session_name = "my-custom-name".to_string();
@@ -62,6 +64,7 @@ fn test_format_elapsed() {
         cwd: "/tmp".to_string(),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let mut session = ClaudeSession::from_raw(raw);
     session.elapsed = Duration::from_secs(3661);
@@ -80,6 +83,7 @@ fn test_format_tokens() {
         cwd: "/tmp".to_string(),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let mut session = ClaudeSession::from_raw(raw);
 
@@ -101,6 +105,7 @@ fn test_format_cost() {
         cwd: "/tmp".to_string(),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let mut session = ClaudeSession::from_raw(raw);
 
@@ -130,6 +135,7 @@ fn test_cwd_to_project_name() {
             cwd: cwd.to_string(),
             started_at: 0,
             name: None,
+            name_source: None,
         };
         let session = ClaudeSession::from_raw(raw);
         assert_eq!(session.project_name, expected, "cwd={cwd}");
@@ -148,6 +154,7 @@ fn test_session_name_from_raw_name_field() {
         cwd: "/Users/jane/linera-protocol".into(),
         started_at: 0,
         name: Some("fix-validator-oom".into()),
+        name_source: None,
     };
     let s = ClaudeSession::from_raw(raw);
     assert_eq!(s.session_name, "fix-validator-oom");
@@ -165,6 +172,7 @@ fn test_display_name_falls_back_to_cwd_when_name_absent() {
         cwd: "/Users/jane/linera-protocol".into(),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let s = ClaudeSession::from_raw(raw);
     assert_eq!(s.session_name, "");

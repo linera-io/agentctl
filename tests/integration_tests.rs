@@ -32,6 +32,7 @@ fn make_session(cpu: f32, last_message_age_secs: u64) -> ClaudeSession {
         cwd: "/tmp/test-project".into(),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let mut s = ClaudeSession::from_raw(raw);
     s.cpu_percent = cpu;
@@ -191,6 +192,7 @@ fn status_no_telemetry_unknown() {
         cwd: "/tmp/test-project".into(),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let mut s = ClaudeSession::from_raw(raw);
     monitor::infer_status(&mut s, "", "", false);
@@ -211,6 +213,7 @@ fn session_with_id(id: &str, cpu: f32) -> ClaudeSession {
         cwd: "/tmp/test-project".into(),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let mut s = ClaudeSession::from_raw(raw);
     s.cpu_percent = cpu;
@@ -877,6 +880,7 @@ fn make_session_with_jsonl(content: &str) -> (ClaudeSession, tempfile::NamedTemp
         cwd: "/tmp/test".into(),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let mut s = ClaudeSession::from_raw(raw);
     s.jsonl_path = Some(file.path().to_path_buf());
@@ -894,6 +898,7 @@ fn make_session_with_paths(
         cwd,
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let mut s = ClaudeSession::from_raw(raw);
     s.jsonl_path = Some(jsonl_path);
@@ -959,6 +964,7 @@ fn jsonl_incremental_reads() {
         cwd: "/tmp/test".into(),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let mut s = ClaudeSession::from_raw(raw);
     s.jsonl_path = Some(file.path().to_path_buf());
@@ -1035,6 +1041,7 @@ fn jsonl_missing_file() {
         cwd: "/tmp/test".into(),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let mut s = ClaudeSession::from_raw(raw);
     s.jsonl_path = Some(std::path::PathBuf::from("/nonexistent/path.jsonl"));
@@ -1052,6 +1059,7 @@ fn jsonl_no_path() {
         cwd: "/tmp/test".into(),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let mut s = ClaudeSession::from_raw(raw);
     // jsonl_path is None
@@ -1475,6 +1483,7 @@ fn resolve_with_layout(
         cwd: cwd.to_string(),
         started_at: 1776421121745,
         name: None,
+        name_source: None,
     };
     let mut session = ClaudeSession::from_raw(raw);
     discovery::resolve_jsonl_paths(std::slice::from_mut(&mut session));
@@ -1552,6 +1561,7 @@ fn resolve_jsonl_encoding_mismatch_fallback() {
         cwd: cwd.to_string(),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let mut session = ClaudeSession::from_raw(raw);
     discovery::resolve_jsonl_paths(std::slice::from_mut(&mut session));

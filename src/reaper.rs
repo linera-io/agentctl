@@ -611,8 +611,25 @@ fn scan_sandbox_sidecars() -> io::Result<Vec<SandboxSidecar>> {
     //
     // No jq dependency in the sandbox — use bash + grep + sed. Each output
     // line is `<pid>\t<host_tty>\t<alive>\t<name>` where alive is 0 or 1.
-    let dir = sandbox_sessions_dir();
-    let script = format!(
+    let script = sidecar_scan_script(&sandbox_sessions_dir());
+
+    let output = Command::new("sbx")
+        .args(["exec", &sandbox_name(), "bash", "-c", &script])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "sbx exec sidecar-scan failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_sandbox_sidecars(&text))
+}
+
+/// The in-sandbox scan script for `dir`. Its own fn so tests can execute it
+/// against a fixture directory with plain `bash -c` (no sbx).
+fn sidecar_scan_script(dir: &str) -> String {
+    format!(
         r#"
 set -u
 DIR={dir}
@@ -628,23 +645,17 @@ for sc in "$DIR"/*.terminal.json; do
   if [ -f "$DIR/$pid.json" ]; then
     name=$(grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' "$DIR/$pid.json" 2>/dev/null \
       | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -n1)
+    # Claude Code >= 2.1.220 marks its auto-derived placeholder names
+    # (e.g. "ndr-5e") with nameSource:"derived" — don't label reap logs
+    # with them (mirrors RawSession::title()).
+    if grep -q '"nameSource"[[:space:]]*:[[:space:]]*"derived"' "$DIR/$pid.json" 2>/dev/null; then
+      name=""
+    fi
   fi
   printf '%s\t%s\t%s\t%s\n' "$pid" "$host_tty" "$alive" "$name"
 done
 "#
-    );
-
-    let output = Command::new("sbx")
-        .args(["exec", &sandbox_name(), "bash", "-c", &script])
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "sbx exec sidecar-scan failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_sandbox_sidecars(&text))
+    )
 }
 
 /// Pure parser for the tab-separated sandbox-side scan output.
@@ -1745,6 +1756,56 @@ old-sbx        claude   stopped           /elsewhere
         // No SANDBOX header line → can't parse → None.
         let stdout = "totally bogus\noutput here\n";
         assert_eq!(parse_sbx_ls_for_single_running_sandbox(stdout), None);
+    }
+
+    #[test]
+    fn regression_scan_script_drops_derived_placeholder_names() {
+        // Executed against a fixture dir with plain bash. The reaper's grep
+        // pipeline read the pointer's raw "name" and printed Claude Code's
+        // auto-derived placeholder ("ndr-5e") in reap logs; it must honor
+        // nameSource:"derived" the same way RawSession::title() does.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("101.terminal.json"),
+            r#"{"host_tty":"/dev/ttys038"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("101.json"),
+            r#"{"pid":101,"name":"ndr-5e","nameSource":"derived"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("202.terminal.json"),
+            r#"{"host_tty":"/dev/ttys039"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("202.json"),
+            r#"{"pid":202,"name":"real-title"}"#,
+        )
+        .unwrap();
+        let script = sidecar_scan_script(dir.path().to_str().unwrap());
+        let out = std::process::Command::new("bash")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "scan script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let sidecars = parse_sandbox_sidecars(&String::from_utf8_lossy(&out.stdout));
+        let name_of = |pid: u32| {
+            sidecars
+                .iter()
+                .find(|s| s.pid == pid)
+                .unwrap_or_else(|| panic!("pid {pid} missing from scan output"))
+                .name
+                .clone()
+        };
+        assert_eq!(name_of(101), "", "derived placeholder must not label logs");
+        assert_eq!(name_of(202), "real-title");
     }
 
     #[test]
