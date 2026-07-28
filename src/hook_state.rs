@@ -509,17 +509,38 @@ pub fn is_compacting(state: &HookState) -> bool {
     now_ms().saturating_sub(pre) < COMPACTING_MAX_AGE_MS
 }
 
+/// Timestamp of the newest event that means "a turn is under way": the user's
+/// prompt, or a tool starting or finishing inside the response.
+///
+/// This is the hook stream's idea of how far the current turn has progressed,
+/// and the yardstick the transcript is compared against when the two disagree
+/// (see `monitor::transcript_ended_the_turn`).
+pub fn newest_turn_event_ms(state: &HookState) -> u64 {
+    state
+        .last_promptsubmit_ts_ms
+        .max(state.last_pretooluse_ts_ms)
+        .max(state.last_posttooluse_ts_ms)
+}
+
 /// Whether Claude is currently responding to a prompt.
 ///
 /// True when *any* mid-turn event is more recent than the last `Stop`. Tools
 /// coming and going inside a single response don't flip this — claude only
 /// stops "responding" when `Stop` fires at the end of the turn. This is
 /// what makes the status stable instead of flickering with each tool call.
+///
+/// Note the asymmetry this creates, and why callers must not treat a `true`
+/// here as the final word: every other marker in this module expires
+/// (`is_at_permission_prompt` after 30 min, `is_compacting` after 5), but a
+/// turn has no honest upper bound — an agent can legitimately grind for hours.
+/// So if the `Stop` that ends the turn never arrives, this stays true forever.
+/// That is exactly what happened on 2026-07-28: sessions whose `Stop` hook
+/// never reached claudectl were reported `Processing` for up to 15 hours while
+/// their transcripts had long since ended in `end_turn`. The transcript — which
+/// Claude Code writes itself, and which therefore cannot be lost the way a hook
+/// invocation can — is the tie-breaker, applied in `monitor`.
 pub fn is_responding(state: &HookState) -> bool {
-    let stop = state.last_stop_ts_ms;
-    state.last_promptsubmit_ts_ms > stop
-        || state.last_pretooluse_ts_ms > stop
-        || state.last_posttooluse_ts_ms > stop
+    newest_turn_event_ms(state) > state.last_stop_ts_ms
 }
 
 /// Whether Claude has cleanly finished its turn — `Stop` is the latest

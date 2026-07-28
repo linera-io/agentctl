@@ -225,6 +225,7 @@ fn session_with_id(id: &str, cpu: f32) -> ClaudeSession {
 
 #[test]
 fn hook_permission_prompt_marks_needs_input() {
+    isolate_hook_state_dir();
     let sid = "hook-test-permission";
     claudectl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Notification",
@@ -250,6 +251,7 @@ fn hook_permission_prompt_marks_needs_input() {
 
 #[test]
 fn hook_pretooluse_clears_permission_prompt() {
+    isolate_hook_state_dir();
     let sid = "hook-test-approval";
     claudectl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Notification",
@@ -273,6 +275,7 @@ fn hook_pretooluse_clears_permission_prompt() {
 
 #[test]
 fn hook_precompact_marks_compacting() {
+    isolate_hook_state_dir();
     let sid = "hook-test-compacting";
     claudectl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "PreCompact",
@@ -287,6 +290,7 @@ fn hook_precompact_marks_compacting() {
 
 #[test]
 fn hook_stop_marks_waiting_input() {
+    isolate_hook_state_dir();
     let sid = "hook-test-stop";
     claudectl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Stop",
@@ -301,6 +305,7 @@ fn hook_stop_marks_waiting_input() {
 
 #[test]
 fn hook_userpromptsubmit_after_stop_marks_responding() {
+    isolate_hook_state_dir();
     let sid = "hook-test-followup";
     claudectl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Stop",
@@ -321,6 +326,7 @@ fn hook_userpromptsubmit_after_stop_marks_responding() {
 
 #[test]
 fn hook_waiting_input_ages_out_to_idle() {
+    isolate_hook_state_dir();
     let sid = "hook-test-waiting-ages-out";
     claudectl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Stop",
@@ -341,6 +347,7 @@ fn hook_waiting_input_ages_out_to_idle() {
 
 #[test]
 fn hook_waiting_input_recent_stays_waiting() {
+    isolate_hook_state_dir();
     let sid = "hook-test-waiting-recent";
     claudectl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Stop",
@@ -355,6 +362,7 @@ fn hook_waiting_input_recent_stays_waiting() {
 
 #[test]
 fn hook_responding_stable_across_tool_boundaries() {
+    isolate_hook_state_dir();
     // The whole point of the is_responding check: tools coming and going
     // inside one turn don't flicker the status. UserPromptSubmit was the
     // most-recent-event when the turn started; PreToolUse/PostToolUse
@@ -391,6 +399,7 @@ fn hook_responding_stable_across_tool_boundaries() {
 
 #[test]
 fn hook_permission_prompt_cleared_by_subsequent_event() {
+    isolate_hook_state_dir();
     // After Notification, ANY later state-changing event clears the prompt
     // regardless of which one. PreToolUse means approved; PostToolUse means
     // a tool finished (could be a denial result); UserPromptSubmit means
@@ -417,6 +426,7 @@ fn hook_permission_prompt_cleared_by_subsequent_event() {
 
 #[test]
 fn hook_worker_permission_prompt_marks_needs_input() {
+    isolate_hook_state_dir();
     // Subagents fire `notification_type = "worker_permission_prompt"` instead
     // of `"permission_prompt"` (verified against Claude Code 2.1.117 binary).
     // Both must classify the session as NeedsInput.
@@ -442,6 +452,7 @@ fn hook_worker_permission_prompt_marks_needs_input() {
 
 #[test]
 fn hook_worker_pretooluse_clears_permission_prompt() {
+    isolate_hook_state_dir();
     // Approval of a subagent's prompt fires PreToolUse with the approved
     // tool — same semantic as the main-agent case.
     let sid = "hook-test-worker-approval";
@@ -465,6 +476,7 @@ fn hook_worker_pretooluse_clears_permission_prompt() {
 
 #[test]
 fn hook_permission_prompt_outranks_compacting() {
+    isolate_hook_state_dir();
     // Edge case: both signals are set. NeedsInput wins because a pending
     // permission prompt is the most actionable state and because Compacting
     // has been observed to get stuck on sessions where Stop never fires —
@@ -495,6 +507,7 @@ fn hook_permission_prompt_outranks_compacting() {
 
 #[test]
 fn hook_postcompact_clears_compacting_without_stop() {
+    isolate_hook_state_dir();
     // Auto-compact paths where Stop never fires: PostCompact is the direct
     // "compaction done" signal and must clear the Compacting status on its
     // own.
@@ -519,6 +532,126 @@ fn hook_postcompact_clears_compacting_without_stop() {
     let mut s = session_with_id(sid, 0.5);
     monitor::infer_status(&mut s, "user", "", false);
     assert_ne!(s.status, SessionStatus::Compacting);
+}
+
+/// Replay a turn that ran and finished, but whose `Stop` hook never reached
+/// claudectl — the 2026-07-28 incident. `mid_turn_age_secs` backdates every
+/// recorded event so the transcript tail can be placed after them.
+fn state_with_lost_stop(sid: &str, mid_turn_age_secs: u64) -> claudectl::hook_state::HookState {
+    isolate_hook_state_dir();
+    for (event, tool) in [
+        ("UserPromptSubmit", None),
+        ("PreToolUse", Some("Bash")),
+        ("PostToolUse", Some("Bash")),
+    ] {
+        claudectl::hook_state::record_hook_event(&serde_json::json!({
+            "hook_event_name": event,
+            "session_id": sid,
+            "tool_name": tool,
+        }))
+        .unwrap();
+    }
+    let mut state = claudectl::hook_state::HookState::load(sid).unwrap();
+    let back = mid_turn_age_secs * 1000;
+    state.last_promptsubmit_ts_ms = state.last_promptsubmit_ts_ms.saturating_sub(back);
+    state.last_pretooluse_ts_ms = state.last_pretooluse_ts_ms.saturating_sub(back);
+    state.last_posttooluse_ts_ms = state.last_posttooluse_ts_ms.saturating_sub(back);
+    assert_eq!(state.last_stop_ts_ms, 0, "the lost Stop is the whole point");
+    let path = claudectl::hook_state::state_dir().join(format!("{sid}.json"));
+    std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
+    state
+}
+
+#[test]
+fn regression_lost_stop_does_not_pin_finished_turn_to_processing() {
+    // 2026-07-28: three live sandbox sessions sat on `Processing` for hours
+    // (one for 15h) while their transcripts ended in `assistant`/`end_turn`.
+    // Every one had `last_stop_ts_ms == 0`: the Stop hook never reached
+    // claudectl, `is_responding` had no staleness bound, and
+    // `status_from_hook_state` returned early — so the JSONL heuristic that
+    // would have said WaitingInput never ran.
+    let sid = "regression-lost-stop-waiting";
+    let state = state_with_lost_stop(sid, 120);
+
+    // Transcript ended the turn AFTER the last recorded hook event.
+    let mut s = session_with_id(sid, 0.5);
+    s.last_message_ts = state.last_posttooluse_ts_ms + 1_000;
+    monitor::infer_status(&mut s, "assistant", "end_turn", false);
+    assert_eq!(s.status, SessionStatus::WaitingInput);
+}
+
+#[test]
+fn regression_lost_stop_long_quiet_session_ages_to_idle() {
+    // Same shape, but the finished turn is long past — the session belongs in
+    // Idle, not Processing. (Live case: `d0ac5803`, last `end_turn` 15h old.)
+    let sid = "regression-lost-stop-idle";
+    let state = state_with_lost_stop(sid, 20 * 60);
+
+    let mut s = session_with_id(sid, 0.5);
+    s.last_message_ts = state.last_posttooluse_ts_ms + 1_000;
+    monitor::infer_status(&mut s, "assistant", "end_turn", false);
+    assert_eq!(s.status, SessionStatus::Idle);
+}
+
+#[test]
+fn regression_lost_stop_veto_needs_a_finished_transcript_tail() {
+    // The transcript only vetoes when it actually says the turn ended. A tail
+    // still sitting on `tool_use` proves nothing, so the hook state stands and
+    // the session stays Processing.
+    let sid = "regression-lost-stop-tool-tail";
+    let state = state_with_lost_stop(sid, 120);
+
+    let mut s = session_with_id(sid, 0.5);
+    s.last_message_ts = state.last_posttooluse_ts_ms + 1_000;
+    monitor::infer_status(&mut s, "assistant", "tool_use", false);
+    assert_eq!(s.status, SessionStatus::Processing);
+}
+
+#[test]
+fn regression_transcript_veto_never_masks_a_live_turn() {
+    isolate_hook_state_dir();
+    // The guard that keeps the fix honest: a turn that is genuinely under way
+    // must stay Processing. The user's follow-up prompt is newer than the
+    // transcript's last (previous-turn) `end_turn` message, so the stale tail
+    // must not be read as "this turn is over".
+    let sid = "regression-live-turn-not-masked";
+    claudectl::hook_state::record_hook_event(&serde_json::json!({
+        "hook_event_name": "Stop",
+        "session_id": sid,
+    }))
+    .unwrap();
+    claudectl::hook_state::record_hook_event(&serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": sid,
+    }))
+    .unwrap();
+
+    let state = claudectl::hook_state::HookState::load(sid).unwrap();
+    let mut s = session_with_id(sid, 0.5);
+    s.last_message_ts = state.last_promptsubmit_ts_ms.saturating_sub(1_000);
+    monitor::infer_status(&mut s, "assistant", "end_turn", false);
+    assert_eq!(s.status, SessionStatus::Processing);
+}
+
+#[test]
+fn regression_transcript_veto_never_masks_an_in_flight_tool() {
+    isolate_hook_state_dir();
+    // Same guard, tool edition: PreToolUse fired after the transcript's last
+    // message (Claude Code writes the tool_use entry, then the tool runs).
+    // The tail is older than the hook event, so no veto — still Processing.
+    let sid = "regression-in-flight-tool-not-masked";
+    claudectl::hook_state::record_hook_event(&serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": sid,
+        "tool_name": "Bash",
+    }))
+    .unwrap();
+
+    let state = claudectl::hook_state::HookState::load(sid).unwrap();
+    let mut s = session_with_id(sid, 0.5);
+    s.last_message_ts = state.last_pretooluse_ts_ms.saturating_sub(1_000);
+    monitor::infer_status(&mut s, "assistant", "end_turn", false);
+    assert_eq!(s.status, SessionStatus::Processing);
 }
 
 #[test]
