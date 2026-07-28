@@ -1187,6 +1187,7 @@ pub(crate) fn run_brain_query(cfg: &config::Config, cli: &Cli) -> io::Result<()>
             .unwrap_or_else(|_| ".".into()),
         started_at: 0,
         name: None,
+        name_source: None,
     });
     synthetic.project_name = project.clone();
     synthetic.status = session::SessionStatus::NeedsInput;

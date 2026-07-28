@@ -511,6 +511,7 @@ mod tests {
             cwd: "/w".into(),
             started_at: 0,
             name: None,
+            name_source: None,
         });
 
         apply_sidecar_probe(&mut session, None);
@@ -539,6 +540,7 @@ mod tests {
             cwd: "/w".into(),
             started_at: 0,
             name: None,
+            name_source: None,
         });
         for _ in 0..SIDECAR_PROBE_ATTEMPTS - 1 {
             apply_sidecar_probe(&mut never, None);

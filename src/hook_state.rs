@@ -736,6 +736,7 @@ mod tests {
             cwd: "/work".to_string(),
             started_at: 42,
             name: None,
+            name_source: None,
         });
         let cached_with_dead_owner = crate::sandbox_registry::SessionEntry {
             session_id: "aaa".to_string(),

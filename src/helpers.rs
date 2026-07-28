@@ -155,6 +155,7 @@ pub(crate) fn create_aggregate_session(total_cost: f64, limit: f64, period: &str
         cwd: String::new(),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let mut s = ClaudeSession::from_raw(raw);
     s.project_name = format!("{period}-budget");

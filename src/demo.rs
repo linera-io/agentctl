@@ -139,6 +139,7 @@ pub fn generate_sessions(tick: u32) -> Vec<ClaudeSession> {
                 cwd: cwd.to_string(),
                 started_at: 0, // Will be overridden
                 name: None,
+                name_source: None,
             };
             let mut s = ClaudeSession::from_raw(raw);
             s.project_name = name.to_string();

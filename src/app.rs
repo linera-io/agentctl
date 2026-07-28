@@ -2644,6 +2644,7 @@ mod tests {
             cwd: format!("/tmp/{project}"),
             started_at: 0,
             name: None,
+            name_source: None,
         };
         let mut session = ClaudeSession::from_raw(raw);
         session.project_name = project.to_string();
@@ -2975,6 +2976,7 @@ mod tests {
             cwd: format!("/tmp/{project}"),
             started_at: 0,
             name: None,
+            name_source: None,
         };
         let mut s = ClaudeSession::from_raw(raw);
         s.project_name = project.into();

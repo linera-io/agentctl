@@ -817,6 +817,7 @@ mod tests {
             cwd: "/tmp/test".into(),
             started_at: 0,
             name: None,
+            name_source: None,
         };
         let mut s = ClaudeSession::from_raw(raw);
         s.status = status;

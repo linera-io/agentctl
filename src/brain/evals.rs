@@ -180,6 +180,7 @@ fn build_session_from_eval(eval: &EvalSession) -> ClaudeSession {
         cwd: format!("/tmp/{}", eval.project),
         started_at: 0,
         name: None,
+        name_source: None,
     };
     let mut s = ClaudeSession::from_raw(raw);
     s.status = match eval.status.to_lowercase().as_str() {
