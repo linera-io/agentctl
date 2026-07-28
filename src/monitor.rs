@@ -377,7 +377,9 @@ pub fn infer_status(
     // they tell us exactly what state it's in — no CPU/age guessing needed.
     if !session.session_id.is_empty() {
         if let Some(state) = HookState::load(&session.session_id) {
-            if let Some(status) = status_from_hook_state(&state, session) {
+            if let Some(status) =
+                status_from_hook_state(&state, session, last_msg_type, last_stop_reason)
+            {
                 session.status = status;
                 return;
             }
@@ -397,10 +399,10 @@ pub fn infer_status(
 /// Map a populated hook state to the appropriate status, or `None` when the
 /// state is empty / inconclusive (in which case we fall back to heuristics).
 ///
-/// Pure deterministic status. Every check is a comparison of hook
-/// timestamps — no CPU, no JSONL parsing, no age guessing. The hook
-/// helpers in `hook_state` already handle staleness via "most-recent-event"
-/// comparisons.
+/// Deterministic status from hook timestamps — no CPU, no age guessing. The
+/// hook helpers in `hook_state` already handle staleness via "most-recent-event"
+/// comparisons, with one exception the transcript has to settle: see
+/// [`transcript_ended_the_turn`].
 ///
 /// Precedence (highest to lowest): NeedsInput > Compacting > Processing >
 /// WaitingInput. NeedsInput wins over everything because a pending
@@ -412,14 +414,21 @@ pub fn infer_status(
 /// is "blocked on me." Idle is never produced from hook state — a session
 /// that has fired any hook recently is by definition not idle, and a
 /// session that hasn't fired any hook is handled by the heuristic fallback.
-fn status_from_hook_state(state: &HookState, _session: &ClaudeSession) -> Option<SessionStatus> {
+fn status_from_hook_state(
+    state: &HookState,
+    session: &ClaudeSession,
+    last_msg_type: &str,
+    last_stop_reason: &str,
+) -> Option<SessionStatus> {
     if hook_state::is_at_permission_prompt(state) {
         return Some(SessionStatus::NeedsInput);
     }
     if hook_state::is_compacting(state) {
         return Some(SessionStatus::Compacting);
     }
-    if hook_state::is_responding(state) {
+    if hook_state::is_responding(state)
+        && !transcript_ended_the_turn(state, session, last_msg_type, last_stop_reason)
+    {
         return Some(SessionStatus::Processing);
     }
     if hook_state::is_waiting_for_user(state) {
@@ -435,6 +444,36 @@ fn status_from_hook_state(state: &HookState, _session: &ClaudeSession) -> Option
         });
     }
     None
+}
+
+/// Whether the transcript proves the turn is over even though the hook stream
+/// still looks mid-turn — the one place the JSONL overrules a hook marker.
+///
+/// `is_responding` is the only marker with no expiry (a turn may legitimately
+/// run for hours), so a `Stop` that never reaches claudectl pins the session to
+/// `Processing` for the rest of its life. Hook events are lossy: each one is a
+/// separate `claudectl` process Claude Code spawns with a 5 s timeout, and any
+/// invocation can be dropped. The transcript is not — Claude Code writes it
+/// itself — so when it says the assistant finished its turn we believe it.
+///
+/// Two conditions, both required:
+///   1. the tail is an assistant message that *ended* (`end_turn` /
+///      `stop_sequence`) — a `tool_use` tail proves nothing, the tool may still
+///      be running;
+///   2. that message is at least as new as the newest mid-turn hook event —
+///      otherwise it describes the *previous* turn and vetoing on it would
+///      report a live turn as finished. This is what keeps the fix from
+///      trading one wrong status for its mirror image.
+fn transcript_ended_the_turn(
+    state: &HookState,
+    session: &ClaudeSession,
+    last_msg_type: &str,
+    last_stop_reason: &str,
+) -> bool {
+    if last_msg_type != "assistant" || !matches!(last_stop_reason, "end_turn" | "stop_sequence") {
+        return false;
+    }
+    session.last_message_ts >= hook_state::newest_turn_event_ms(state)
 }
 
 /// Heuristic fallback when the deterministic hook state path returned None.

@@ -4,6 +4,21 @@ All notable changes to claudectl are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **A lost `Stop` hook no longer pins a session to `Processing` forever.** Every
+  other deterministic marker expires (permission prompt after 30 min, compaction
+  after 5), but a turn has no honest time limit, so `is_responding` had no bound
+  at all: if the `Stop` event that ends the turn never reached claudectl, the
+  session reported `Processing` for the rest of its life and the JSONL heuristic
+  that would have said `Waiting` never ran (`status_from_hook_state` returns
+  early). Observed on 2026-07-28 across three live sandbox sessions, one stuck
+  for 15 hours with a transcript that had ended in `end_turn`. The transcript —
+  written by Claude Code itself, so it cannot be dropped the way a hook
+  invocation can — now overrules the hook state when it shows the assistant
+  finished its turn *at or after* the newest mid-turn hook event. The
+  at-or-after test is what keeps a genuinely live turn from being mislabelled
+  `Waiting` off a stale previous-turn tail.
+
 ### Removed
 - **claudectl no longer deletes Claude Code session-pointer files.** The
   `cleanup_stale_sessions` GC (delete `~/.claude/sessions/<pid>.json` when the
