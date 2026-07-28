@@ -488,7 +488,7 @@ pub(crate) mod tests {
     /// from poisoning so one panicking test doesn't cascade into the rest.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn env_guard() -> MutexGuard<'static, ()> {
+    pub(crate) fn env_guard() -> MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 

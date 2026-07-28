@@ -307,15 +307,45 @@ struct TerminalSidecar {
 /// bootstrap (see tools/agent-sandbox/sbx-template/sandbox-bootstrap-inner).
 /// Returns the HOST-side TTY + terminal-application id if present.
 ///
-/// The sidecar lives at $HOME/.claude/sessions/<pid>.terminal.json. Only the
-/// agent sandbox writes it; for non-sandbox claude sessions (host-native) the
-/// file is absent and this returns None — the regular `ps` TTY stands.
+/// The bootstrap writes `<pid>.terminal.json` to `$HOME/.claude/sessions/` —
+/// but inside the sandbox that path is a per-exec-namespace bind mount of
+/// `/var/lib/sandbox-sessions`, and execs that skip the bootstrap overlay
+/// (notably the shell the TUI runs in) see the host directory instead, where
+/// the sidecars don't exist. So probe the canonical sandbox dir first: it is
+/// the real directory behind every overlay and is visible from any in-sandbox
+/// namespace. It doesn't exist on hosts, where the `$HOME` path stands. For
+/// non-sandbox claude sessions the file is absent everywhere and this returns
+/// None — the regular `ps` TTY stands.
 fn read_terminal_sidecar(pid: u32) -> Option<TerminalSidecar> {
-    let home = std::env::var_os("HOME")?;
-    let path = std::path::PathBuf::from(home)
-        .join(".claude")
-        .join("sessions")
-        .join(format!("{pid}.terminal.json"));
+    first_sidecar_in(&sidecar_candidate_dirs(), pid)
+}
+
+/// Sidecar search path, most authoritative first. The sandbox dir honors the
+/// same `CLAUDECTL_SANDBOX_SESSIONS_DIR` override as the reaper — with one
+/// caveat: the reaper interpolates the value into a bash script (where `~`
+/// and `$VARS` expand), while this probe uses it as a literal path, so an
+/// override must be an absolute literal path to work for both.
+fn sidecar_candidate_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![std::path::PathBuf::from(
+        crate::reaper::sandbox_sessions_dir(),
+    )];
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(
+            std::path::PathBuf::from(home)
+                .join(".claude")
+                .join("sessions"),
+        );
+    }
+    dirs
+}
+
+fn first_sidecar_in(dirs: &[std::path::PathBuf], pid: u32) -> Option<TerminalSidecar> {
+    dirs.iter()
+        .find_map(|dir| read_terminal_sidecar_in(dir, pid))
+}
+
+fn read_terminal_sidecar_in(dir: &std::path::Path, pid: u32) -> Option<TerminalSidecar> {
+    let path = dir.join(format!("{pid}.terminal.json"));
     let body = std::fs::read_to_string(&path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&body).ok()?;
     let trim = |v: &serde_json::Value, key: &str| -> Option<String> {
@@ -494,6 +524,100 @@ mod tests {
         assert!(!is_claude_process(
             "bash -lc 'exec sandbox-bootstrap claude --resume foo'"
         ));
+    }
+
+    #[test]
+    fn regression_sidecar_found_in_canonical_sandbox_dir_without_overlay() {
+        // 2026-07-28: the TUI's exec namespace lacked the ~/.claude/sessions
+        // overlay, so sidecars only existed in /var/lib/sandbox-sessions.
+        // Reading only $HOME/.claude/sessions left terminal_id unset and Tab
+        // fell back to cwd matching, focusing an arbitrary same-cwd Ghostty
+        // tab (or erroring for cwds with no host tab).
+        let sandbox = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sandbox.path().join("4242.terminal.json"),
+            r#"{"host_tty":"/dev/ttys038","terminal_id":"7464E59F","terminal_type":"ghostty"}"#,
+        )
+        .unwrap();
+        let dirs = vec![sandbox.path().to_path_buf(), home.path().to_path_buf()];
+        let sidecar = first_sidecar_in(&dirs, 4242).expect("sidecar in sandbox dir must be found");
+        assert_eq!(sidecar.terminal_id.as_deref(), Some("7464E59F"));
+        assert_eq!(sidecar.host_tty.as_deref(), Some("/dev/ttys038"));
+    }
+
+    #[test]
+    fn sidecar_falls_back_to_home_sessions_dir() {
+        // Host-native macOS: /var/lib/sandbox-sessions doesn't exist and the
+        // $HOME path is the only location.
+        let sandbox = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("7.terminal.json"),
+            r#"{"terminal_id":"ID-7"}"#,
+        )
+        .unwrap();
+        let dirs = vec![sandbox.path().to_path_buf(), home.path().to_path_buf()];
+        assert_eq!(
+            first_sidecar_in(&dirs, 7).unwrap().terminal_id.as_deref(),
+            Some("ID-7")
+        );
+    }
+
+    #[test]
+    fn sidecar_prefers_canonical_dir_when_both_exist() {
+        // Inside a session namespace both paths resolve to the same directory;
+        // if they ever diverge, the canonical sandbox dir must win.
+        let sandbox = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sandbox.path().join("9.terminal.json"),
+            r#"{"terminal_id":"CANONICAL"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("9.terminal.json"),
+            r#"{"terminal_id":"OVERLAY"}"#,
+        )
+        .unwrap();
+        let dirs = vec![sandbox.path().to_path_buf(), home.path().to_path_buf()];
+        assert_eq!(
+            first_sidecar_in(&dirs, 9).unwrap().terminal_id.as_deref(),
+            Some("CANONICAL")
+        );
+    }
+
+    #[test]
+    fn sidecar_absent_everywhere_returns_none() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        assert!(first_sidecar_in(&[a.path().to_path_buf(), b.path().to_path_buf()], 1).is_none());
+    }
+
+    #[test]
+    fn regression_production_lookup_consults_the_sandbox_sessions_dir() {
+        // Pins the WIRING, not just the helper: read_terminal_sidecar itself
+        // must consult the env-resolved sandbox dir. Reverting it to the old
+        // $HOME-only body would leave the first_sidecar_in tests green but
+        // fail this one.
+        let _lock = crate::sandbox_registry::tests::env_guard();
+        let sandbox = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sandbox.path().join("4291042.terminal.json"),
+            r#"{"terminal_id":"WIRED"}"#,
+        )
+        .unwrap();
+        // SAFETY: env access serialized by the held env lock.
+        unsafe {
+            std::env::set_var("CLAUDECTL_SANDBOX_SESSIONS_DIR", sandbox.path());
+        }
+        let result = read_terminal_sidecar(4291042);
+        // SAFETY: same lock still held.
+        unsafe {
+            std::env::remove_var("CLAUDECTL_SANDBOX_SESSIONS_DIR");
+        }
+        let sidecar = result.expect("production lookup must consult the sandbox dir");
+        assert_eq!(sidecar.terminal_id.as_deref(), Some("WIRED"));
     }
 
     #[test]
