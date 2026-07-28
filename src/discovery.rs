@@ -63,6 +63,7 @@ pub fn try_live_sessions() -> Option<Vec<ClaudeSession>> {
         registry_slice_for_current_scope(),
         &pid_alive,
         &proc_cwd,
+        &transcript_session_name,
         DeadPointers::Drop,
     ))
 }
@@ -91,6 +92,7 @@ fn snapshot_and_assemble(
     registry: Vec<crate::sandbox_registry::SessionEntry>,
     pid_alive_probe: &impl Fn(u32) -> bool,
     resolve_cwd: &impl Fn(u32) -> Option<String>,
+    resolve_name: &impl Fn(&str, &str) -> Option<String>,
     dead_pointers: DeadPointers,
 ) -> Vec<ClaudeSession> {
     let procs = take_snapshot();
@@ -100,6 +102,7 @@ fn snapshot_and_assemble(
         registry,
         pid_alive_probe,
         resolve_cwd,
+        resolve_name,
         dead_pointers,
     )
 }
@@ -124,6 +127,7 @@ fn assemble_sessions(
     registry: Vec<crate::sandbox_registry::SessionEntry>,
     pid_alive_probe: &impl Fn(u32) -> bool,
     resolve_cwd: &impl Fn(u32) -> Option<String>,
+    resolve_name: &impl Fn(&str, &str) -> Option<String>,
     dead_pointers: DeadPointers,
 ) -> Vec<ClaudeSession> {
     let is_live = |pid: u32| match procs {
@@ -149,7 +153,7 @@ fn assemble_sessions(
         }
     }
     merge_pointerless_live(&mut sessions, registry, &is_live, resolve_cwd);
-    extend_with_ps_live(&mut sessions, procs, resolve_cwd);
+    extend_with_ps_live(&mut sessions, procs, resolve_cwd, resolve_name);
     sessions
 }
 
@@ -289,6 +293,7 @@ pub fn scan_sessions() -> Vec<ClaudeSession> {
         registry_slice_for_current_scope(),
         &pid_alive,
         &proc_cwd,
+        &transcript_session_name,
         DeadPointers::Keep,
     )
 }
@@ -306,10 +311,22 @@ pub fn scan_sessions() -> Vec<ClaudeSession> {
 /// launched without `--resume` whose pointer is already gone get an empty
 /// session_id, which the registry writer skips (nothing to `--resume` at
 /// restore time) but the display shows normally.
+///
+/// Name: `resolve_name(session_id, cwd)` — production reads the transcript's
+/// last `custom-title`/`agent-name` record. This is the moment a session's
+/// registry entry was just lost (that's the only way a `--resume` session
+/// lands here), so whatever name we record now is what the registry keeps;
+/// without recovery it would be recorded name-less and the title lost until
+/// the session restarts. Only consulted for sessions with a real uuid — an
+/// empty session_id has no locatable transcript and is skipped by the
+/// registry writer anyway. One-shot by construction: the next hook write puts
+/// the session back in the registry, after which the registry supplement
+/// covers it and this pass no longer sees it.
 fn extend_with_ps_live(
     sessions: &mut Vec<ClaudeSession>,
     procs: Option<&std::collections::HashMap<u32, crate::process::LiveClaudeProc>>,
     resolve_cwd: &impl Fn(u32) -> Option<String>,
+    resolve_name: &impl Fn(&str, &str) -> Option<String>,
 ) {
     let Some(procs) = procs else { return };
     let seen_pids: HashSet<u32> = sessions.iter().map(|s| s.pid).collect();
@@ -339,17 +356,29 @@ fn extend_with_ps_live(
             .filter(|token| crate::process::looks_like_uuid(token))
             .filter(|id| seen_ids.insert(id.clone()))
             .unwrap_or_default();
+        let cwd = resolve_cwd(pid).unwrap_or_default();
+        let name = if session_id.is_empty() {
+            None
+        } else {
+            resolve_name(&session_id, &cwd)
+        };
         let mut session = ClaudeSession::from_raw(RawSession {
             pid,
             session_id,
-            cwd: resolve_cwd(pid).unwrap_or_default(),
+            cwd,
             started_at: proc_info.started_at_ms,
-            name: None,
+            name,
         });
         session.command_args = proc_info.args.clone();
         found.push(session);
     }
     sessions.extend(found);
+}
+
+/// Production `resolve_name` for [`extend_with_ps_live`]: the transcript's
+/// own name record. See [`crate::transcript::last_session_name`].
+fn transcript_session_name(session_id: &str, cwd: &str) -> Option<String> {
+    crate::transcript::last_session_name(&transcript_path(session_id, cwd))
 }
 
 /// Working directory of a live process, in the caller's namespace.
@@ -744,7 +773,7 @@ mod tests {
             4084,
             &format!("--dangerously-skip-permissions --resume {uuid}"),
         )]);
-        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None);
+        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None, &|_, _| None);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].pid, 4084);
         assert_eq!(sessions[0].session_id, uuid);
@@ -766,7 +795,7 @@ mod tests {
             (333, &format!("--resume {uuid}")),
             (444, "some prompt text"),
         ]);
-        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None);
+        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None, &|_, _| None);
         let rows: Vec<(u32, &str)> = sessions
             .iter()
             .map(|s| (s.pid, s.session_id.as_str()))
@@ -788,7 +817,7 @@ mod tests {
         let mut sessions = Vec::new();
         let args = format!("--resume {uuid}");
         let procs = proc_map(&[(100, &args), (200, &args)]);
-        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None);
+        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None, &|_, _| None);
         let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
         assert_eq!(
             ids,
@@ -802,7 +831,7 @@ mod tests {
         let mut sessions = Vec::new();
         // `--resume my-named-session` is a name, not a uuid — identity unknown.
         let procs = proc_map(&[(555, "--resume my-named-session")]);
-        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None);
+        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None, &|_, _| None);
         assert_eq!(sessions.len(), 1);
         assert_eq!(
             sessions[0].session_id, "",
@@ -813,11 +842,11 @@ mod tests {
     #[test]
     fn ps_extend_is_deterministic_and_noop_without_snapshot() {
         let mut sessions = Vec::new();
-        extend_with_ps_live(&mut sessions, None, &|_| None);
+        extend_with_ps_live(&mut sessions, None, &|_| None, &|_, _| None);
         assert!(sessions.is_empty(), "no ps snapshot -> no additions");
 
         let procs = proc_map(&[(30, ""), (10, ""), (20, "")]);
-        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None);
+        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None, &|_, _| None);
         let pids: Vec<u32> = sessions.iter().map(|s| s.pid).collect();
         assert_eq!(pids, vec![10, 20, 30], "added in sorted pid order");
     }
@@ -861,10 +890,54 @@ mod tests {
             Vec::new(),
             &|_| false,
             &|_| Some("/Users/ndr".into()),
+            &|_, _| None,
             DeadPointers::Drop,
         );
         assert_eq!(assembled_ids(&sessions), vec![(4084, uuid.to_string())]);
         assert_eq!(sessions[0].cwd, "/Users/ndr");
+    }
+
+    #[test]
+    fn regression_ps_readd_recovers_title_from_transcript() {
+        // 2026-07-28 title-blanking, the recovery half: when a session lands
+        // in the ps supplement its registry entry was JUST lost, and whatever
+        // this pass reports is what the next hook write records. The name must
+        // be recovered from the transcript (the only surviving source), not
+        // recorded as None.
+        let uuid = "3c20ad09-d564-429d-868c-d3a67dcace79";
+        let procs = proc_map(&[(4084, &format!("--resume {uuid}"))]);
+        let sessions = assemble_sessions(
+            Vec::new(),
+            Some(&procs),
+            Vec::new(), // registry slice: entry already pruned
+            &|_| false,
+            &|_| Some("/Users/ndr".into()),
+            &|id, cwd| {
+                assert_eq!(id, uuid);
+                assert_eq!(cwd, "/Users/ndr");
+                Some("resume-old-sessions-audit".into())
+            },
+            DeadPointers::Drop,
+        );
+        assert_eq!(
+            sessions[0].session_name, "resume-old-sessions-audit",
+            "ps rediscovery must recover the title from the transcript"
+        );
+    }
+
+    #[test]
+    fn ps_readd_without_uuid_never_probes_for_a_name() {
+        // No `--resume` uuid ⇒ no locatable transcript, and the registry
+        // writer skips the session anyway. The resolver must not run — in
+        // production it opens files, and this pass repeats every tick for
+        // uuid-less sessions.
+        let procs = proc_map(&[(77, "")]);
+        let mut sessions = Vec::new();
+        extend_with_ps_live(&mut sessions, Some(&procs), &|_| None, &|_, _| {
+            panic!("resolve_name must not be called for an empty session_id")
+        });
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].session_name.is_empty());
     }
 
     #[test]
@@ -879,6 +952,7 @@ mod tests {
             vec![entry("s1", Some(111)), entry("s2", Some(222))],
             &|_| false,
             &|_| None,
+            &|_, _| None,
             DeadPointers::Drop,
         );
         assert_eq!(
@@ -905,6 +979,7 @@ mod tests {
             Vec::new(),
             &alive_probe,
             &|_| None,
+            &|_, _| None,
             DeadPointers::Drop,
         );
         assert!(
@@ -919,6 +994,7 @@ mod tests {
             Vec::new(),
             &alive_probe,
             &|_| None,
+            &|_, _| None,
             DeadPointers::Keep,
         );
         assert_eq!(
@@ -939,6 +1015,7 @@ mod tests {
             vec![entry("r1", Some(200))],
             &|pid| pid == 100 || pid == 200,
             &|_| None,
+            &|_, _| None,
             DeadPointers::Drop,
         );
         assert_eq!(
@@ -966,6 +1043,7 @@ mod tests {
             Vec::new(),
             &|_| false,
             &|_| Some("/Users/ndr/new".into()),
+            &|_, _| None,
             DeadPointers::Keep,
         );
         assert!(snapshot_taken.get(), "helper must take the snapshot itself");
@@ -987,6 +1065,7 @@ mod tests {
             vec![poisoned],
             &|_| false,
             &|pid| (pid == 100).then(|| "/Users/ndr".to_string()),
+            &|_, _| None,
             DeadPointers::Drop,
         );
         // Identity asserted too: a mutation that DROPS the poisoned entry
@@ -1014,6 +1093,7 @@ mod tests {
             Vec::new(),
             &|_| false,
             &|_| None,
+            &|_, _| None,
             DeadPointers::Drop,
         );
         let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();

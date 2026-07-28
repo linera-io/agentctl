@@ -5,6 +5,19 @@ All notable changes to claudectl are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **Registry writes can no longer blank a session's stored title.** A session
+  rediscovered from the process table carries `name: None` (the process only
+  knows its `--resume` uuid), and both registry writers took incoming entries
+  wholesale — so one tick after a registry entry was pruned, the re-record
+  overwrote the stored title with null (observed 2026-07-28: a host session's
+  name went blank in the TUI; the sandbox slice replace could have blanked
+  every sandbox title in a single tick). Both writers now carry a stored name
+  forward when the incoming entry has none — a genuinely fresher name still
+  wins — and the ps-rediscovery pass recovers the title from the transcript's
+  last `custom-title`/`agent-name` record before it is recorded, so even the
+  prune+re-add sequence keeps the title. Entries already nulled before this
+  fix heal on the session's next restart (the recreated pointer file carries
+  the name); the TUI display was already healing via transcript parsing.
 - **A lost `Stop` hook no longer pins a session to `Processing` forever.** Every
   other deterministic marker expires (permission prompt after 30 min, compaction
   after 5), but a turn has no honest time limit, so `is_responding` had no bound
