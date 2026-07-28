@@ -131,9 +131,30 @@ impl SessionEntry {
     }
 }
 
+/// Carry a stored display name forward into incoming entries that lost
+/// theirs. An incoming `name: None` does not mean "the session was un-named" —
+/// it means the discovery pass had no name source (the pointer file is gone
+/// and the session was rediscovered from the process table, which only knows
+/// the `--resume` uuid). The registry copy is the durable one; letting `None`
+/// overwrite it is how the 2026-07-28 title-blanking happened. An incoming
+/// `Some` always wins — that is a genuinely fresher name (pointer file or
+/// transcript recovery).
+fn backfill_missing_names(previous: &[SessionEntry], entries: &mut [SessionEntry]) {
+    for entry in entries.iter_mut().filter(|entry| entry.name.is_none()) {
+        if let Some(known) = previous
+            .iter()
+            .find(|prev| prev.session_id == entry.session_id)
+        {
+            entry.name = known.name.clone();
+        }
+    }
+}
+
 /// The hook write: take the live set in, keep everything else untouched.
 ///
-/// Live sessions win — they carry fresh names, transcripts and owners. Every
+/// Live sessions win — they carry fresh names, transcripts and owners (an
+/// incoming entry that lost its *name* is the one exception; see
+/// [`backfill_missing_names`]). Every
 /// departed session's entry is kept verbatim; hooks never forget. A hook fires
 /// from one session while a *different* terminal may be mid-quit, and one
 /// unconfirmed look then could delete exactly the restore set that quit needs,
@@ -143,6 +164,7 @@ pub fn merge_live_keep_all(
     live: Vec<SessionEntry>,
 ) -> Vec<SessionEntry> {
     let mut entries = live;
+    backfill_missing_names(previous, &mut entries);
     let live_ids: std::collections::HashSet<&str> = entries
         .iter()
         .map(|entry| entry.session_id.as_str())
@@ -349,10 +371,18 @@ where
 /// state on its own — exactly what `--restore-sbx-sessions` restores — and
 /// container pids say nothing about which host terminal owned anything.
 /// Empty `entries` removes the key; other sandboxes' slices are untouched.
-pub fn replace_sandbox_slice(sandbox: &str, entries: Vec<SessionEntry>) -> io::Result<()> {
+pub fn replace_sandbox_slice(sandbox: &str, mut entries: Vec<SessionEntry>) -> io::Result<()> {
     let path = sandbox_registry_path();
     with_lock(&path, || {
         let mut registry = load();
+        // A replace is wholesale, so without this a single tick whose live
+        // set was assembled from the process table alone (registry read
+        // missed, pointers long gone) would blank EVERY session title in the
+        // sandbox at once. Backfill before the unchanged-comparison so a
+        // no-op-after-backfill write is still skipped.
+        if let Some(existing) = registry.sandboxes.get(sandbox) {
+            backfill_missing_names(existing, &mut entries);
+        }
         let unchanged = match (registry.sandboxes.get(sandbox), entries.is_empty()) {
             (None, true) => true,
             (Some(existing), false) => *existing == entries,
@@ -785,6 +815,80 @@ pub(crate) mod tests {
             ids,
             ["bbb", "ccc"],
             "slice reflects exactly the new live set"
+        );
+    }
+
+    /// `entry(..)` with a display name attached.
+    fn named_entry(id: &str, cwd: &str, name: &str) -> SessionEntry {
+        SessionEntry {
+            name: Some(name.to_string()),
+            ..entry(id, cwd)
+        }
+    }
+
+    #[test]
+    fn regression_merge_keeps_title_when_incoming_entry_lost_it() {
+        // 2026-07-28 incident: a session's registry entry was pruned and the
+        // next hook tick rediscovered it from the process table — which only
+        // knows the `--resume` uuid, so the incoming entry had `name: None`.
+        // The wholesale merge let that None overwrite the stored title
+        // ("resume-old-sessions-audit" became null, blank in the TUI). A
+        // stored name must survive a name-less re-record.
+        let previous = vec![named_entry(
+            "3c20ad09",
+            "/Users/ndr",
+            "resume-old-sessions-audit",
+        )];
+        let merged = merge_live_keep_all(&previous, vec![entry("3c20ad09", "/Users/ndr")]);
+        assert_eq!(
+            merged[0].name.as_deref(),
+            Some("resume-old-sessions-audit"),
+            "a name-less live re-record must not blank the stored title"
+        );
+    }
+
+    #[test]
+    fn merge_takes_incoming_rename_over_stored_name() {
+        // The backfill is for None only: a genuinely fresher name (pointer
+        // file or transcript recovery saw a /rename) always wins.
+        let previous = vec![named_entry("s1", "/w", "old-name")];
+        let merged = merge_live_keep_all(&previous, vec![named_entry("s1", "/w", "new-name")]);
+        assert_eq!(merged[0].name.as_deref(), Some("new-name"));
+    }
+
+    #[test]
+    fn regression_sandbox_replace_keeps_titles_when_live_set_lost_them() {
+        // Same incident shape, sandbox flavor — and worse: the sandbox write
+        // is a wholesale slice replace, so ONE tick assembled from the
+        // process table alone would blank every session title in the sandbox
+        // at once. The stored titles must survive.
+        let _guard = TempRegistry::new("name-backfill");
+        replace_sandbox_slice(
+            "linera-agent",
+            vec![
+                named_entry("aaa", "/a", "title-a"),
+                named_entry("bbb", "/b", "title-b"),
+            ],
+        )
+        .unwrap();
+        // Next tick: same live set, but discovery had no name source.
+        replace_sandbox_slice("linera-agent", vec![entry("aaa", "/a"), entry("bbb", "/b")])
+            .unwrap();
+        let registry = load();
+        let names: Vec<_> = registry
+            .sandboxes
+            .get("linera-agent")
+            .unwrap()
+            .iter()
+            .map(|e| (e.session_id.clone(), e.name.clone()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("aaa".to_string(), Some("title-a".to_string())),
+                ("bbb".to_string(), Some("title-b".to_string())),
+            ],
+            "a name-less replace must not blank stored sandbox titles"
         );
     }
 

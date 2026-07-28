@@ -57,6 +57,46 @@ pub enum TranscriptEvent {
     },
 }
 
+/// The display name recorded in a transcript, scanning the whole file: the
+/// last `custom-title` (an explicit `/rename` — always wins) or, failing
+/// that, the last `agent-name` (auto-derived). `None` when the transcript has
+/// no name record at all.
+///
+/// This is the recovery path for a session rediscovered from the process
+/// table after its registry entry was pruned: the pointer file is long gone
+/// and the registry has forgotten the name, but the transcript — written by
+/// Claude Code itself — still carries it. Called only at that (rare)
+/// rediscovery moment, never per tick: once the recovered name is recorded
+/// back into the registry, the registry supplement covers the session again
+/// and this scan does not run. The line-level `contains` pre-filter keeps the
+/// scan cheap on large transcripts by skipping JSON parsing for the
+/// overwhelming majority of lines.
+pub fn last_session_name(path: &std::path::Path) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut explicit: Option<String> = None;
+    let mut auto: Option<String> = None;
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        if !line.contains("custom-title") && !line.contains("agent-name") {
+            continue;
+        }
+        match parse_line(&line) {
+            Some(TranscriptEvent::SessionName {
+                name,
+                explicit: true,
+            }) => explicit = Some(name),
+            Some(TranscriptEvent::SessionName {
+                name,
+                explicit: false,
+            }) => auto = Some(name),
+            _ => {}
+        }
+    }
+    explicit.or(auto)
+}
+
 pub fn parse_line(line: &str) -> Option<TranscriptEvent> {
     let entry: Value = serde_json::from_str(line).ok()?;
 
@@ -366,6 +406,65 @@ mod tests {
         // Blank or absent names are not events.
         assert!(parse_line(r#"{"type":"custom-title","customTitle":"  "}"#).is_none());
         assert!(parse_line(r#"{"type":"agent-name"}"#).is_none());
+    }
+
+    #[test]
+    fn last_session_name_prefers_last_explicit_title() {
+        // A transcript accumulates name records over its life: auto-derived
+        // agent-names and explicit /rename custom-titles, in any order. The
+        // CURRENT name is the last custom-title; an agent-name written later
+        // (e.g. after a resume) must not shadow an explicit rename.
+        let dir = std::env::temp_dir().join(format!("claudectl-lsn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("titled.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"agent-name","agentName":"auto-early","sessionId":"s"}"#,
+                "\n",
+                r#"{"type":"custom-title","customTitle":"renamed-once","sessionId":"s"}"#,
+                "\n",
+                r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+                "\n",
+                r#"{"type":"custom-title","customTitle":"renamed-twice","sessionId":"s"}"#,
+                "\n",
+                r#"{"type":"agent-name","agentName":"auto-late","sessionId":"s"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(last_session_name(&path).as_deref(), Some("renamed-twice"));
+
+        let auto_only = dir.join("auto.jsonl");
+        std::fs::write(
+            &auto_only,
+            concat!(
+                r#"{"type":"agent-name","agentName":"auto-a","sessionId":"s"}"#,
+                "\n",
+                r#"{"type":"agent-name","agentName":"auto-b","sessionId":"s"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            last_session_name(&auto_only).as_deref(),
+            Some("auto-b"),
+            "without an explicit title, the last auto name wins"
+        );
+
+        let unnamed = dir.join("unnamed.jsonl");
+        std::fs::write(
+            &unnamed,
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(last_session_name(&unnamed), None);
+        assert_eq!(last_session_name(&dir.join("missing.jsonl")), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
