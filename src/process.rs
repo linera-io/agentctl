@@ -476,6 +476,10 @@ fn extract_session_meta(cmd: &[&str], session: &mut ClaudeSession) {
             "--name" | "-n" if i + 1 < cmd.len() => {
                 if !name_already_set {
                     session.session_name = cmd[i + 1].to_string();
+                    // A user-typed CLI flag is an explicit choice, and it has
+                    // no transcript record to re-assert it — without the flag
+                    // a later scan-supplied name would overwrite it for good.
+                    session.name_is_explicit = true;
                 }
                 i += 2;
                 continue;
@@ -484,6 +488,7 @@ fn extract_session_meta(cmd: &[&str], session: &mut ClaudeSession) {
                 let val = cmd[i + 1];
                 if !name_already_set && !looks_like_uuid(val) {
                     session.session_name = val.to_string();
+                    session.name_is_explicit = true;
                 }
                 i += 2;
                 continue;

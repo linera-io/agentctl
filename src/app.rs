@@ -174,12 +174,6 @@ pub fn merge_discovered_sessions(
                     prev.cwd = new.cwd;
                     prev.project_name = new.project_name;
                 }
-                // An empty discovered name carries no information (ps-backstop
-                // rows have none) — never erase a name the TUI already knows,
-                // e.g. one recovered from the transcript's custom-title.
-                if !new.session_name.is_empty() {
-                    prev.session_name = new.session_name;
-                }
                 // Claude Code can rotate `sessionId` under the same OS PID
                 // (/clear, compaction, resume-into-new-file). The transcript
                 // file path changes but `do_refresh_io` skips re-resolution
@@ -192,9 +186,32 @@ pub fn merge_discovered_sessions(
                 // known identity and reset the JSONL offset, double-counting
                 // the transcript on re-read. Keep what we know.
                 if !new.session_id.is_empty() && prev.session_id != new.session_id {
+                    // A rotation is a NEW conversation: the old transcript's
+                    // explicit /rename title must not outlive it, or a
+                    // recycled pid / post-/clear row wears a dead session's
+                    // title forever. Adopt the discovered name wholesale and
+                    // drop the hold — the new transcript re-parses from
+                    // offset 0 this same pass, so a carried-over custom-title
+                    // record re-establishes the explicit title immediately.
+                    prev.session_name = new.session_name;
+                    prev.name_is_explicit = new.name_is_explicit;
                     prev.session_id = new.session_id;
                     prev.jsonl_path = None;
                     prev.jsonl_offset = 0;
+                } else if !new.session_name.is_empty() && !prev.name_is_explicit {
+                    // An empty discovered name carries no information
+                    // (ps-backstop rows have none) — never erase a name the
+                    // TUI already knows, e.g. one recovered from the
+                    // transcript's custom-title.
+                    //
+                    // An EXPLICIT title (transcript custom-title, via
+                    // monitor) outranks every scan source: a registry entry
+                    // recorded before the rename re-supplies the stale name
+                    // every tick, and letting it win here is what made a
+                    // fresh `/rename` revert seconds later. Newer
+                    // custom-title records still update the title through
+                    // the monitor path.
+                    prev.session_name = new.session_name;
                 }
                 prev
             } else {
@@ -3462,6 +3479,39 @@ mod tests {
 
         let (merged, _) = merge_discovered_sessions(vec![existing], vec![fresh]);
         assert_eq!(merged[0].session_name, "renamed-session");
+    }
+
+    #[test]
+    fn regression_explicit_title_outranks_scan_name_in_merge() {
+        // 2026-07-28 rename-revert: the registry re-supplied a stale name
+        // every tick; a title recovered from the transcript's custom-title
+        // (name_is_explicit) must win against any scan-supplied name.
+        let mut existing = named_session(42, "explicit-title", "proj", 0);
+        existing.name_is_explicit = true;
+        let fresh = named_session(42, "stale-registry-name", "proj", 0);
+        let (merged, _) = merge_discovered_sessions(vec![existing], vec![fresh]);
+        assert_eq!(merged[0].session_name, "explicit-title");
+        assert!(merged[0].name_is_explicit, "flag must persist across ticks");
+    }
+
+    #[test]
+    fn regression_rotation_releases_the_explicit_title() {
+        // A sessionId rotation under the same pid (/clear, compaction,
+        // recycled pid) is a NEW conversation: the old transcript's /rename
+        // title must not stick to it — held, it would permanently block the
+        // new identity's own names (only a fresh /rename could ever fix it).
+        let mut existing = named_session(42, "old-explicit-title", "proj", 0);
+        existing.session_id = "session-a".into();
+        existing.name_is_explicit = true;
+        let mut fresh = named_session(42, "new-conversation-name", "proj", 0);
+        fresh.session_id = "session-b".into();
+        let (merged, _) = merge_discovered_sessions(vec![existing], vec![fresh]);
+        assert_eq!(merged[0].session_name, "new-conversation-name");
+        assert!(
+            !merged[0].name_is_explicit,
+            "the explicit hold must not survive a rotation"
+        );
+        assert_eq!(merged[0].session_id, "session-b");
     }
 
     #[test]
