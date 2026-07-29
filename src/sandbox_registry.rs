@@ -177,7 +177,44 @@ pub fn merge_live_keep_all(
         .collect();
 
     entries.extend(retained);
+    release_superseded_pids(&mut entries);
     entries
+}
+
+/// A pid belongs to exactly one conversation at a time. Claude Code rotates
+/// `sessionId` under a running process (/clear, compaction), so a slice
+/// accumulates one entry per sid all claiming the same pid — and every
+/// pid-alive gate downstream (the pointerless re-add, restore's resumed
+/// check) then treats each superseded conversation as live too, one display
+/// row each (2026-07-28: one tab showed as three rows). First claimant
+/// keeps the pid: entries are ordered live-scan first, so the sid that
+/// currently owns the process wins. Later entries with the same pid split
+/// two ways:
+/// - same `started_at_ms` as the claimant → the same process, i.e. a
+///   conversation the user ENDED by rotating past it. Dropped: keeping it
+///   made `--restore-sessions` spawn a second window resuming the
+///   superseded conversation while its successor was still running, and
+///   the reaper would prune it within one pass anyway (terminal still up,
+///   no live process).
+/// - different `started_at_ms` → an unrelated conversation whose recorded
+///   pid was recycled. Released to pid-less: it stays a restore candidate
+///   (its terminal is typically gone), it just no longer counts as alive.
+fn release_superseded_pids(entries: &mut Vec<SessionEntry>) {
+    let mut claimed: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    entries.retain_mut(|entry| {
+        let Some(pid) = entry.pid else { return true };
+        match claimed.get(&pid) {
+            None => {
+                claimed.insert(pid, entry.started_at_ms);
+                true
+            }
+            Some(claimant_started) if *claimant_started == entry.started_at_ms => false,
+            Some(_) => {
+                entry.pid = None;
+                true
+            }
+        }
+    });
 }
 
 /// The reaper write: keep live sessions untouched, drop the ones the user
@@ -610,6 +647,94 @@ pub(crate) mod tests {
         ];
         let merged = merge_live_keep_all(&previous, vec![]);
         assert_eq!(ids(&merged), ["closed-by-hand", "legacy-no-owner"]);
+    }
+
+    #[test]
+    fn regression_rotation_drops_the_superseded_sid_entry() {
+        // 2026-07-28: Claude Code rotated sessionId under a running process
+        // (/clear); the superseded sid's entry kept the pid, so every
+        // pid-alive gate downstream treated one process as several live
+        // conversations (one display row each), and --restore-sessions
+        // offered to resume a conversation the user had deliberately ended.
+        // Same pid + same started_at = the same process: the superseded
+        // conversation is over — drop it.
+        let previous = [SessionEntry {
+            pid: Some(3_276_188),
+            started_at_ms: 1_785_275_675_303,
+            name: Some("pm-control-chain-liveness-alerting".into()),
+            ..entry("aaaa-superseded", "/Users/ndr")
+        }];
+        let live = vec![SessionEntry {
+            pid: Some(3_276_188),
+            started_at_ms: 1_785_275_675_303,
+            ..entry("bbbb-current", "/Users/ndr")
+        }];
+        let merged = merge_live_keep_all(&previous, live);
+        assert_eq!(ids(&merged), ["bbbb-current"]);
+        assert_eq!(merged[0].pid, Some(3_276_188), "current sid keeps the pid");
+    }
+
+    #[test]
+    fn recycled_pid_releases_but_keeps_the_unrelated_entry() {
+        // Different started_at = a different process: the stored entry's pid
+        // was merely recycled by an unrelated session. The old conversation
+        // was never ended by the user — it must stay a restore candidate,
+        // just no longer counted as alive.
+        let previous = [SessionEntry {
+            pid: Some(4242),
+            started_at_ms: 100,
+            name: Some("old-unrelated-conversation".into()),
+            ..entry("aaaa-old", "/Users/ndr")
+        }];
+        let live = vec![SessionEntry {
+            pid: Some(4242),
+            started_at_ms: 900,
+            ..entry("bbbb-new", "/Users/ndr")
+        }];
+        let merged = merge_live_keep_all(&previous, live);
+        assert_eq!(ids(&merged), ["bbbb-new", "aaaa-old"]);
+        assert_eq!(merged[0].pid, Some(4242));
+        assert_eq!(merged[1].pid, None, "recycled pid is released, entry kept");
+        assert_eq!(
+            merged[1].name.as_deref(),
+            Some("old-unrelated-conversation")
+        );
+    }
+
+    #[test]
+    fn no_two_entries_share_a_pid_after_any_merge() {
+        // The invariant behind the display's one-row-per-pid guarantee: no
+        // matter how polluted the inputs are (old binaries recorded dup-pid
+        // slices), a merge result never has two entries claiming one pid.
+        let previous = [
+            SessionEntry {
+                pid: Some(7),
+                ..entry("p1", "/w")
+            },
+            SessionEntry {
+                pid: Some(7),
+                ..entry("p2", "/w")
+            },
+            SessionEntry {
+                pid: Some(8),
+                ..entry("p3", "/w")
+            },
+        ];
+        let live = vec![SessionEntry {
+            pid: Some(7),
+            ..entry("l1", "/w")
+        }];
+        let merged = merge_live_keep_all(&previous, live);
+        let mut claimed = std::collections::HashSet::new();
+        for e in &merged {
+            if let Some(pid) = e.pid {
+                assert!(claimed.insert(pid), "pid {pid} claimed twice");
+            }
+        }
+        assert_eq!(
+            merged.iter().find(|e| e.session_id == "l1").unwrap().pid,
+            Some(7)
+        );
     }
 
     #[test]
