@@ -999,6 +999,105 @@ fn jsonl_empty_file() {
 }
 
 #[test]
+fn regression_rename_does_not_revert_to_stale_scan_name() {
+    // 2026-07-28: a /rename displayed for one tick and then reverted to the
+    // stale pre-rename name. The monitor recovered the transcript's
+    // custom-title once (incremental parse = one-shot), but every later
+    // tick's discovery re-supplied the stale registry-recorded name and the
+    // cross-tick merge let any non-empty scan name overwrite the title.
+    let jsonl = r#"{"type":"custom-title","customTitle":"invoice-restriction-ended-wording"}"#;
+    let (mut s, _file) = make_session_with_jsonl(jsonl);
+    s.session_name = "ndr-5e".into(); // what the scan supplied at assembly
+    monitor::update_tokens(&mut s);
+    assert_eq!(s.session_name, "invoice-restriction-ended-wording");
+    assert!(s.name_is_explicit);
+
+    // Tick 2: discovery re-supplies the stale name; no new transcript bytes,
+    // so the monitor cannot re-recover — the merge must hold the title.
+    let fresh = ClaudeSession::from_raw(RawSession {
+        pid: 1,
+        session_id: "test".into(),
+        cwd: "/tmp/test".into(),
+        started_at: 0,
+        name: Some("ndr-5e".into()),
+        name_source: None,
+    });
+    let (mut merged, _) = claudectl::app::merge_discovered_sessions(vec![s], vec![fresh]);
+    assert_eq!(merged.len(), 1);
+    monitor::update_tokens(&mut merged[0]);
+    assert_eq!(
+        merged[0].session_name, "invoice-restriction-ended-wording",
+        "a stale scan name must not revert an explicit /rename title"
+    );
+}
+
+#[test]
+fn second_rename_overwrites_the_first() {
+    // Explicit beats explicit: the transcript is append-only, so a later
+    // custom-title record is the fresher user choice and must win.
+    let jsonl = concat!(
+        r#"{"type":"custom-title","customTitle":"first-title"}"#,
+        "\n",
+        r#"{"type":"custom-title","customTitle":"second-title"}"#,
+    );
+    let (mut s, _file) = make_session_with_jsonl(jsonl);
+    monitor::update_tokens(&mut s);
+    assert_eq!(s.session_name, "second-title");
+    assert!(s.name_is_explicit);
+}
+
+#[test]
+fn rotation_reestablishes_a_carried_over_title_from_the_new_transcript() {
+    // A sessionId rotation releases the old explicit title (see the app.rs
+    // merge test); Claude Code writes the custom-title record near the head
+    // of a rotated transcript, and the rotated row re-parses from offset 0,
+    // so a carried-over explicit title re-establishes in the same pass.
+    let mut existing = ClaudeSession::from_raw(RawSession {
+        pid: 9,
+        session_id: "session-a".into(),
+        cwd: "/tmp/test".into(),
+        started_at: 0,
+        name: Some("old-title".into()),
+        name_source: None,
+    });
+    existing.name_is_explicit = true;
+
+    let (mut fresh, file) =
+        make_session_with_jsonl(r#"{"type":"custom-title","customTitle":"carried-title"}"#);
+    fresh.pid = 9;
+    fresh.session_id = "session-b".into();
+    fresh.session_name = "registry-name".into();
+
+    let (mut merged, _) = claudectl::app::merge_discovered_sessions(vec![existing], vec![fresh]);
+    assert_eq!(merged[0].session_name, "registry-name");
+    assert!(
+        !merged[0].name_is_explicit,
+        "rotation must release the hold"
+    );
+
+    // do_refresh_io re-resolves the rotated row's transcript; simulate it.
+    merged[0].jsonl_path = Some(file.path().to_path_buf());
+    monitor::update_tokens(&mut merged[0]);
+    assert_eq!(merged[0].session_name, "carried-title");
+    assert!(merged[0].name_is_explicit);
+}
+
+#[test]
+fn agent_name_never_downgrades_an_explicit_title() {
+    // An auto-derived agent-name record arriving after a /rename must not
+    // replace the explicit title (it only ever fills a blank).
+    let jsonl = concat!(
+        r#"{"type":"custom-title","customTitle":"my-title"}"#,
+        "\n",
+        r#"{"type":"agent-name","agentName":"auto-junk"}"#,
+    );
+    let (mut s, _file) = make_session_with_jsonl(jsonl);
+    monitor::update_tokens(&mut s);
+    assert_eq!(s.session_name, "my-title");
+    assert!(s.name_is_explicit);
+}
+
+#[test]
 fn jsonl_corrupted_lines_skipped() {
     let jsonl = concat!(
         "not valid json at all\n",

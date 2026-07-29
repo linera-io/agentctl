@@ -202,6 +202,15 @@ pub struct ClaudeSession {
     pub model: String,
     pub command_args: String,
     pub session_name: String,
+    /// True once `session_name` holds an explicit `/rename` title recovered
+    /// from the transcript's `custom-title` records (monitor). An explicit
+    /// title is the user's own choice and the transcript is its durable
+    /// source of truth — a scan-supplied name (registry entry recorded
+    /// before a rename, recreated pointer) must not overwrite it, or the
+    /// cross-tick merge re-clobbers the title seconds after every rename.
+    /// A newer `custom-title` record still updates it (explicit beats
+    /// explicit; the transcript is append-only, so later means fresher).
+    pub name_is_explicit: bool,
     pub jsonl_path: Option<PathBuf>,
     pub jsonl_offset: u64,
     pub last_message_ts: u64,
@@ -421,6 +430,7 @@ impl ClaudeSession {
             model: String::new(),
             command_args: String::new(),
             session_name,
+            name_is_explicit: false,
             jsonl_path: None,
             jsonl_offset: 0,
             last_message_ts: 0,

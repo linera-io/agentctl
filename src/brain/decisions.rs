@@ -823,6 +823,7 @@ mod tests {
             model: "sonnet".into(),
             command_args: "".into(),
             session_name: "test".into(),
+            name_is_explicit: false,
             jsonl_path: None,
             jsonl_offset: 0,
             last_message_ts: 0,

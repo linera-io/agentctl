@@ -112,7 +112,18 @@ pub fn update_tokens(session: &mut ClaudeSession) {
                                 // deleted mid-session, registry entry lost). An
                                 // explicit `/rename` title always wins; an
                                 // auto-derived agent-name only fills a blank.
-                                if explicit || session.session_name.is_empty() {
+                                //
+                                // `name_is_explicit` makes the win durable:
+                                // this event fires once per record (incremental
+                                // parse), while scan-supplied names (a registry
+                                // entry recorded before the rename) arrive
+                                // every tick — without the flag the merge
+                                // re-clobbers the title on the next tick and a
+                                // rename "reverts" seconds after it is typed.
+                                if explicit {
+                                    session.session_name = name;
+                                    session.name_is_explicit = true;
+                                } else if session.session_name.is_empty() {
                                     session.session_name = name;
                                 }
                             }
