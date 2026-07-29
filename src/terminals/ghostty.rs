@@ -29,6 +29,13 @@ fn require_routing_data(session: &ClaudeSession) -> Result<(), String> {
 ///      `/dev/ttysNNN` (mirrors the iTerm2 matcher), and wrapped in `try` so it's
 ///      a harmless no-op on Ghostty <= 1.3.1 (where the property doesn't exist
 ///      and the query errors) — we then fall through to the CWD match.
+///      When claudectl has NO tty for the session (a host session viewed from
+///      the in-sandbox dashboard: its pid is invisible to in-sandbox `ps`, but
+///      its pointer file arrives over the shared ~/.claude mount), the script
+///      resolves it AT RUN TIME on the machine executing the AppleScript —
+///      which is the HOST, via the osa-bridge — with `ps -o tty= -p <pid>`.
+///      That is exactly where the pid is valid (2026-07-29: Tab on a laptop
+///      row from the sandbox TUI cwd-guessed onto the wrong tab).
 ///   3. working directory, exact then substring, + title disambiguator — the
 ///      fallback for older Ghostty. Breaks down when multiple claudes share a CWD.
 fn find_terminal_script(session: &ClaudeSession) -> String {
@@ -56,6 +63,27 @@ fn find_terminal_script(session: &ClaudeSession) -> String {
     if !tty.is_empty() {
         find.push_str(&format!(
             "            try\n                set matches to every terminal whose tty contains \"{tty}\"\n            end try\n"
+        ));
+    } else if session.pid > 0 {
+        // No tty known here — resolve it where the script runs (the host,
+        // when bridged from the sandbox). The awk guard mirrors
+        // `process::is_claude_process`: the pid must belong to a process
+        // whose comm basename is exactly `claude`, or the line prints
+        // nothing — a recycled or foreign-namespace pid must not resolve an
+        // unrelated process's tty (the shared matcher also drives
+        // send_input/approve, so a wrong match would TYPE into an unrelated
+        // shell, not just misfocus). `ps` prints `ttysNNN` (or `??`);
+        // Ghostty reports `/dev/ttysNNN`, so `contains` matches; a guarded
+        // or dead pid yields nothing and falls through to the cwd chain.
+        let pid = session.pid;
+        find.push_str(&format!(
+            r#"            try
+                set sessTty to do shell script "ps -o tty=,comm= -p {pid} | awk '{{ n=split($2,parts,\"/\"); if (parts[n]==\"claude\") print $1 }}'"
+                if sessTty is not "" and sessTty is not "??" then
+                    set matches to every terminal whose tty contains sessTty
+                end if
+            end try
+"#
         ));
     }
     find.push_str(&format!(
@@ -224,7 +252,10 @@ mod tests {
     #[test]
     fn find_script_disambiguates_shared_cwd_by_title() {
         let script = find_terminal_script(&routed_session(None, "", "/Users/ndr", "my-session"));
-        assert!(!script.contains("whose tty"), "no tty -> no tty clause");
+        assert!(
+            !script.contains("whose tty contains \""),
+            "no known tty -> no static tty clause (runtime pid resolution instead)"
+        );
         assert!(script.contains(r#"name of candidate contains "my-session""#));
     }
 
@@ -319,10 +350,35 @@ mod tests {
     }
 
     #[test]
-    fn find_script_omits_tty_block_when_tty_empty() {
-        let s = make_session("/tmp/p", ""); // tty defaults to empty
+    fn find_script_resolves_tty_at_runtime_when_tty_unknown() {
+        // 2026-07-29: a host session viewed from the in-sandbox dashboard —
+        // its pid is invisible to in-sandbox ps (no tty) and it has no
+        // sidecar surface id, so Tab fell straight into the shared-cwd guess
+        // and focused the wrong tab. The script must instead resolve the tty
+        // on the machine EXECUTING the AppleScript (the host, via the
+        // osa-bridge), where the pid is valid.
+        let s = make_session("/tmp/p", ""); // tty defaults to empty, pid 100
         let script = find_terminal_script(&s);
-        assert!(!script.contains("whose tty"));
+        assert!(script.contains(r#"ps -o tty=,comm= -p 100"#));
+        assert!(
+            script.contains(r#"if (parts[n]==\"claude\") print $1"#),
+            "the pid must be verified as a claude process where the script \
+             runs — a recycled/foreign pid resolving an unrelated process's \
+             tty would let send_input/approve type into an unrelated shell"
+        );
+        assert!(script.contains("whose tty contains sessTty"));
+        assert!(
+            script.contains(r#"if sessTty is not "" and sessTty is not "??" then"#),
+            "empty/?? resolutions must never become a match key"
+        );
+        assert!(
+            !script.contains("whose tty contains \""),
+            "no static tty literal without a known tty"
+        );
+        assert!(
+            script.contains("working directory is \"/tmp/p\""),
+            "cwd chain stays as the last resort"
+        );
     }
 
     #[test]
