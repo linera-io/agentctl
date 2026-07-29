@@ -197,14 +197,40 @@ fn merge_pointerless_live(
     resolve_cwd: &impl Fn(u32) -> Option<String>,
 ) {
     let seen: HashSet<String> = sessions.iter().map(|s| s.session_id.clone()).collect();
-    for entry in registry {
+    let used_pids: HashSet<u32> = sessions.iter().map(|s| s.pid).collect();
+    // One process = one row. Claude Code rotates `sessionId` under a running
+    // process (/clear, compaction), so a polluted slice can hold several
+    // entries all claiming the same live pid — one per superseded
+    // conversation (2026-07-28: one tab showed as three rows, each stealing
+    // a different transcript). Keep the newest claim per pid: greatest
+    // `started_at_ms`; on a tie the EARLIEST record wins — both registry
+    // writers emit freshest-first (live scan before retained history), so
+    // earlier in the file means fresher. Skip pids the scan already
+    // represents.
+    let mut winners: std::collections::HashMap<
+        u32,
+        (u64, usize, crate::sandbox_registry::SessionEntry),
+    > = std::collections::HashMap::new();
+    for (index, entry) in registry.into_iter().enumerate() {
         if seen.contains(&entry.session_id) {
             continue;
         }
         let Some(pid) = entry.pid else { continue };
-        if !is_alive(pid) {
+        if used_pids.contains(&pid) || !is_alive(pid) {
             continue;
         }
+        let is_newer = winners
+            .get(&pid)
+            .is_none_or(|(started, _, _)| entry.started_at_ms > *started);
+        if is_newer {
+            winners.insert(pid, (entry.started_at_ms, index, entry));
+        }
+    }
+    let mut picked: Vec<(u64, usize, crate::sandbox_registry::SessionEntry)> =
+        winners.into_values().collect();
+    picked.sort_by_key(|(_, index, _)| *index);
+    for (_, _, entry) in picked {
+        let pid = entry.pid.expect("winners hold pid-bearing entries only");
         // A registry entry recorded with an empty cwd would otherwise be
         // immortal: this supplemented session (carrying the empty cwd) is
         // what the next hook re-records, so the bad value round-trips
@@ -447,16 +473,13 @@ pub fn resolve_jsonl_paths(sessions: &mut [ClaudeSession]) {
             }
         }
 
-        // Priority 3: Fall back to most recently modified .jsonl in the project dir
-        if let Some(latest) = find_latest_jsonl(&project_dir) {
-            session.jsonl_path = Some(latest);
-            continue;
-        }
-
-        // Priority 4: Search ALL project directories for a JSONL matching the session ID.
-        // This handles cwd encoding mismatches between claudectl and Claude Code
-        // (e.g., symlink resolution, path normalization differences).
-        if let Some(found) = search_all_projects_for_session(&session.session_id) {
+        // Priority 3: Search ALL project directories for a JSONL matching the
+        // session ID. This handles cwd encoding mismatches between claudectl
+        // and Claude Code (e.g., symlink resolution, path normalization
+        // differences).
+        if !session.session_id.is_empty()
+            && let Some(found) = search_all_projects_for_session(&session.session_id)
+        {
             crate::logger::log(
                 "DEBUG",
                 &format!(
@@ -466,6 +489,28 @@ pub fn resolve_jsonl_paths(sessions: &mut [ClaudeSession]) {
                 ),
             );
             session.jsonl_path = Some(found);
+            continue;
+        }
+
+        // Priority 4 (last resort, identity-less rows only): a project dir
+        // holding EXACTLY ONE transcript. "Most recently modified .jsonl"
+        // used to stand here; in a cwd shared by many sessions — even across
+        // machines, since ~/.claude is one shared mount — it wired rows onto
+        // whichever transcript happened to be written last, stealing that
+        // session's telemetry AND (through the monitor's title recovery) its
+        // name (2026-07-28). Rows WITH a session id never guess: their own
+        // file is the only correct answer (priorities 1-3), and since a
+        // bound path is final for the row's lifetime, binding a foreign file
+        // while their own doesn't exist yet (fresh rotation) would be a
+        // permanent mis-wire. They stay unresolved and retry every pass
+        // until their file appears. An id-less row is itself writing a
+        // transcript in this dir, so a dir with exactly one is its own —
+        // modulo the first seconds before the file exists, which is why
+        // this stays last.
+        if session.session_id.is_empty()
+            && let Some(only) = sole_jsonl(&project_dir)
+        {
+            session.jsonl_path = Some(only);
             continue;
         }
 
@@ -516,23 +561,23 @@ fn extract_resume_uuid(command_args: &str) -> Option<String> {
     Some(token.to_string())
 }
 
-/// Find the most recently modified .jsonl file in a project directory.
-fn find_latest_jsonl(dir: &PathBuf) -> Option<PathBuf> {
+/// The project directory's transcript, iff it holds exactly one. More than
+/// one candidate means any pick is a guess — see the Priority-4 comment in
+/// [`resolve_jsonl_paths`].
+fn sole_jsonl(dir: &PathBuf) -> Option<PathBuf> {
     let entries = fs::read_dir(dir).ok()?;
-    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
-
+    let mut only: Option<PathBuf> = None;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let modified = entry.metadata().ok()?.modified().ok()?;
-        if best.as_ref().is_none_or(|(_, t)| modified > *t) {
-            best = Some((path, modified));
+        if only.is_some() {
+            return None;
         }
+        only = Some(path);
     }
-
-    best.map(|(p, _)| p)
+    only
 }
 
 /// Feature #29: Scan for subagent task .jsonl files.
@@ -878,6 +923,166 @@ mod tests {
             .iter()
             .map(|s| (s.pid, s.session_id.clone()))
             .collect()
+    }
+
+    #[test]
+    fn regression_one_row_per_live_pid_across_rotated_sids() {
+        // 2026-07-28: Claude Code rotated sessionId under a running process
+        // (/clear), the registry held one entry per sid all claiming the same
+        // live pid, and the pointerless re-add (sid-deduped only) turned one
+        // tab into multiple rows — each then stealing a different transcript.
+        // Same started_at (one process) and production file order (both
+        // writers emit freshest-first): the FIRST record is the current
+        // conversation and must win the row.
+        let current = entry("bbbb-current", Some(91));
+        let superseded = entry("aaaa-superseded", Some(91));
+        let procs = proc_map(&[(91, "")]);
+        let sessions = assemble_sessions(
+            Vec::new(),
+            Some(&procs),
+            vec![current, superseded],
+            &|_| false,
+            &|_| Some("/Users/ndr".into()),
+            &|_, _| None,
+            DeadPointers::Drop,
+        );
+        assert_eq!(
+            assembled_ids(&sessions),
+            vec![(91, "bbbb-current".to_string())],
+            "one live pid must yield exactly one row — the current conversation"
+        );
+    }
+
+    #[test]
+    fn newest_started_entry_wins_the_pid_regardless_of_record_order() {
+        // A strictly newer started_at outranks file position: a slice written
+        // by an old binary can hold the fresher conversation later in the
+        // file, and record order alone must not pick the stale one.
+        let mut stale = entry("aaaa-stale", Some(93));
+        stale.started_at_ms = 1_000;
+        let mut fresh = entry("bbbb-fresh", Some(93));
+        fresh.started_at_ms = 2_000;
+        let procs = proc_map(&[(93, "")]);
+        let sessions = assemble_sessions(
+            Vec::new(),
+            Some(&procs),
+            vec![stale, fresh],
+            &|_| false,
+            &|_| Some("/Users/ndr".into()),
+            &|_, _| None,
+            DeadPointers::Drop,
+        );
+        assert_eq!(
+            assembled_ids(&sessions),
+            vec![(93, "bbbb-fresh".to_string())]
+        );
+    }
+
+    #[test]
+    fn pointer_row_blocks_registry_readd_for_the_same_pid() {
+        // A pointer-backed row already represents the process; a superseded
+        // sid's registry entry with the same pid must not add a second row.
+        let raw = raw_pointer("cccc-pointer", 92);
+        let stale = entry("dddd-superseded", Some(92));
+        let procs = proc_map(&[(92, "")]);
+        let sessions = assemble_sessions(
+            vec![raw],
+            Some(&procs),
+            vec![stale],
+            &|_| false,
+            &|_| Some("/Users/ndr".into()),
+            &|_, _| None,
+            DeadPointers::Drop,
+        );
+        assert_eq!(
+            assembled_ids(&sessions),
+            vec![(92, "cccc-pointer".to_string())]
+        );
+    }
+
+    #[test]
+    fn regression_sid_bearing_row_never_binds_a_foreign_sole_transcript() {
+        // 2026-07-28 review finding: a bound jsonl_path is final for the
+        // row's lifetime, so a row WITH a session id must never bind the
+        // dir's sole transcript while its own file doesn't exist yet (fresh
+        // rotation) — that would be a permanent mis-wire. It stays
+        // unresolved and binds its own file once it appears. An id-less row
+        // may bind the sole file (it has no better identity), and a row
+        // whose file lives under a different slug must find it via the
+        // all-projects sid search BEFORE any last resort.
+        let _lock = crate::sandbox_registry::tests::env_guard();
+        let home = tempfile::tempdir().unwrap();
+        let saved_home = std::env::var_os("HOME");
+        // SAFETY: env access serialized by the held env lock.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+
+        let shared = home.path().join(".claude/projects/-Users-ndr");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("aaaa-foreign.jsonl"), "{}").unwrap();
+        let other_slug = home.path().join(".claude/projects/-Users-ndr-work");
+        std::fs::create_dir_all(&other_slug).unwrap();
+        std::fs::write(other_slug.join("cccc-elsewhere.jsonl"), "{}").unwrap();
+
+        let make = |sid: &str| {
+            ClaudeSession::from_raw(RawSession {
+                pid: 1,
+                session_id: sid.into(),
+                cwd: "/Users/ndr".into(),
+                started_at: 0,
+                name: None,
+                name_source: None,
+            })
+        };
+        let mut sessions = vec![make("bbbb-mine"), make(""), make("cccc-elsewhere")];
+        resolve_jsonl_paths(&mut sessions);
+
+        // SAFETY: same lock still held.
+        unsafe {
+            match &saved_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert_eq!(
+            sessions[0].jsonl_path, None,
+            "an identity-bearing row must not steal the sole foreign file"
+        );
+        assert_eq!(
+            sessions[1].jsonl_path,
+            Some(shared.join("aaaa-foreign.jsonl")),
+            "an id-less row may bind the dir's sole transcript"
+        );
+        assert_eq!(
+            sessions[2].jsonl_path,
+            Some(other_slug.join("cccc-elsewhere.jsonl")),
+            "the sid search across project dirs outranks the last resort"
+        );
+    }
+
+    #[test]
+    fn sole_jsonl_requires_exactly_one_candidate() {
+        // The last-resort transcript association must never guess between
+        // candidates — "newest in dir" cross-wired rows onto other sessions'
+        // transcripts (2026-07-28), including across machines via the shared
+        // ~/.claude mount.
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        assert_eq!(sole_jsonl(&dir_path), None, "empty dir: nothing to bind");
+        std::fs::write(dir_path.join("a.jsonl"), "{}").unwrap();
+        assert_eq!(
+            sole_jsonl(&dir_path),
+            Some(dir_path.join("a.jsonl")),
+            "a single candidate is unambiguous"
+        );
+        std::fs::write(dir_path.join("b.jsonl"), "{}").unwrap();
+        assert_eq!(
+            sole_jsonl(&dir_path),
+            None,
+            "two candidates: refuse to guess"
+        );
     }
 
     #[test]
