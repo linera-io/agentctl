@@ -375,6 +375,16 @@ pub fn sandbox_snapshot_path() -> PathBuf {
         .unwrap_or_else(|| registry_dir().join("sandboxes.json"))
 }
 
+/// Read the host-collected snapshot. Missing or unparseable yields the default
+/// — same posture as [`load`]: a corrupt or absent file must degrade to "no
+/// foreign origins", never block rendering the local ones.
+pub fn load_snapshot() -> SandboxSnapshot {
+    match fs::read(sandbox_snapshot_path()) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => SandboxSnapshot::default(),
+    }
+}
+
 /// Replace the snapshot wholesale. Unlike the hook-written registries there is
 /// no merge: the collector observes every sandbox in one pass, so its view is
 /// complete by construction and a merge could only resurrect a reaped sandbox.

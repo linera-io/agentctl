@@ -795,6 +795,7 @@ mod tests {
         let session = ClaudeSession {
             pid: 42,
             session_id: "test-session".into(),
+            origin: crate::session::SessionOrigin::Local,
             cwd: "/tmp".into(),
             project_name: "test-proj".into(),
             started_at: 0,
