@@ -38,6 +38,8 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::sandbox_registry;
+
 /// Process-wide cache for the auto-detected sandbox name. `None` means
 /// `sbx ls` could not pick exactly one running sandbox; the resolver then
 /// falls back to `DEFAULT_SANDBOX_NAME`. Populated lazily on first call.
@@ -91,6 +93,24 @@ fn detect_running_sandbox_name() -> Option<String> {
 /// default. We require the running condition because a stopped sandbox is no
 /// help to the reaper — it has no in-VM processes to scan.
 pub(crate) fn parse_sbx_ls_for_single_running_sandbox(stdout: &str) -> Option<String> {
+    let mut running = parse_sbx_ls_running_names(stdout);
+    if running.len() == 1 {
+        return running.pop();
+    }
+    None
+}
+
+/// Pure parser: every running sandbox name in `sbx ls` stdout, in listed order.
+///
+/// Stopped rows are excluded for the same reason the single-sandbox resolver
+/// excludes them — a stopped sandbox has no in-VM processes to scan and nothing
+/// to collect from.
+///
+/// This reads text columns even though `sbx ls --json` exists as of v0.37.0:
+/// the JSON field names aren't pinned yet, and guessing them would trade a
+/// layout verified against real output for one that isn't. Switching over is a
+/// mechanical follow-up once the schema is confirmed.
+pub(crate) fn parse_sbx_ls_running_names(stdout: &str) -> Vec<String> {
     // Header is the first non-empty line whose first whitespace-delimited
     // token equals "SANDBOX". Non-headers are body rows: `name agent status
     // ports workspace`. We only count rows whose status column is "running".
@@ -122,10 +142,114 @@ pub(crate) fn parse_sbx_ls_for_single_running_sandbox(stdout: &str) -> Option<St
             running.push(first.to_string());
         }
     }
-    if running.len() == 1 {
-        return running.pop();
+    running
+}
+
+/// Host-side pointer written by the sandbox wrapper naming the sandbox the
+/// `linera-agent` alias currently resolves to. Absent until the wrapper side
+/// lands, and absent whenever the wrapper has never created a sandbox.
+fn current_sandbox_pointer() -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let path = std::env::var_os("CLAUDECTL_CURRENT_SANDBOX_POINTER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".cache/sandbox-claude-stage/current-sandbox"));
+    let raw = std::fs::read_to_string(path).ok()?;
+    let name = raw.trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Pure resolver for which running sandbox is "current".
+///
+/// The pointer wins when it names a sandbox that is actually running. A pointer
+/// naming a dead sandbox is ignored rather than trusted: it means the wrapper
+/// created something that has since been reaped, and marking a corpse current
+/// would strand every live sandbox as "superseded".
+///
+/// With no usable pointer we fall back to "the only running sandbox, if there
+/// is exactly one" — which is precisely today's world, so this reads correctly
+/// before the wrapper side exists. With several running and no pointer we
+/// return `None`: guessing would put a `current` badge on an arbitrary row.
+pub(crate) fn resolve_current_sandbox(pointer: Option<&str>, running: &[String]) -> Option<String> {
+    if let Some(name) = pointer {
+        if running.iter().any(|r| r == name) {
+            return Some(name.to_string());
+        }
     }
-    None
+    match running {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
+}
+
+/// Ask one sandbox for its sessions via its own in-VM `claudectl --json`.
+///
+/// Errors are per-sandbox and non-fatal: one unreachable sandbox must not cost
+/// us the inventory of every other one, so the caller records an empty slice
+/// for it and carries on.
+fn collect_one_sandbox(name: &str) -> io::Result<Vec<serde_json::Value>> {
+    let output = Command::new("sbx")
+        .args(["exec", name, "claudectl", "--json"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "sbx exec {name} claudectl --json failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let parsed: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| io::Error::other(format!("unparseable --json from {name}: {e}")))?;
+    Ok(parsed
+        .into_iter()
+        .map(sandbox_registry::trim_snapshot_session)
+        .collect())
+}
+
+/// Collect every running sandbox into the host snapshot and write it.
+///
+/// This is the only place cross-sandbox liveness is authoritative — the
+/// per-sandbox registries are written from inside each sandbox and can only
+/// ever describe their own slice.
+fn collect_and_write_snapshot(out: &mut impl Write) -> io::Result<()> {
+    let listing = Command::new("sbx").arg("ls").output()?;
+    if !listing.status.success() {
+        return Err(io::Error::other("sbx ls failed"));
+    }
+    let running = parse_sbx_ls_running_names(&String::from_utf8_lossy(&listing.stdout));
+    let current = resolve_current_sandbox(current_sandbox_pointer().as_deref(), &running);
+
+    let mut snapshot = sandbox_registry::SandboxSnapshot {
+        collected_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        ..Default::default()
+    };
+    for name in &running {
+        let sessions = match collect_one_sandbox(name) {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                // Log which sandbox and why, not just that collection was
+                // partial — a snapshot silently missing an origin looks
+                // identical to a sandbox with no sessions.
+                writeln!(out, "reaper: collect from '{name}' failed: {e}")?;
+                Vec::new()
+            }
+        };
+        snapshot.sandboxes.insert(
+            name.clone(),
+            sandbox_registry::SandboxOrigin {
+                is_current: current.as_deref() == Some(name.as_str()),
+                sessions,
+            },
+        );
+    }
+    sandbox_registry::write_snapshot(&snapshot)?;
+    writeln!(
+        out,
+        "reaper: collected {} sandbox(es) into {}",
+        running.len(),
+        sandbox_registry::sandbox_snapshot_path().display()
+    )
 }
 
 pub(crate) fn sandbox_sessions_dir() -> String {
@@ -338,6 +462,15 @@ pub fn run(dry_run: bool) -> io::Result<()> {
             "reaper: `sbx` not in PATH; nothing to do (no sandboxes on this host)",
         )?;
         return Ok(());
+    }
+
+    // Publish the cross-sandbox snapshot before the orphan scan. Deliberately
+    // independent of it: a collection failure must not cost us orphan reaping,
+    // and vice versa. Skipped under --dry-run, which promises no writes.
+    if !dry_run {
+        if let Err(e) = collect_and_write_snapshot(&mut out) {
+            writeln!(io::stderr(), "reaper: snapshot collection failed: {e}")?;
+        }
     }
 
     let open_ttys = match scan_host_open_ttys() {
@@ -1756,6 +1889,85 @@ old-sbx        claude   stopped           /elsewhere
         // No SANDBOX header line → can't parse → None.
         let stdout = "totally bogus\noutput here\n";
         assert_eq!(parse_sbx_ls_for_single_running_sandbox(stdout), None);
+    }
+
+    /// Real `sbx ls` output (v0.37.0), trimmed in the WORKSPACE column only.
+    /// Several running sandboxes is the whole point of the collector, and it is
+    /// exactly the case the single-sandbox resolver deliberately refuses.
+    const SBX_LS_THREE: &str = "\
+SANDBOX                AGENT    STATUS    PORTS   WORKSPACE
+linera-agent-a3f11b28  claude   running           /Users/ndr/repos
+linera-agent-251d6f7c  claude   running           /Users/ndr/repos
+old-task               claude   stopped           /Users/ndr/repos
+linera-agent           claude   running           /Users/ndr/repos
+";
+
+    #[test]
+    fn running_names_lists_every_running_sandbox_in_order() {
+        assert_eq!(
+            parse_sbx_ls_running_names(SBX_LS_THREE),
+            vec![
+                "linera-agent-a3f11b28".to_string(),
+                "linera-agent-251d6f7c".to_string(),
+                "linera-agent".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn running_names_and_single_resolver_agree_on_the_one_sandbox_case() {
+        // The two parsers share a body; assert they can't drift apart rather
+        // than trusting that they won't.
+        let stdout = "\
+SANDBOX        AGENT    STATUS    PORTS   WORKSPACE
+linera-agent   claude   running           /Users/ndr/repos
+";
+        let names = parse_sbx_ls_running_names(stdout);
+        assert_eq!(names.len(), 1);
+        assert_eq!(
+            parse_sbx_ls_for_single_running_sandbox(stdout),
+            Some(names[0].clone())
+        );
+    }
+
+    #[test]
+    fn current_sandbox_prefers_a_pointer_that_is_actually_running() {
+        let running = parse_sbx_ls_running_names(SBX_LS_THREE);
+        assert_eq!(
+            resolve_current_sandbox(Some("linera-agent-251d6f7c"), &running),
+            Some("linera-agent-251d6f7c".to_string())
+        );
+    }
+
+    #[test]
+    fn current_sandbox_ignores_a_pointer_naming_a_dead_sandbox() {
+        // A pointer left behind by a reaped sandbox must not win: marking a
+        // corpse current would strand every live sandbox as "superseded".
+        // Several are running, so there is no unambiguous fallback either.
+        let running = parse_sbx_ls_running_names(SBX_LS_THREE);
+        assert_eq!(resolve_current_sandbox(Some("long-gone"), &running), None);
+    }
+
+    #[test]
+    fn current_sandbox_falls_back_to_the_only_running_sandbox() {
+        // Today's world, before the wrapper writes any pointer.
+        let running = vec!["linera-agent".to_string()];
+        assert_eq!(
+            resolve_current_sandbox(None, &running),
+            Some("linera-agent".to_string())
+        );
+    }
+
+    #[test]
+    fn current_sandbox_refuses_to_guess_among_several() {
+        let running = parse_sbx_ls_running_names(SBX_LS_THREE);
+        assert_eq!(resolve_current_sandbox(None, &running), None);
+    }
+
+    #[test]
+    fn current_sandbox_is_none_when_nothing_runs() {
+        assert_eq!(resolve_current_sandbox(None, &[]), None);
+        assert_eq!(resolve_current_sandbox(Some("linera-agent"), &[]), None);
     }
 
     #[test]
