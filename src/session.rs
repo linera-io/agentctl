@@ -31,6 +31,25 @@ impl fmt::Display for SessionStatus {
 }
 
 impl SessionStatus {
+    /// Inverse of [`fmt::Display`], for reading a status back out of collected
+    /// `--json` output. Unrecognised input becomes `Unknown` rather than a
+    /// guess — the variant that already means "the process is there but we
+    /// can't say what it's doing".
+    ///
+    /// Kept adjacent to the `Display` impl on purpose; `status_labels_round_trip`
+    /// asserts the two stay inverses instead of trusting that they will.
+    pub fn from_label(label: &str) -> Self {
+        match label {
+            "Needs Input" => Self::NeedsInput,
+            "Compacting" => Self::Compacting,
+            "Processing" => Self::Processing,
+            "Waiting" => Self::WaitingInput,
+            "Idle" => Self::Idle,
+            "Finished" => Self::Finished,
+            _ => Self::Unknown,
+        }
+    }
+
     pub fn sort_key(&self) -> u8 {
         match self {
             Self::NeedsInput => 0,
@@ -139,10 +158,48 @@ pub enum HostTerminalTarget {
     },
 }
 
+/// Where a session was observed — which machine or microVM its process runs in.
+///
+/// A property of the session, not of how we happened to learn about it: a
+/// session's pid, `~/.claude/sessions` sidecar and `ps` row all live inside one
+/// VM, and none of them mean anything outside it. Carrying this on the session
+/// (rather than in a lookup table beside it) is what stops a foreign row being
+/// silently treated as local — the distinction that decides whether we may
+/// signal its pid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOrigin {
+    /// Discovered natively by this claudectl — its own sandbox, or the laptop
+    /// when running on the host. Its pid is addressable by us.
+    Local,
+    /// Collected from another sandbox via the host-side snapshot. Its pid
+    /// belongs to a different VM and must never be signalled from here.
+    Sandbox(String),
+}
+
+impl SessionOrigin {
+    /// Label for the ORIGIN column. `Local` needs context we don't hold here —
+    /// the caller passes what "here" is called (the sandbox name, or `None` on
+    /// the laptop).
+    pub fn label(&self, local_name: Option<&str>) -> String {
+        match self {
+            Self::Local => local_name.unwrap_or("laptop").to_string(),
+            Self::Sandbox(name) => name.clone(),
+        }
+    }
+
+    /// Can this process be signalled from here? False for anything in another
+    /// VM, where our pid namespace would hit an unrelated local process.
+    pub fn is_addressable(&self) -> bool {
+        matches!(self, Self::Local)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClaudeSession {
     pub pid: u32,
     pub session_id: String,
+    /// Which machine/VM this session runs in. See [`SessionOrigin`].
+    pub origin: SessionOrigin,
     pub cwd: String,
     pub project_name: String,
     pub started_at: u64,
@@ -401,6 +458,10 @@ impl ClaudeSession {
         Self {
             pid: raw.pid,
             session_id: raw.session_id,
+            // Everything reaching `from_raw` came from this VM's own sidecars
+            // or process table, so it is by construction local. Foreign
+            // sessions are built by `from_snapshot_value` instead.
+            origin: SessionOrigin::Local,
             cwd: raw.cwd,
             project_name,
             started_at: raw.started_at,
@@ -526,6 +587,77 @@ impl ClaudeSession {
             .iter()
             .map(|&level| BLOCKS[level.min(8) as usize])
             .collect()
+    }
+
+    /// Rebuild a session from one entry of another sandbox's `--json` output,
+    /// as collected into the host snapshot.
+    ///
+    /// Returns `None` when the entry carries no `session_id` — an unidentified
+    /// row can be neither resumed nor de-duplicated against local discovery,
+    /// so showing it would be worse than omitting it.
+    ///
+    /// Only fields the collected payload actually carries are overlaid. The
+    /// rest keep `from_raw`'s defaults rather than being invented: a fabricated
+    /// zero would render as a real measurement, and "we didn't collect this"
+    /// must not look like "this session is idle".
+    pub fn from_snapshot_value(sandbox: &str, value: &serde_json::Value) -> Option<Self> {
+        let session_id = value.get("session_id")?.as_str()?.to_string();
+        let str_field = |key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let raw = RawSession {
+            pid: value
+                .get("pid")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32,
+            session_id,
+            cwd: str_field("cwd"),
+            started_at: value
+                .get("started_at")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            // Pass the recorded title through as-is. It has already survived
+            // the placeholder filter on the producing side, so re-running
+            // `title()` here would be a second filter over clean input.
+            name: Some(str_field("session_name")).filter(|name| !name.is_empty()),
+            name_source: None,
+        };
+        let mut session = Self::from_raw(raw);
+        session.origin = SessionOrigin::Sandbox(sandbox.to_string());
+
+        if let Some(cpu) = value.get("cpu").and_then(serde_json::Value::as_f64) {
+            session.cpu_percent = cpu as f32;
+        }
+        if let Some(mem) = value.get("mem_mb").and_then(serde_json::Value::as_f64) {
+            session.mem_mb = mem;
+        }
+        // The cost/token block is emitted as null when the producing side had
+        // no usage metrics. Treat a present number as the authority for that
+        // whole block — matching how `to_json_value` gates them together.
+        if let Some(cost) = value.get("cost_usd").and_then(serde_json::Value::as_f64) {
+            session.cost_usd = cost;
+            session.usage_metrics_available = true;
+            session.burn_rate_per_hr = value
+                .get("burn_rate_per_hr")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            session.total_input_tokens = value
+                .get("tokens_in")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            session.total_output_tokens = value
+                .get("tokens_out")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+        }
+        if let Some(status) = value.get("status").and_then(serde_json::Value::as_str) {
+            session.status = SessionStatus::from_label(status);
+        }
+        Some(session)
     }
 
     pub fn display_name(&self) -> &str {
@@ -747,11 +879,18 @@ impl ClaudeSession {
         };
 
         serde_json::json!({
-            // The id is what makes a row actionable — `claude --resume <id>`,
-            // and the join key when a host-side collector merges this output
-            // across sandboxes. Without it a consumer can only address a
-            // session by pid, which is meaningless outside its own VM.
+            // Identity and placement. Together these are what let a consumer
+            // reconstruct and act on a row it did not observe itself:
+            // `session_id` for `claude --resume <id>`, `cwd` for resuming in
+            // the right directory, and `session_name` because `project` below
+            // is `display_name()` — which collapses the title and the project
+            // into one string and so can't fill both columns on the way back.
+            // Without these a consumer can only address a session by pid,
+            // which means nothing outside the VM that produced it.
             "session_id": self.session_id,
+            "cwd": self.cwd,
+            "session_name": self.session_name,
+            "started_at": self.started_at,
             "pid": self.pid,
             "project": self.display_name(),
             "status": self.status.to_string(),
@@ -893,6 +1032,159 @@ fn subagent_label(path: &Path) -> String {
         .and_then(|stem| stem.to_str())
         .unwrap_or("subagent")
         .to_string()
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    const ALL_STATUSES: [SessionStatus; 7] = [
+        SessionStatus::NeedsInput,
+        SessionStatus::Compacting,
+        SessionStatus::Processing,
+        SessionStatus::WaitingInput,
+        SessionStatus::Unknown,
+        SessionStatus::Idle,
+        SessionStatus::Finished,
+    ];
+
+    #[test]
+    fn status_labels_round_trip() {
+        // `from_label` is a hand-written inverse of `Display`. Assert they are
+        // actually inverses rather than trusting two match arms to stay in
+        // step — a drifted pair would silently render every collected foreign
+        // session as Unknown.
+        for status in ALL_STATUSES {
+            assert_eq!(
+                SessionStatus::from_label(&status.to_string()),
+                status,
+                "round trip failed for {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_status_label_degrades_to_unknown() {
+        assert_eq!(
+            SessionStatus::from_label("Something From The Future"),
+            SessionStatus::Unknown
+        );
+        assert_eq!(SessionStatus::from_label(""), SessionStatus::Unknown);
+    }
+
+    #[test]
+    fn origin_label_names_the_local_context() {
+        // Inside a sandbox the local origin is that sandbox; on the laptop it
+        // has no name of its own.
+        assert_eq!(
+            SessionOrigin::Local.label(Some("linera-agent-a3f1")),
+            "linera-agent-a3f1"
+        );
+        assert_eq!(SessionOrigin::Local.label(None), "laptop");
+        assert_eq!(
+            SessionOrigin::Sandbox("linera-agent-251d".into()).label(Some("linera-agent-a3f1")),
+            "linera-agent-251d"
+        );
+    }
+
+    #[test]
+    fn only_local_sessions_are_addressable() {
+        // The guard that stops us signalling a pid in someone else's namespace.
+        assert!(SessionOrigin::Local.is_addressable());
+        assert!(!SessionOrigin::Sandbox("elsewhere".into()).is_addressable());
+    }
+
+    fn collected(extra: serde_json::Value) -> serde_json::Value {
+        let mut base = serde_json::json!({
+            "session_id": "abc-123",
+            "cwd": "/Users/ndr/repos/linera-infra",
+            "session_name": "fix-scylla-disk",
+            "started_at": 1_700_000_000_000u64,
+            "pid": 4242,
+            "project": "fix-scylla-disk",
+            "status": "Processing",
+        });
+        let (base_map, extra_map) = (base.as_object_mut().unwrap(), extra.as_object().unwrap());
+        for (key, value) in extra_map {
+            base_map.insert(key.clone(), value.clone());
+        }
+        base
+    }
+
+    #[test]
+    fn snapshot_value_rebuilds_identity_and_origin() {
+        let session = ClaudeSession::from_snapshot_value(
+            "linera-agent-251d",
+            &collected(serde_json::json!({})),
+        )
+        .expect("well-formed entry");
+        assert_eq!(session.session_id, "abc-123");
+        assert_eq!(session.pid, 4242);
+        assert_eq!(session.cwd, "/Users/ndr/repos/linera-infra");
+        assert_eq!(session.status, SessionStatus::Processing);
+        assert_eq!(
+            session.origin,
+            SessionOrigin::Sandbox("linera-agent-251d".into())
+        );
+        assert!(!session.origin.is_addressable());
+        // `session_name` must survive separately from `project`, or the Name
+        // and Project columns collapse into one on the way back.
+        assert_eq!(session.display_name(), "fix-scylla-disk");
+    }
+
+    #[test]
+    fn snapshot_value_without_an_id_is_dropped() {
+        let mut value = collected(serde_json::json!({}));
+        value.as_object_mut().unwrap().remove("session_id");
+        assert!(ClaudeSession::from_snapshot_value("sbx", &value).is_none());
+    }
+
+    #[test]
+    fn snapshot_value_does_not_invent_uncollected_metrics() {
+        // No cost block in the payload means the producing side had no usage
+        // metrics. A fabricated 0.0 would render as a real measurement.
+        let session = ClaudeSession::from_snapshot_value("sbx", &collected(serde_json::json!({})))
+            .expect("well-formed entry");
+        assert!(!session.usage_metrics_available);
+        assert_eq!(session.cost_usd, 0.0);
+        assert_eq!(session.total_input_tokens, 0);
+    }
+
+    #[test]
+    fn snapshot_value_overlays_collected_metrics() {
+        let session = ClaudeSession::from_snapshot_value(
+            "sbx",
+            &collected(serde_json::json!({
+                "cost_usd": 12.5,
+                "burn_rate_per_hr": 3.25,
+                "tokens_in": 1000,
+                "tokens_out": 250,
+                "cpu": 7.5,
+                "mem_mb": 512.0,
+            })),
+        )
+        .expect("well-formed entry");
+        assert!(session.usage_metrics_available);
+        assert_eq!(session.cost_usd, 12.5);
+        assert_eq!(session.burn_rate_per_hr, 3.25);
+        assert_eq!(session.total_input_tokens, 1000);
+        assert_eq!(session.total_output_tokens, 250);
+        assert_eq!(session.mem_mb, 512.0);
+    }
+
+    #[test]
+    fn locally_discovered_sessions_are_local() {
+        let session = ClaudeSession::from_raw(RawSession {
+            pid: 1,
+            session_id: "local-1".into(),
+            cwd: "/tmp".into(),
+            started_at: 0,
+            name: None,
+            name_source: None,
+        });
+        assert_eq!(session.origin, SessionOrigin::Local);
+        assert!(session.origin.is_addressable());
+    }
 }
 
 #[cfg(test)]

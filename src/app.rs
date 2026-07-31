@@ -69,6 +69,14 @@ pub fn do_refresh_io(prev_sessions: Vec<ClaudeSession>) -> RefreshIoOutput {
     }
     let jsonl_elapsed = jsonl_start.elapsed();
 
+    // Foreign sessions join only AFTER the local pipeline, never before.
+    // Everything above addresses a session by pid in *our* namespace:
+    // `fetch_and_enrich` would `ps` a foreign pid and decorate the row with an
+    // unrelated local process's CPU and memory, and `monitor::update_tokens`
+    // would re-derive metrics we already collected. Their numbers arrive
+    // pre-computed by the claudectl that can actually see them.
+    sessions.extend(foreign_sessions(&sessions));
+
     RefreshIoOutput {
         sessions,
         new_pids,
@@ -76,6 +84,35 @@ pub fn do_refresh_io(prev_sessions: Vec<ClaudeSession>) -> RefreshIoOutput {
         ps_elapsed,
         jsonl_elapsed,
     }
+}
+
+/// Sessions from every origin that is not this one, read from the host-side
+/// snapshot.
+///
+/// Excludes our own sandbox's slice: we discovered those natively a few lines
+/// above, live, and the snapshot's copy is as old as the last collector pass.
+/// De-dupes on `session_id` as a backstop so a mislabelled slice can't render
+/// the same session twice.
+fn foreign_sessions(local: &[ClaudeSession]) -> Vec<ClaudeSession> {
+    let here = crate::sandbox_registry::current_sandbox();
+    let snapshot = crate::sandbox_registry::load_snapshot();
+    let seen: std::collections::HashSet<&str> = local
+        .iter()
+        .map(|session| session.session_id.as_str())
+        .collect();
+
+    snapshot
+        .sandboxes
+        .iter()
+        .filter(|(name, _)| here.as_deref() != Some(name.as_str()))
+        .flat_map(|(name, origin)| {
+            origin
+                .sessions
+                .iter()
+                .filter_map(move |value| ClaudeSession::from_snapshot_value(name, value))
+        })
+        .filter(|session| !seen.contains(session.session_id.as_str()))
+        .collect()
 }
 
 /// Refresh-driven application state. Owned exclusively by `App.data` and

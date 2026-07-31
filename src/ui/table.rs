@@ -13,6 +13,21 @@ use super::detail::render_detail_panel;
 use super::help::render_help_overlay;
 use super::status_bar::render_status_bar;
 
+/// Table columns in render order.
+///
+/// Single-sourced because every row builder must emit exactly this many cells
+/// and ratatui silently renders a short row rather than failing — the padding
+/// loop in `parked_separator_row` used to count to a hardcoded 13, which is the
+/// kind of thing that goes wrong the next time a column is added.
+///
+/// ORIGIN is last deliberately: `sort_header_idx` below maps sort columns to
+/// header positions by hand, so inserting mid-table would silently mis-point
+/// the sort arrow.
+const HEADER_NAMES: [&str; 14] = [
+    "PID", "Name", "Project", "Status", "Context", "Cost", "$/hr", "Elapsed", "Last", "CPU%",
+    "MEM", "In/Out", "Activity", "Origin",
+];
+
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
     let visible_sessions = app.visible_sessions();
@@ -131,10 +146,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     // Build header with sort indicator
-    let header_names = [
-        "PID", "Name", "Project", "Status", "Context", "Cost", "$/hr", "Elapsed", "Last", "CPU%",
-        "MEM", "In/Out", "Activity",
-    ];
+    let header_names = HEADER_NAMES;
 
     // Map sort_column index to header index:
     // 0=Status->3, 1=Context->4, 2=Cost->5, 3=$/hr->6, 4=Elapsed->7, 5=Last->8, 6=Name->1
@@ -192,7 +204,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 Cell::from(header_text)
                     .style(Style::default().fg(t.header).add_modifier(Modifier::BOLD)),
             ];
-            for _ in 3..13 {
+            for _ in 3..HEADER_NAMES.len() {
                 cells.push(Cell::from(""));
             }
             rows.push(Row::new(cells));
@@ -253,6 +265,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(5),  // MEM
         Constraint::Length(14), // Tokens
         Constraint::Length(16), // Activity sparkline
+        Constraint::Min(10),    // Origin (sandbox name / laptop)
     ];
 
     let count = visible_sessions.len();
@@ -453,7 +466,7 @@ fn parked_separator_row(app: &App, parked_count: usize) -> Row<'static> {
                 .add_modifier(Modifier::BOLD),
         ),
     ];
-    for _ in 3..13 {
+    for _ in 3..HEADER_NAMES.len() {
         cells.push(Cell::from(""));
     }
     Row::new(cells)
@@ -581,7 +594,26 @@ fn session_row(s: &ClaudeSession, app: &App) -> Row<'static> {
         Cell::from(s.format_mem()),
         Cell::from(s.format_tokens()),
         Cell::from(s.format_sparkline()).style(Style::default().fg(t.sparkline)),
+        origin_cell(s, app),
     ])
+}
+
+/// The ORIGIN cell. A foreign session is dimmed: its numbers are real but were
+/// measured at the last collector pass rather than this tick, and rendering it
+/// identically to a live local row would overstate how current it is.
+fn origin_cell(s: &ClaudeSession, app: &App) -> Cell<'static> {
+    let t = &app.theme;
+    let label = s
+        .origin
+        .label(crate::sandbox_registry::current_sandbox().as_deref());
+    let style = if s.origin.is_addressable() {
+        Style::default().fg(t.text_muted)
+    } else {
+        Style::default()
+            .fg(t.text_muted)
+            .add_modifier(Modifier::DIM)
+    };
+    Cell::from(label).style(style)
 }
 
 fn subagent_row(
@@ -633,6 +665,9 @@ fn subagent_row(
         Cell::from("-").style(row_style),
         Cell::from(row.format_tokens()).style(row_style),
         Cell::from("-").style(row_style),
+        // A subagent lives in whatever origin its parent does, so repeating it
+        // on every child row is noise.
+        Cell::from("").style(row_style),
     ])
 }
 
