@@ -142,7 +142,6 @@ pub enum HostTerminalTarget {
 #[derive(Debug, Clone)]
 pub struct ClaudeSession {
     pub pid: u32,
-    #[allow(dead_code)]
     pub session_id: String,
     pub cwd: String,
     pub project_name: String,
@@ -748,6 +747,11 @@ impl ClaudeSession {
         };
 
         serde_json::json!({
+            // The id is what makes a row actionable — `claude --resume <id>`,
+            // and the join key when a host-side collector merges this output
+            // across sandboxes. Without it a consumer can only address a
+            // session by pid, which is meaningless outside its own VM.
+            "session_id": self.session_id,
             "pid": self.pid,
             "project": self.display_name(),
             "status": self.status.to_string(),

@@ -297,6 +297,92 @@ impl Default for Registry {
     }
 }
 
+/// Heavy per-session fields the aggregate view never renders. Dropped from the
+/// snapshot because it is rewritten on every collector pass: `files_modified`
+/// alone can be hundreds of entries, and a full 22-session `claudectl --json`
+/// payload measures ~124 KB before any of this is stripped.
+///
+/// A denylist rather than an allowlist so fields added to `to_json_value` later
+/// flow through without an edit here — the snapshot stays forward-compatible,
+/// and the only cost of forgetting to deny a new heavy field is file size.
+const SNAPSHOT_HEAVY_FIELDS: &[&str] = &[
+    "files_modified",
+    "tool_usage",
+    "recent_errors",
+    "subagent_breakdown",
+];
+
+/// One origin's collected inventory. `is_current` marks the sandbox the alias
+/// resolves to; every other running sandbox is superseded and draining.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SandboxOrigin {
+    #[serde(default)]
+    pub is_current: bool,
+    #[serde(default)]
+    pub sessions: Vec<serde_json::Value>,
+}
+
+/// Host-collected snapshot of every sandbox's sessions (`sandboxes.json`).
+///
+/// Distinct from [`Registry`], which is written by *hooks from inside* each
+/// sandbox and only ever describes the writer's own slice. This file is written
+/// by a single host-side collector that can see all sandboxes at once, so it is
+/// the only place cross-sandbox liveness is authoritative.
+///
+/// `collected_at_ms` is load-bearing, not decoration: a reader that cannot tell
+/// a fresh snapshot from one abandoned by a dead collector would render a
+/// confidently wrong session list. Consumers must degrade on staleness rather
+/// than trust it silently.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SandboxSnapshot {
+    #[serde(default = "current_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub collected_at_ms: u64,
+    #[serde(default)]
+    pub sandboxes: BTreeMap<String, SandboxOrigin>,
+}
+
+impl Default for SandboxSnapshot {
+    // Hand-written for the same reason as `Registry`'s: a derived impl would
+    // persist version 0.
+    fn default() -> Self {
+        SandboxSnapshot {
+            version: current_version(),
+            collected_at_ms: 0,
+            sandboxes: BTreeMap::new(),
+        }
+    }
+}
+
+/// Strip [`SNAPSHOT_HEAVY_FIELDS`] from one `claudectl --json` session object.
+/// Non-objects pass through untouched — a malformed element must not abort a
+/// whole sandbox's collection.
+pub fn trim_snapshot_session(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(map) = value.as_object_mut() {
+        for field in SNAPSHOT_HEAVY_FIELDS {
+            map.remove(*field);
+        }
+    }
+    value
+}
+
+/// Path to the host-collected snapshot (`sandboxes.json`). Honors
+/// `CLAUDECTL_SANDBOX_SNAPSHOT` (tests, to avoid stomping the real file).
+pub fn sandbox_snapshot_path() -> PathBuf {
+    std::env::var_os("CLAUDECTL_SANDBOX_SNAPSHOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| registry_dir().join("sandboxes.json"))
+}
+
+/// Replace the snapshot wholesale. Unlike the hook-written registries there is
+/// no merge: the collector observes every sandbox in one pass, so its view is
+/// complete by construction and a merge could only resurrect a reaped sandbox.
+pub fn write_snapshot(snapshot: &SandboxSnapshot) -> io::Result<()> {
+    let path = sandbox_snapshot_path();
+    with_lock(&path, || write_atomic(&path, &serialize(snapshot)?))
+}
+
 /// The local (laptop) session registry — a flat list, since there's only ever
 /// one machine's worth of sessions (no sandbox names to key by). Stored in its
 /// own file (`local-sessions.json`) so host hooks and the in-sandbox writer
@@ -553,6 +639,7 @@ pub(crate) mod tests {
             unsafe {
                 std::env::set_var("CLAUDECTL_SANDBOX_REGISTRY", dir.join("sandbox.json"));
                 std::env::set_var("CLAUDECTL_LOCAL_REGISTRY", dir.join("local.json"));
+                std::env::set_var("CLAUDECTL_SANDBOX_SNAPSHOT", dir.join("sandboxes.json"));
             }
             TempRegistry {
                 dir,
@@ -582,6 +669,7 @@ pub(crate) mod tests {
             unsafe {
                 std::env::remove_var("CLAUDECTL_SANDBOX_REGISTRY");
                 std::env::remove_var("CLAUDECTL_LOCAL_REGISTRY");
+                std::env::remove_var("CLAUDECTL_SANDBOX_SNAPSHOT");
                 if let Some(previous) = self.saved_home.take() {
                     match previous {
                         Some(home) => std::env::set_var("HOME", home),
@@ -1178,6 +1266,75 @@ pub(crate) mod tests {
             terminals_running(&[15601]),
         );
         assert!(pruned.is_empty());
+    }
+
+    #[test]
+    fn snapshot_round_trips_through_disk_with_current_flag_intact() {
+        let _reg = TempRegistry::new("snapshot");
+        let mut snapshot = SandboxSnapshot {
+            collected_at_ms: 1_784_953_050_628,
+            ..Default::default()
+        };
+        snapshot.sandboxes.insert(
+            "linera-agent-a3f11b28c4d0".to_string(),
+            SandboxOrigin {
+                is_current: true,
+                sessions: vec![serde_json::json!({"session_id": "s1"})],
+            },
+        );
+        snapshot.sandboxes.insert(
+            "linera-agent-251d6f7c9065".to_string(),
+            SandboxOrigin::default(),
+        );
+        write_snapshot(&snapshot).unwrap();
+
+        let bytes = fs::read(sandbox_snapshot_path()).unwrap();
+        let back: SandboxSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.version, current_version());
+        assert_eq!(back.collected_at_ms, 1_784_953_050_628);
+        // Exactly one origin is current; a superseded one must not inherit it.
+        assert!(back.sandboxes["linera-agent-a3f11b28c4d0"].is_current);
+        assert!(!back.sandboxes["linera-agent-251d6f7c9065"].is_current);
+        assert_eq!(
+            back.sandboxes["linera-agent-a3f11b28c4d0"].sessions.len(),
+            1
+        );
+        assert!(
+            back.sandboxes["linera-agent-251d6f7c9065"]
+                .sessions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn snapshot_trim_drops_heavy_fields_and_keeps_what_a_row_needs() {
+        let session = serde_json::json!({
+            "session_id": "s1",
+            "project": "auto-rolling-sandbox-images",
+            "status": "Processing",
+            "cost_usd": 12.5,
+            "files_modified": {"/a": 1},
+            "tool_usage": {"Bash": 3},
+            "recent_errors": ["boom"],
+            "subagent_breakdown": [{"x": 1}],
+        });
+        let trimmed = trim_snapshot_session(session);
+        let obj = trimmed.as_object().unwrap();
+        for keep in ["session_id", "project", "status", "cost_usd"] {
+            assert!(obj.contains_key(keep), "{keep} was trimmed but is needed");
+        }
+        for heavy in SNAPSHOT_HEAVY_FIELDS {
+            assert!(!obj.contains_key(*heavy), "{heavy} survived trimming");
+        }
+    }
+
+    #[test]
+    fn snapshot_trim_passes_non_objects_through_untouched() {
+        // One malformed element must not abort a whole sandbox's collection.
+        let scalar = serde_json::json!("not an object");
+        assert_eq!(trim_snapshot_session(scalar.clone()), scalar);
+        let array = serde_json::json!([1, 2, 3]);
+        assert_eq!(trim_snapshot_session(array.clone()), array);
     }
 
     #[test]
