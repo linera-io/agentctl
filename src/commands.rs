@@ -272,6 +272,30 @@ fn resolve_cwd(cwd: &str) -> String {
 /// Decide which sandbox slice(s) to restore. An explicit name (or `all`) is
 /// honored directly; otherwise a single registered sandbox is auto-selected
 /// and multiple prompt an interactive pick.
+/// Registered sandboxes belonging to the family `arg` names, in registry order.
+///
+/// A sandbox's name encodes the image + mounts it was built from
+/// (`linera-agent-a3f11b28c4d0`), so what used to be one long-lived
+/// `linera-agent` is now a rolling series of them, several alive at once while
+/// older ones drain. `--restore-sbx-sessions linera-agent` therefore has to
+/// mean "everything in the linera-agent family", or it silently restores a
+/// fraction of your sessions — and after the legacy sandbox is finally reaped,
+/// nothing at all, because no sandbox is called exactly that any more.
+///
+/// The boundary is a literal `-`, not a bare prefix: `linera-agent` must not
+/// swallow a hypothetical `linera-agentic`. An exact name still selects exactly
+/// itself, so naming one rolled sandbox targets only that one, and an
+/// engineer's `SANDBOX_NAME=` sandbox is never swept in by a family it doesn't
+/// belong to.
+pub(crate) fn matching_sandboxes(names: &[String], arg: &str) -> Vec<String> {
+    let family_prefix = format!("{arg}-");
+    names
+        .iter()
+        .filter(|name| name.as_str() == arg || name.starts_with(&family_prefix))
+        .cloned()
+        .collect()
+}
+
 fn select_sandboxes(
     registry: &sandbox_registry::Registry,
     sandbox_arg: &str,
@@ -283,8 +307,9 @@ fn select_sandboxes(
         if arg.eq_ignore_ascii_case("all") {
             return Ok(names);
         }
-        if registry.sandboxes.contains_key(arg) {
-            return Ok(vec![arg.to_string()]);
+        let matched = matching_sandboxes(&names, arg);
+        if !matched.is_empty() {
+            return Ok(matched);
         }
         eprintln!(
             "No sessions registered for sandbox '{arg}'. Registered: {}",
@@ -1310,6 +1335,84 @@ pub(crate) fn run_brain_query(cfg: &config::Config, cli: &Cli) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The registry as it looks mid-roll: the legacy sandbox still draining,
+    /// two rolled ones, and an engineer's own task sandbox.
+    fn registered() -> Vec<String> {
+        vec![
+            "linera-agent".to_string(),
+            "linera-agent-2a14db7ea350".to_string(),
+            "linera-agent-ecc2914459c0".to_string(),
+            "scylla-investigation".to_string(),
+        ]
+    }
+
+    #[test]
+    fn base_name_covers_the_whole_rolled_family() {
+        // The reported bug: restoring 'linera-agent' recovered only the one
+        // sandbox named exactly that, leaving every rolled sandbox's sessions
+        // stranded.
+        assert_eq!(
+            matching_sandboxes(&registered(), "linera-agent"),
+            vec![
+                "linera-agent".to_string(),
+                "linera-agent-2a14db7ea350".to_string(),
+                "linera-agent-ecc2914459c0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn base_name_still_works_once_the_legacy_sandbox_is_gone() {
+        // No sandbox is called exactly 'linera-agent' any more. Before this
+        // change that resolved to nothing at all.
+        let names = vec![
+            "linera-agent-2a14db7ea350".to_string(),
+            "linera-agent-ecc2914459c0".to_string(),
+        ];
+        assert_eq!(matching_sandboxes(&names, "linera-agent"), names);
+    }
+
+    #[test]
+    fn an_exact_rolled_name_selects_only_itself() {
+        assert_eq!(
+            matching_sandboxes(&registered(), "linera-agent-2a14db7ea350"),
+            vec!["linera-agent-2a14db7ea350".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_named_task_sandbox_is_never_swept_into_another_family() {
+        assert_eq!(
+            matching_sandboxes(&registered(), "scylla-investigation"),
+            vec!["scylla-investigation".to_string()]
+        );
+        // ...and naming the family must not drag it in.
+        assert!(
+            !matching_sandboxes(&registered(), "linera-agent")
+                .contains(&"scylla-investigation".to_string())
+        );
+    }
+
+    #[test]
+    fn family_matching_stops_at_a_hyphen_boundary() {
+        // A bare prefix match would make 'linera-agent' swallow these.
+        let names = vec![
+            "linera-agentic".to_string(),
+            "linera-agentfoo".to_string(),
+            "linera-agent".to_string(),
+        ];
+        assert_eq!(
+            matching_sandboxes(&names, "linera-agent"),
+            vec!["linera-agent".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_unknown_name_matches_nothing() {
+        assert!(matching_sandboxes(&registered(), "no-such-sandbox").is_empty());
+        assert!(matching_sandboxes(&[], "linera-agent").is_empty());
+    }
 
     #[test]
     fn session_id_validation_accepts_uuids_and_rejects_shell_metacharacters() {
