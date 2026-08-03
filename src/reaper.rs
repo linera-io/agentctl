@@ -31,7 +31,7 @@
 //! Both env vars are read on every invocation; an empty value falls back to
 //! the default (treat empty as unset).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -186,7 +186,31 @@ pub(crate) fn resolve_current_sandbox(pointer: Option<&str>, running: &[String])
     }
 }
 
-/// Ask one sandbox for its sessions via its own in-VM `claudectl --json`.
+/// One live `claude` process seen inside a sandbox — the only facts about a
+/// foreign session that the host cannot work out for itself.
+///
+/// Everything else a row renders is either *identity* (the hook-written
+/// registry has it) or *transcript-derived* (the host recomputes it from the
+/// shared `~/.claude` mount every tick — see `app::do_refresh_io`). CPU and
+/// resident memory are genuinely per-VM measurements, and membership in the
+/// probe's output is the liveness verdict.
+#[derive(Debug, Clone, PartialEq)]
+struct SandboxProc {
+    pid: u32,
+    cpu_percent: f32,
+    mem_mb: f64,
+}
+
+/// Collect one running sandbox's sessions: identity from the hook-written
+/// registry, CPU/memory/liveness from a `ps` probe run inside that VM.
+///
+/// Nothing here speaks to the sandbox's own `claudectl`. That binary is baked
+/// into the sandbox image, which rebuilds nightly at best, so the host was
+/// reading a wire format that could be arbitrarily older than its own — and
+/// was, repeatedly, each time surfacing as a column that silently rendered
+/// blank for every session in an older sandbox. `ps` has no version to skew
+/// against, and the registry is written by hooks running *this* claudectl's
+/// schema on the shared mount.
 ///
 /// Errors are per-sandbox and non-fatal: one unreachable sandbox must not cost
 /// us the inventory of every other one, so the caller records an empty slice
@@ -195,68 +219,140 @@ fn collect_one_sandbox(
     name: &str,
     registry: &[sandbox_registry::SessionEntry],
 ) -> io::Result<Vec<serde_json::Value>> {
-    let output = Command::new("sbx")
-        .args(["exec", name, "claudectl", "--json"])
-        .output()?;
+    let pids: Vec<u32> = registry.iter().filter_map(|entry| entry.pid).collect();
+    if pids.is_empty() {
+        // Nothing recorded for this sandbox ⇒ nothing to ask it about. Not
+        // merely an optimisation: every `sbx exec` is seconds of wrapper
+        // startup, paid once per running sandbox on every reaper tick.
+        return Ok(Vec::new());
+    }
+    let live = probe_sandbox_procs(name, &pids)?;
+    Ok(sessions_from_registry(registry, &live))
+}
+
+/// Run [`PROC_PROBE_SCRIPT`] inside `name` for `pids` and parse what it saw.
+///
+/// Caller must have established that `name` is *running*: `sbx exec` starts a
+/// stopped sandbox, so probing one indiscriminately would resurrect sandboxes
+/// the user had deliberately shut down.
+fn probe_sandbox_procs(name: &str, pids: &[u32]) -> io::Result<HashMap<u32, SandboxProc>> {
+    let mut cmd = Command::new("sbx");
+    cmd.args(["exec", name, "bash", "-c", PROC_PROBE_SCRIPT, "--"]);
+    cmd.args(pids.iter().map(u32::to_string));
+    let output = cmd.output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
-            "sbx exec {name} claudectl --json failed: {}",
+            "sbx exec {name} proc-probe failed: {}",
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    let parsed: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
-        .map_err(|e| io::Error::other(format!("unparseable --json from {name}: {e}")))?;
-    Ok(parsed
-        .into_iter()
-        .map(sandbox_registry::trim_snapshot_session)
-        .map(|session| backfill_identity_from_registry(session, registry))
-        .collect())
+    Ok(parse_sandbox_procs(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
-/// Fill in identity fields the sandbox's own `claudectl --json` didn't provide.
+/// The in-sandbox process probe, kept as a named constant for the same reason
+/// [`sidecar_scan_script`] is its own function: tests execute it for real
+/// against live pids with a plain `bash -c`, no `sbx` involved.
 ///
-/// A sandbox built from an older image runs an older claudectl, whose `--json`
-/// predates `session_id`/`session_name`/`cwd`. Those rows are unidentifiable,
-/// and the renderer drops what it cannot identify — so every session in an
-/// older sandbox silently vanished from the unified view (20 of them, on
-/// 2026-07-31).
+/// Pids arrive as positional arguments and one `ps` row is printed per live
+/// one: `pid %cpu rss command`. `ps` is the entire dependency — no jq, no
+/// in-sandbox claudectl — which is precisely what makes the collector immune
+/// to image-vs-host version skew.
 ///
-/// The registry closes the gap: it is written by in-sandbox *hooks* rather than
-/// by `--json`, so it carries `session_id`, `name` and `cwd` for exactly those
-/// sessions. Join on pid, which is unique within one sandbox — and it is the
-/// same sandbox's slice on both sides, so a pid cannot mean two things here.
+/// `ps` exits non-zero when *none* of the pids exist, which is an ordinary
+/// outcome (every recorded session has since exited), so its failure is
+/// swallowed and the script always exits 0. Empty stdout then reads as
+/// "nothing alive here", which is exactly right; a genuine `sbx` failure still
+/// shows up as a non-zero exit from `sbx` itself.
+const PROC_PROBE_SCRIPT: &str = r#"
+set -u
+if [ "$#" -eq 0 ]; then exit 0; fi
+IFS=,
+pids="$*"
+unset IFS
+ps -o pid=,%cpu=,rss=,command= -p "$pids" 2>/dev/null || true
+exit 0
+"#;
+
+/// Pure parser for the probe's `ps` output, keyed by pid.
 ///
-/// Only ever fills absent fields. A value the sandbox reported is fresher than
-/// the registry's copy and must win.
-fn backfill_identity_from_registry(
-    mut session: serde_json::Value,
-    registry: &[sandbox_registry::SessionEntry],
-) -> serde_json::Value {
-    let Some(map) = session.as_object_mut() else {
-        return session;
-    };
-    let missing = |map: &serde_json::Map<String, serde_json::Value>, key: &str| {
-        map.get(key).is_none_or(|v| v.is_null())
-    };
-    if !missing(map, "session_id") {
-        return session;
-    }
-    let Some(pid) = map.get("pid").and_then(serde_json::Value::as_u64) else {
-        return session;
-    };
-    let Some(entry) = registry.iter().find(|e| e.pid == Some(pid as u32)) else {
-        return session;
-    };
-    map.insert("session_id".into(), entry.session_id.clone().into());
-    if missing(map, "cwd") {
-        map.insert("cwd".into(), entry.cwd.clone().into());
-    }
-    if missing(map, "session_name") {
-        if let Some(name) = entry.name.clone() {
-            map.insert("session_name".into(), name.into());
+/// Rows whose argv0 is not exactly `claude` are dropped rather than merely
+/// left unmatched: pids get recycled inside a container as readily as anywhere
+/// else, and a registry entry naming a recycled pid would otherwise report an
+/// unrelated process's CPU and memory as a live session's. This is the same
+/// claude-only liveness the in-VM scan applies (`discovery`'s `is_live` is
+/// membership in the live *claude* process map), so a session reaches the
+/// snapshot on exactly the terms it would reach that sandbox's own dashboard.
+fn parse_sandbox_procs(text: &str) -> HashMap<u32, SandboxProc> {
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields.next().and_then(|f| f.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(cpu_percent) = fields.next().and_then(|f| f.parse::<f32>().ok()) else {
+            continue;
+        };
+        let Some(rss_kb) = fields.next().and_then(|f| f.parse::<f64>().ok()) else {
+            continue;
+        };
+        let command = fields.collect::<Vec<&str>>().join(" ");
+        if !crate::process::is_claude_process(&command) {
+            continue;
         }
+        out.insert(
+            pid,
+            SandboxProc {
+                pid,
+                cpu_percent,
+                mem_mb: rss_kb / 1024.0,
+            },
+        );
     }
-    session
+    out
+}
+
+/// Build one sandbox's snapshot rows from its registry slice, keeping only the
+/// sessions the probe found alive.
+///
+/// The registry is the *primary* identity source here, not a fallback it once
+/// was: it is written by in-sandbox hooks running this same claudectl's schema
+/// onto the host-shared mount, so `session_id`, `cwd` and `name` are always the
+/// current shape — which is the whole point of no longer asking an image-aged
+/// binary for them. An entry with no id is skipped: the renderer drops what it
+/// cannot identify (`ClaudeSession::from_snapshot_value` returns `None`), so
+/// emitting it would only inflate the file.
+///
+/// A recorded pid that the probe did not return is a departed session. Dropping
+/// it is what keeps the snapshot honest between hook fires: `replace_sandbox_slice`
+/// mirrors the live set only when some hook in that sandbox fires, and it
+/// freezes entirely once `sbx rm` takes the sandbox away.
+fn sessions_from_registry(
+    entries: &[sandbox_registry::SessionEntry],
+    live: &HashMap<u32, SandboxProc>,
+) -> Vec<serde_json::Value> {
+    entries
+        .iter()
+        .filter(|entry| !entry.session_id.is_empty())
+        .filter_map(|entry| {
+            let sample = live.get(&entry.pid?)?;
+            Some(serde_json::json!({
+                "session_id": entry.session_id,
+                "cwd": entry.cwd,
+                "session_name": entry.name.clone().unwrap_or_default(),
+                "started_at": entry.started_at_ms,
+                "pid": sample.pid,
+                // Both rounded to two decimals, for the reason `to_json_value`
+                // rounds memory: the snapshot is rewritten in full on every
+                // collector pass, nothing renders more than two decimals of
+                // either, and widening an f32 to JSON otherwise writes its
+                // binary error out in full (`3.4` becomes 3.4000000953674316).
+                "cpu": (f64::from(sample.cpu_percent) * 100.0).round() / 100.0,
+                "mem_mb": (sample.mem_mb * 100.0).round() / 100.0,
+            }))
+        })
+        .collect()
 }
 
 /// Collect every running sandbox into the host snapshot and write it.
@@ -276,9 +372,14 @@ fn collect_and_write_snapshot(out: &mut impl Write) -> io::Result<()> {
         ..Default::default()
     };
     // Read once, outside the loop: the hook-written registry is the identity
-    // source for sandboxes whose claudectl is too old to report it itself.
+    // source for every sandbox, so re-reading it per sandbox would be the same
+    // file parsed N times.
     let registry = sandbox_registry::load();
     let no_entries: Vec<sandbox_registry::SessionEntry> = Vec::new();
+    // `running` is a fully materialised list before any `sbx exec` runs. That
+    // ordering is deliberate everywhere this pattern appears: `sbx` consumes
+    // the stdin it inherits, so an exec driven straight off a streaming
+    // enumeration eats the rest of its own input and collects one sandbox.
     for name in &running {
         let slice = registry.sandboxes.get(name).unwrap_or(&no_entries);
         let sessions = match collect_one_sandbox(name, slice) {
@@ -2052,7 +2153,7 @@ mod tests {
             session_id: id.to_string(),
             cwd: "/Users/ndr/repos/linera-infra".to_string(),
             transcript: String::new(),
-            started_at_ms: 0,
+            started_at_ms: 1_754_150_400_000,
             name: name.map(str::to_string),
             pid: Some(pid),
             owner_pid: None,
@@ -2060,78 +2161,113 @@ mod tests {
         }
     }
 
-    /// Verbatim shape from an OLD sandbox's `claudectl --json` — the fields
-    /// #27/#28 added are absent, which is what made 20 sessions invisible.
-    fn legacy_session(pid: u64) -> serde_json::Value {
-        serde_json::json!({ "pid": pid, "project": "ndr", "status": "Idle" })
+    fn sample(pid: u32, cpu_percent: f32, mem_mb: f64) -> SandboxProc {
+        SandboxProc {
+            pid,
+            cpu_percent,
+            mem_mb,
+        }
+    }
+
+    fn live_map(samples: Vec<SandboxProc>) -> HashMap<u32, SandboxProc> {
+        samples.into_iter().map(|proc| (proc.pid, proc)).collect()
+    }
+
+    /// Verbatim `ps -o pid=,%cpu=,rss=,command=` output from inside a sandbox:
+    /// right-aligned numeric columns, a full argv tail, and one non-claude
+    /// process sharing the pid space.
+    const PS_PROBE_OUTPUT: &str = "\
+  11036   3.4 1048576 claude --dangerously-skip-permissions
+  11200   0.0  524288 /usr/local/bin/claude --resume 9905252f-e0aa-43d0-b578-c3023b36b2fb
+  11311  91.2  262144 node /opt/claudectl/bin/claudectl --json
+";
+
+    #[test]
+    fn probe_parser_reads_cpu_and_memory_for_every_claude_row() {
+        let procs = parse_sandbox_procs(PS_PROBE_OUTPUT);
+        assert_eq!(procs.len(), 2, "parsed pids: {:?}", {
+            let mut pids: Vec<u32> = procs.keys().copied().collect();
+            pids.sort_unstable();
+            pids
+        });
+        assert_eq!(procs[&11036].cpu_percent, 3.4);
+        // rss is KiB; the renderer wants MB.
+        assert_eq!(procs[&11036].mem_mb, 1024.0);
+        assert_eq!(procs[&11200].cpu_percent, 0.0);
+        assert_eq!(procs[&11200].mem_mb, 512.0);
     }
 
     #[test]
-    fn backfill_recovers_identity_an_old_sandbox_could_not_report() {
-        let registry = vec![registry_entry(
+    fn probe_parser_drops_a_recycled_pid_running_something_else() {
+        // 11311 is `claudectl`, not `claude`. Reporting it would attribute a
+        // stranger's 91% CPU to a session that has actually exited — and, worse,
+        // keep that dead session on screen forever.
+        let procs = parse_sandbox_procs(PS_PROBE_OUTPUT);
+        assert!(!procs.contains_key(&11311));
+        // The same guard on the shapes that make a substring check wrong.
+        for command in [
+            "grep claude",
+            "bash -lc 'exec sandbox-bootstrap claude --resume foo'",
+            "claudectl --reap-orphans",
+        ] {
+            assert!(
+                parse_sandbox_procs(&format!("  4242   1.0  1024 {command}")).is_empty(),
+                "{command} must not count as a live claude session"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_parser_skips_malformed_rows_without_losing_the_good_ones() {
+        let text = "\
+notapid   1.0  1024 claude
+7777 only-three fields
+8888   2.5  2048 claude --resume x
+   \n";
+        let procs = parse_sandbox_procs(text);
+        assert_eq!(procs.keys().copied().collect::<Vec<u32>>(), vec![8888]);
+    }
+
+    #[test]
+    fn probe_parser_tolerates_empty_output() {
+        // What `ps` prints when every recorded pid has exited.
+        assert!(parse_sandbox_procs("").is_empty());
+    }
+
+    #[test]
+    fn collected_row_carries_the_identity_the_registry_recorded() {
+        let entries = vec![registry_entry(
             11036,
             "9905252f-e0aa-43d0-b578-c3023b36b2fb",
             Some("argo-validator-migration-strategy"),
         )];
-        let filled = backfill_identity_from_registry(legacy_session(11036), &registry);
+        let rows = sessions_from_registry(&entries, &live_map(vec![sample(11036, 3.4, 1024.0)]));
+        assert_eq!(rows.len(), 1);
         assert_eq!(
-            filled["session_id"], "9905252f-e0aa-43d0-b578-c3023b36b2fb",
+            rows[0]["session_id"], "9905252f-e0aa-43d0-b578-c3023b36b2fb",
             "without an id the renderer drops the row entirely"
         );
-        assert_eq!(filled["session_name"], "argo-validator-migration-strategy");
-        assert_eq!(filled["cwd"], "/Users/ndr/repos/linera-infra");
+        assert_eq!(rows[0]["session_name"], "argo-validator-migration-strategy");
+        assert_eq!(rows[0]["cwd"], "/Users/ndr/repos/linera-infra");
+        assert_eq!(rows[0]["pid"], 11036);
+        assert_eq!(rows[0]["started_at"], 1_754_150_400_000u64);
+        assert_eq!(rows[0]["cpu"], 3.4);
+        assert_eq!(rows[0]["mem_mb"], 1024.0);
     }
 
     #[test]
-    fn backfill_never_overwrites_what_the_sandbox_reported() {
-        // A current sandbox's own values are fresher than the registry's copy.
-        let registry = vec![registry_entry(42, "stale-id", Some("stale-name"))];
-        let fresh = serde_json::json!({
-            "pid": 42,
-            "session_id": "fresh-id",
-            "session_name": "fresh-name",
-            "cwd": "/fresh",
-        });
-        let filled = backfill_identity_from_registry(fresh, &registry);
-        assert_eq!(filled["session_id"], "fresh-id");
-        assert_eq!(filled["session_name"], "fresh-name");
-        assert_eq!(filled["cwd"], "/fresh");
-    }
-
-    #[test]
-    fn backfill_leaves_a_session_the_registry_does_not_know() {
-        let registry = vec![registry_entry(11036, "some-id", None)];
-        let filled = backfill_identity_from_registry(legacy_session(999), &registry);
-        assert!(
-            filled.get("session_id").is_none(),
-            "a pid with no registry entry stays unidentified rather than borrowing another session's id"
-        );
-    }
-
-    #[test]
-    fn backfill_tolerates_an_empty_registry_and_odd_shapes() {
-        let filled = backfill_identity_from_registry(legacy_session(1), &[]);
-        assert!(filled.get("session_id").is_none());
-        // A non-object element must pass through instead of aborting collection.
-        let scalar = serde_json::json!("not an object");
-        assert_eq!(backfill_identity_from_registry(scalar.clone(), &[]), scalar);
-        // A row with no pid at all cannot be joined.
-        let no_pid = serde_json::json!({"project": "x"});
-        assert_eq!(
-            backfill_identity_from_registry(no_pid.clone(), &[registry_entry(1, "i", None)]),
-            no_pid
-        );
-    }
-
-    #[test]
-    fn backfilled_row_survives_from_snapshot_value() {
-        // End to end: the legacy row that used to be dropped now renders.
-        let registry = vec![registry_entry(11036, "abc-123", Some("my-title"))];
-        let filled = backfill_identity_from_registry(legacy_session(11036), &registry);
-        let session = crate::session::ClaudeSession::from_snapshot_value("linera-agent", &filled)
-            .expect("a backfilled row must be renderable");
+    fn collected_row_survives_from_snapshot_value() {
+        // End to end: what the collector writes is what the renderer accepts.
+        let entries = vec![registry_entry(11036, "abc-123", Some("my-title"))];
+        let rows = sessions_from_registry(&entries, &live_map(vec![sample(11036, 7.5, 256.0)]));
+        let session = crate::session::ClaudeSession::from_snapshot_value("linera-agent", &rows[0])
+            .expect("a collected row must be renderable");
         assert_eq!(session.session_id, "abc-123");
         assert_eq!(session.display_name(), "my-title");
+        assert_eq!(session.cwd, "/Users/ndr/repos/linera-infra");
+        assert_eq!(session.pid, 11036);
+        assert_eq!(session.cpu_percent, 7.5);
+        assert_eq!(session.mem_mb, 256.0);
         assert_eq!(
             session.origin,
             crate::session::SessionOrigin::Sandbox("linera-agent".into())
@@ -2139,15 +2275,172 @@ mod tests {
     }
 
     #[test]
-    fn unbackfilled_legacy_row_is_still_dropped() {
-        // Negative control: without the backfill this is exactly what happened
-        // to all 20 sessions — proves the tests above are testing something.
+    fn an_unnamed_session_still_renders_under_its_project() {
+        let entries = vec![registry_entry(11036, "abc-123", None)];
+        let rows = sessions_from_registry(&entries, &live_map(vec![sample(11036, 0.0, 1.0)]));
+        let session = crate::session::ClaudeSession::from_snapshot_value("linera-agent", &rows[0])
+            .expect("an unnamed session is still identifiable");
+        assert_eq!(session.session_name, "");
+        assert_eq!(session.display_name(), "linera-infra");
+    }
+
+    #[test]
+    fn a_departed_session_is_left_out_of_the_snapshot() {
+        // The slice is a mirror frozen at the last hook fire (and forever, once
+        // `sbx rm` runs), so "recorded" never implies "still running".
+        let entries = vec![
+            registry_entry(11036, "alive", Some("still-here")),
+            registry_entry(999, "departed", Some("long-gone")),
+        ];
+        let rows = sessions_from_registry(&entries, &live_map(vec![sample(11036, 1.0, 8.0)]));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["session_id"], "alive");
+    }
+
+    #[test]
+    fn entries_without_identity_or_pid_are_skipped() {
+        let mut no_pid = registry_entry(1, "no-pid", None);
+        no_pid.pid = None;
+        let entries = vec![registry_entry(11036, "", Some("no-id")), no_pid];
+        let rows = sessions_from_registry(
+            &entries,
+            &live_map(vec![sample(11036, 1.0, 8.0), sample(1, 1.0, 8.0)]),
+        );
         assert!(
-            crate::session::ClaudeSession::from_snapshot_value(
-                "linera-agent",
-                &legacy_session(11036)
-            )
-            .is_none()
+            rows.is_empty(),
+            "an unidentifiable row only inflates the file: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn empty_registry_slice_collects_nothing() {
+        assert!(sessions_from_registry(&[], &live_map(vec![sample(1, 1.0, 1.0)])).is_empty());
+    }
+
+    #[test]
+    fn probe_script_prints_the_columns_the_parser_expects() {
+        // Pins the WIRING, not just the parser: the script is executed for
+        // real, so a reordered `-o` list or a header that stopped being
+        // suppressed fails here rather than silently blanking CPU and MEM for
+        // every foreign row. Runs on both CI runners, so it covers BSD ps and
+        // procps alike.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a probe target");
+        let pid = child.id();
+        let out = std::process::Command::new("bash")
+            .args(["-c", PROC_PROBE_SCRIPT, "--", &pid.to_string(), "999999999"])
+            .output()
+            .expect("run the probe script");
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            out.status.success(),
+            "probe script must exit 0 even with a dead pid in the list: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let rows: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(rows.len(), 1, "exactly the live pid, got {stdout:?}");
+        let fields: Vec<&str> = rows[0].split_whitespace().collect();
+        assert_eq!(fields[0].parse::<u32>().ok(), Some(pid), "column 1 is pid");
+        assert!(fields[1].parse::<f32>().is_ok(), "column 2 is %cpu");
+        assert!(fields[2].parse::<f64>().is_ok(), "column 3 is rss");
+        assert!(
+            fields[3..].join(" ").contains("sleep"),
+            "column 4+ is the command line: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn probe_script_exits_clean_with_no_pids_at_all() {
+        let out = std::process::Command::new("bash")
+            .args(["-c", PROC_PROBE_SCRIPT, "--"])
+            .output()
+            .expect("run the probe script");
+        assert!(out.status.success());
+        assert!(out.stdout.is_empty(), "no pids means no rows");
+    }
+
+    #[test]
+    fn probe_script_exits_clean_when_every_recorded_pid_is_gone() {
+        // `ps` exits non-zero when NONE of its pids exist, and that is the
+        // ordinary steady state for a sandbox whose sessions have all ended.
+        // Letting the status escape would make `probe_sandbox_procs` call the
+        // whole sandbox a collection failure — and log one — on every tick,
+        // for exactly the sandboxes where there was nothing to report.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a process to then bury");
+        let dead = child.id();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let out = std::process::Command::new("bash")
+            .args([
+                "-c",
+                PROC_PROBE_SCRIPT,
+                "--",
+                &dead.to_string(),
+                "999999999",
+            ])
+            .output()
+            .expect("run the probe script");
+        assert!(
+            out.status.success(),
+            "an all-dead pid list is not an error: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(parse_sandbox_procs(&String::from_utf8_lossy(&out.stdout)).is_empty());
+    }
+
+    #[test]
+    fn a_sandbox_with_no_recorded_sessions_is_never_probed() {
+        // Each `sbx exec` is seconds of wrapper startup, paid per running
+        // sandbox per tick, so the empty case must short-circuit before it.
+        // The name is deliberately one no sandbox can have: reaching the exec
+        // at all — whether `sbx` is absent (spawn error) or present (unknown
+        // sandbox) — surfaces as `Err` and fails this assertion.
+        let collected = collect_one_sandbox("claudectl-no-such-sandbox-4f2a91b7", &[]);
+        assert_eq!(
+            collected.expect("an empty registry slice must not shell out"),
+            Vec::<serde_json::Value>::new()
+        );
+    }
+
+    #[test]
+    fn probe_script_and_parser_agree_on_a_real_claude_process() {
+        // Full path, no fixtures: a process whose argv0 basename is `claude`,
+        // probed by the real script and read by the real parser. This is the
+        // only test that would catch the script and the parser drifting apart
+        // in a way that still leaves both individually plausible.
+        //
+        // `exec -a` renames argv0 rather than staging a binary called `claude`:
+        // copying `/bin/sleep` under that name works on a stock GNU/BSD box but
+        // not where coreutils is the multi-call uutils build, which dispatches
+        // on argv0 and exits with "unknown program 'claude'".
+        let mut child = std::process::Command::new("bash")
+            .args(["-c", r#"exec -a "$0" sleep 30"#, "/opt/sandbox/bin/claude"])
+            .spawn()
+            .expect("spawn a process posing as claude");
+        let pid = child.id();
+        let out = std::process::Command::new("bash")
+            .args(["-c", PROC_PROBE_SCRIPT, "--", &pid.to_string()])
+            .output()
+            .expect("run the probe script");
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let procs = parse_sandbox_procs(&String::from_utf8_lossy(&out.stdout));
+        let observed = procs
+            .get(&pid)
+            .unwrap_or_else(|| panic!("pid {pid} missing; probe said {:?}", out.stdout));
+        assert!(
+            observed.mem_mb > 0.0,
+            "a running process has resident memory"
         );
     }
 

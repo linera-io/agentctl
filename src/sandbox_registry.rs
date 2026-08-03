@@ -297,27 +297,17 @@ impl Default for Registry {
     }
 }
 
-/// Heavy per-session fields the aggregate view never renders. Dropped from the
-/// snapshot because it is rewritten on every collector pass: `files_modified`
-/// alone can be hundreds of entries, and a full 22-session `claudectl --json`
-/// payload measures ~124 KB before any of this is stripped.
-///
-/// A denylist rather than an allowlist so fields added to `to_json_value` later
-/// flow through without an edit here — the snapshot stays forward-compatible,
-/// and the only cost of forgetting to deny a new heavy field is file size.
-const SNAPSHOT_HEAVY_FIELDS: &[&str] = &[
-    "files_modified",
-    "tool_usage",
-    "recent_errors",
-    "subagent_breakdown",
-];
-
 /// One origin's collected inventory. `is_current` marks the sandbox the alias
 /// resolves to; every other running sandbox is superseded and draining.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct SandboxOrigin {
     #[serde(default)]
     pub is_current: bool,
+    /// Untyped on purpose. These rows are a *persisted* format: a snapshot on
+    /// disk may have been written by an older claudectl, and a reader that
+    /// refused to deserialize an unexpected field would render nothing at all
+    /// rather than the fields it does understand. `from_snapshot_value` picks
+    /// what it needs and defaults the rest.
     #[serde(default)]
     pub sessions: Vec<serde_json::Value>,
 }
@@ -353,18 +343,6 @@ impl Default for SandboxSnapshot {
             sandboxes: BTreeMap::new(),
         }
     }
-}
-
-/// Strip [`SNAPSHOT_HEAVY_FIELDS`] from one `claudectl --json` session object.
-/// Non-objects pass through untouched — a malformed element must not abort a
-/// whole sandbox's collection.
-pub fn trim_snapshot_session(mut value: serde_json::Value) -> serde_json::Value {
-    if let Some(map) = value.as_object_mut() {
-        for field in SNAPSHOT_HEAVY_FIELDS {
-            map.remove(*field);
-        }
-    }
-    value
 }
 
 /// Path to the host-collected snapshot (`sandboxes.json`). Honors
@@ -1314,37 +1292,6 @@ pub(crate) mod tests {
                 .sessions
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn snapshot_trim_drops_heavy_fields_and_keeps_what_a_row_needs() {
-        let session = serde_json::json!({
-            "session_id": "s1",
-            "project": "auto-rolling-sandbox-images",
-            "status": "Processing",
-            "cost_usd": 12.5,
-            "files_modified": {"/a": 1},
-            "tool_usage": {"Bash": 3},
-            "recent_errors": ["boom"],
-            "subagent_breakdown": [{"x": 1}],
-        });
-        let trimmed = trim_snapshot_session(session);
-        let obj = trimmed.as_object().unwrap();
-        for keep in ["session_id", "project", "status", "cost_usd"] {
-            assert!(obj.contains_key(keep), "{keep} was trimmed but is needed");
-        }
-        for heavy in SNAPSHOT_HEAVY_FIELDS {
-            assert!(!obj.contains_key(*heavy), "{heavy} survived trimming");
-        }
-    }
-
-    #[test]
-    fn snapshot_trim_passes_non_objects_through_untouched() {
-        // One malformed element must not abort a whole sandbox's collection.
-        let scalar = serde_json::json!("not an object");
-        assert_eq!(trim_snapshot_session(scalar.clone()), scalar);
-        let array = serde_json::json!([1, 2, 3]);
-        assert_eq!(trim_snapshot_session(array.clone()), array);
     }
 
     #[test]
