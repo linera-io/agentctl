@@ -1694,3 +1694,49 @@ fn resolve_jsonl_telemetry_available_after_resolution() {
     assert!(s.usage_metrics_available);
     assert!(s.own_output_tokens > 0, "should have parsed output tokens");
 }
+
+/// A session collected from another sandbox must end up with exactly the same
+/// transcript-derived values as one discovered locally.
+///
+/// This is the invariant three bugs violated in different ways: Last, Context
+/// and Activity rendered blank on sandbox rows, and status went stale, because
+/// those values were taken from whatever the *collecting sandbox* reported
+/// instead of computed here. The transcript lives on a host-shared mount, so
+/// origin must make no difference at all to anything derived from it.
+#[test]
+fn a_foreign_session_derives_the_same_transcript_values_as_a_local_one() {
+    isolate_hook_state_dir();
+    let jsonl = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello"}]},"timestamp":"2026-08-03T12:00:00.000Z"}
+{"type":"assistant","message":{"role":"assistant","model":"claude-opus-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1200,"output_tokens":340,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+
+    let (mut local, _f1) = make_session_with_jsonl(jsonl);
+    let (mut foreign, _f2) = make_session_with_jsonl(jsonl);
+    foreign.origin = claudectl::session::SessionOrigin::Sandbox("linera-agent-4759da86c2f4".into());
+
+    monitor::update_tokens(&mut local);
+    monitor::update_tokens(&mut foreign);
+
+    // The fields whose blankness was reported, asserted on the RENDERED form
+    // where there is one — that is what was visibly broken.
+    assert_eq!(foreign.last_user_message_ts, local.last_user_message_ts);
+    assert_ne!(
+        foreign.last_user_message_ts, 0,
+        "Last renders '—' when this is 0, which is the reported bug"
+    );
+    assert_eq!(foreign.context_tokens, local.context_tokens);
+    assert_eq!(foreign.context_max, local.context_max);
+    assert_eq!(foreign.format_context_bar(6), local.format_context_bar(6));
+    assert_eq!(foreign.format_tokens(), local.format_tokens());
+    assert_eq!(foreign.format_cost(), local.format_cost());
+    assert_eq!(foreign.status, local.status);
+    assert_eq!(foreign.telemetry_status, local.telemetry_status);
+    assert_eq!(
+        foreign.usage_metrics_available,
+        local.usage_metrics_available
+    );
+
+    // And the origin itself must survive the pass — it is what gates whether
+    // we may signal the pid.
+    assert!(!foreign.origin.is_addressable());
+    assert!(local.origin.is_addressable());
+}
