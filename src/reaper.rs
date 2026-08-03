@@ -380,6 +380,7 @@ fn collect_and_write_snapshot(out: &mut impl Write) -> io::Result<()> {
     // ordering is deliberate everywhere this pattern appears: `sbx` consumes
     // the stdin it inherits, so an exec driven straight off a streaming
     // enumeration eats the rest of its own input and collects one sandbox.
+    let mut tally: Vec<String> = Vec::with_capacity(running.len());
     for name in &running {
         let slice = registry.sandboxes.get(name).unwrap_or(&no_entries);
         let sessions = match collect_one_sandbox(name, slice) {
@@ -392,6 +393,10 @@ fn collect_and_write_snapshot(out: &mut impl Write) -> io::Result<()> {
                 Vec::new()
             }
         };
+        // Both numbers, not just the result: "0 sessions" is the shape every
+        // one of these bugs took, and only the recorded count says whether
+        // that means the registry was empty or the probe found nothing alive.
+        tally.push(format!("{name}={}/{} live", sessions.len(), slice.len()));
         snapshot.sandboxes.insert(
             name.clone(),
             sandbox_registry::SandboxOrigin {
@@ -403,8 +408,9 @@ fn collect_and_write_snapshot(out: &mut impl Write) -> io::Result<()> {
     sandbox_registry::write_snapshot(&snapshot)?;
     writeln!(
         out,
-        "reaper: collected {} sandbox(es) into {}",
+        "reaper: collected {} sandbox(es) [{}] into {}",
         running.len(),
+        tally.join(", "),
         sandbox_registry::sandbox_snapshot_path().display()
     )
 }
@@ -2317,6 +2323,22 @@ notapid   1.0  1024 claude
         assert!(sessions_from_registry(&[], &live_map(vec![sample(1, 1.0, 1.0)])).is_empty());
     }
 
+    /// Spawn a `sleep`, kill it and reap it. Its pid is then definitively dead
+    /// *and* in range — which an arbitrary large number is not. BSD `ps`
+    /// rejects an out-of-range pid by discarding the WHOLE `-p` list, so
+    /// spelling "dead pid" as `999999999` made this file's probe tests pass on
+    /// procps and fail on macOS.
+    fn reaped_pid() -> u32 {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a process to then bury");
+        let pid = child.id();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        pid
+    }
+
     #[test]
     fn probe_script_prints_the_columns_the_parser_expects() {
         // Pins the WIRING, not just the parser: the script is executed for
@@ -2324,13 +2346,24 @@ notapid   1.0  1024 claude
         // suppressed fails here rather than silently blanking CPU and MEM for
         // every foreign row. Runs on both CI runners, so it covers BSD ps and
         // procps alike.
+        //
+        // The dead pid alongside the live one is the production steady state,
+        // not decoration: a registry slice routinely names sessions that have
+        // since exited, and `ps` must still report the survivors.
+        let dead = reaped_pid();
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .expect("spawn a probe target");
         let pid = child.id();
         let out = std::process::Command::new("bash")
-            .args(["-c", PROC_PROBE_SCRIPT, "--", &pid.to_string(), "999999999"])
+            .args([
+                "-c",
+                PROC_PROBE_SCRIPT,
+                "--",
+                &pid.to_string(),
+                &dead.to_string(),
+            ])
             .output()
             .expect("run the probe script");
         let _ = child.kill();
@@ -2371,21 +2404,14 @@ notapid   1.0  1024 claude
         // Letting the status escape would make `probe_sandbox_procs` call the
         // whole sandbox a collection failure — and log one — on every tick,
         // for exactly the sandboxes where there was nothing to report.
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn a process to then bury");
-        let dead = child.id();
-        child.kill().unwrap();
-        child.wait().unwrap();
-
+        let (first, second) = (reaped_pid(), reaped_pid());
         let out = std::process::Command::new("bash")
             .args([
                 "-c",
                 PROC_PROBE_SCRIPT,
                 "--",
-                &dead.to_string(),
-                "999999999",
+                &first.to_string(),
+                &second.to_string(),
             ])
             .output()
             .expect("run the probe script");
