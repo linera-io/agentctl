@@ -69,13 +69,28 @@ pub fn do_refresh_io(prev_sessions: Vec<ClaudeSession>) -> RefreshIoOutput {
     }
     let jsonl_elapsed = jsonl_start.elapsed();
 
-    // Foreign sessions join only AFTER the local pipeline, never before.
-    // Everything above addresses a session by pid in *our* namespace:
-    // `fetch_and_enrich` would `ps` a foreign pid and decorate the row with an
-    // unrelated local process's CPU and memory, and `monitor::update_tokens`
-    // would re-derive metrics we already collected. Their numbers arrive
-    // pre-computed by the claudectl that can actually see them.
-    sessions.extend(foreign_sessions(&sessions));
+    // Foreign sessions join after the local `ps` pass, never before:
+    // `fetch_and_enrich` addresses sessions by pid in *our* namespace and would
+    // decorate a foreign row with whatever unrelated local process holds that
+    // number.
+    //
+    // But they DO go through the transcript monitor, on the same code path as
+    // local rows. Their transcripts live on the host-shared `~/.claude` mount,
+    // so everything transcript-derived — tokens, cost, context, last message,
+    // status — is ours to compute, live, this tick. Taking those values from
+    // the collecting sandbox instead was the mistake behind three separate
+    // "column renders blank" bugs: it made a second implementation of data we
+    // already had, and pinned it to whatever claudectl version happens to be
+    // baked into that sandbox's image. Only what is genuinely per-VM (pid,
+    // cpu, mem) still comes from the snapshot.
+    let mut foreign = foreign_sessions(&sessions);
+    for session in &mut foreign {
+        if session.jsonl_path.is_none() {
+            discovery::resolve_jsonl_paths(std::slice::from_mut(session));
+        }
+        monitor::update_tokens(session);
+    }
+    sessions.extend(foreign);
 
     RefreshIoOutput {
         sessions,
