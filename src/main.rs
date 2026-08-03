@@ -148,8 +148,10 @@ pub(crate) struct Cli {
 
     /// Restore sandbox Claude sessions after `sbx rm`: spawn one window per
     /// session that was live at teardown, each running `sc --resume <id>` in
-    /// its recorded directory. Optionally name a sandbox; omit to auto-pick
-    /// (or choose when several are registered). Pair with --dry-run to preview.
+    /// its recorded directory. Optionally name a sandbox — a base name covers
+    /// its whole rolled family, so `linera-agent` restores from
+    /// `linera-agent-<hash>` too. Omit to auto-pick (or choose when several are
+    /// registered). Pair with --dry-run to preview.
     #[arg(
         long = "restore-sbx-sessions",
         num_args = 0..=1,
