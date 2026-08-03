@@ -602,8 +602,15 @@ impl ClaudeSession {
             .collect()
     }
 
-    /// Rebuild a session from one entry of another sandbox's `--json` output,
-    /// as collected into the host snapshot.
+    /// Rebuild a session from one row of the host-collected snapshot
+    /// (`sandboxes.json`), i.e. a session belonging to another sandbox.
+    ///
+    /// The reaper's collector assembles those rows from each sandbox's
+    /// hook-written registry plus an in-VM `ps` probe. Older snapshots on disk
+    /// were assembled from that sandbox's own `claudectl --json` and carry more
+    /// fields (cost, status, activity); they are still read here, but the host
+    /// recomputes every transcript-derived one immediately afterwards in
+    /// `app::do_refresh_io`, so what they say no longer decides anything.
     ///
     /// Returns `None` when the entry carries no `session_id` — an unidentified
     /// row can be neither resumed nor de-duplicated against local discovery,

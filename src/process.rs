@@ -170,7 +170,12 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
 /// True iff `command`'s argv0, after stripping any leading path, is exactly
 /// `"claude"`. This excludes `claudectl`, `grep claude`, and
 /// `bash -lc '... claude ...'`.
-fn is_claude_process(command: &str) -> bool {
+///
+/// Shared with the reaper's cross-sandbox collector so both places decide
+/// "this pid is a claude session" from one implementation — a `ps` row is the
+/// liveness evidence in both, and two spellings of that test would be two
+/// answers to whether a recycled pid is a live session.
+pub(crate) fn is_claude_process(command: &str) -> bool {
     claude_argv0_token_count(command).is_some()
 }
 
