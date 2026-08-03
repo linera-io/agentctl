@@ -87,6 +87,19 @@ impl TelemetryStatus {
         }
     }
 
+    /// Inverse of [`label`](Self::label), for reading a collected row back.
+    /// Unrecognised input becomes `Pending` — "we don't know yet" — rather than
+    /// a guess. `telemetry_labels_round_trip` keeps the two in step.
+    pub fn from_label(label: &str) -> Self {
+        match label {
+            "Available" => Self::Available,
+            "No transcript" => Self::MissingTranscript,
+            "Unreadable transcript" => Self::UnreadableTranscript,
+            "Unsupported transcript" => Self::UnsupportedTranscript,
+            _ => Self::Pending,
+        }
+    }
+
     pub fn short_label(self) -> &'static str {
         match self {
             Self::Pending => "Pending",
@@ -636,11 +649,24 @@ impl ClaudeSession {
             session.mem_mb = mem;
         }
         // The cost/token block is emitted as null when the producing side had
-        // no usage metrics. Treat a present number as the authority for that
-        // whole block — matching how `to_json_value` gates them together.
-        if let Some(cost) = value.get("cost_usd").and_then(serde_json::Value::as_f64) {
-            session.cost_usd = cost;
+        // no usage metrics. Prefer the producer's own flag; fall back to "a
+        // cost number is present" for rows collected from an older claudectl
+        // that didn't emit the flag.
+        let has_metrics = value
+            .get("usage_metrics_available")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| {
+                value
+                    .get("cost_usd")
+                    .and_then(serde_json::Value::as_f64)
+                    .is_some()
+            });
+        if has_metrics {
             session.usage_metrics_available = true;
+            session.cost_usd = value
+                .get("cost_usd")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
             session.burn_rate_per_hr = value
                 .get("burn_rate_per_hr")
                 .and_then(serde_json::Value::as_f64)
@@ -653,9 +679,43 @@ impl ClaudeSession {
                 .get("tokens_out")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
+            // Both sides of the ratio: `context_percent` returns 0 unless it
+            // has each of them, which rendered the Context bar blank on every
+            // collected row.
+            session.context_tokens = value
+                .get("context_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            session.context_max = value
+                .get("context_max")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+        }
+        if let Some(ts) = value
+            .get("last_user_message_ts")
+            .and_then(serde_json::Value::as_u64)
+        {
+            session.last_user_message_ts = ts;
+        }
+        if let Some(history) = value
+            .get("activity_history")
+            .and_then(serde_json::Value::as_array)
+        {
+            session.activity_history = history
+                .iter()
+                .filter_map(serde_json::Value::as_u64)
+                .map(|level| level as u8)
+                .collect();
         }
         if let Some(status) = value.get("status").and_then(serde_json::Value::as_str) {
             session.status = SessionStatus::from_label(status);
+        }
+        if let Some(state) = value
+            .get("telemetry")
+            .and_then(|t| t.get("state"))
+            .and_then(serde_json::Value::as_str)
+        {
+            session.telemetry_status = TelemetryStatus::from_label(state);
         }
         Some(session)
     }
@@ -891,6 +951,16 @@ impl ClaudeSession {
             "cwd": self.cwd,
             "session_name": self.session_name,
             "started_at": self.started_at,
+            // Raw inputs behind the rendered columns, not just the rendered
+            // values. `context_pct` below is a computed number, and a consumer
+            // that only receives it cannot draw the Context bar, which needs
+            // both sides of the ratio. Same for Last and Activity: they are
+            // driven by fields that had no representation here at all, so
+            // every collected row rendered them empty.
+            "context_tokens": self.context_tokens,
+            "context_max": self.context_max,
+            "last_user_message_ts": self.last_user_message_ts,
+            "activity_history": self.activity_history,
             "pid": self.pid,
             "project": self.display_name(),
             "status": self.status.to_string(),
@@ -1061,6 +1131,137 @@ mod origin_tests {
                 "round trip failed for {status}"
             );
         }
+    }
+
+    #[test]
+    fn telemetry_labels_round_trip() {
+        for state in [
+            TelemetryStatus::Pending,
+            TelemetryStatus::Available,
+            TelemetryStatus::MissingTranscript,
+            TelemetryStatus::UnreadableTranscript,
+            TelemetryStatus::UnsupportedTranscript,
+        ] {
+            assert_eq!(
+                TelemetryStatus::from_label(state.label()),
+                state,
+                "round trip failed for {}",
+                state.label()
+            );
+        }
+        assert_eq!(
+            TelemetryStatus::from_label("something new"),
+            TelemetryStatus::Pending
+        );
+    }
+
+    #[test]
+    fn every_rendered_column_survives_a_round_trip_through_the_snapshot() {
+        // The Last / Context / Activity columns rendered blank on every
+        // collected row because the fields behind them were never emitted.
+        // Assert on the RENDERED output, not just the fields — that is what
+        // was actually broken.
+        let mut original = ClaudeSession::from_raw(RawSession {
+            pid: 4242,
+            session_id: "abc-123".into(),
+            cwd: "/Users/ndr/repos/linera-infra".into(),
+            started_at: 1_700_000_000_000,
+            name: Some("fix-scylla-disk".into()),
+            name_source: None,
+        });
+        original.usage_metrics_available = true;
+        original.cost_usd = 12.5;
+        original.burn_rate_per_hr = 3.25;
+        original.total_input_tokens = 1000;
+        original.total_output_tokens = 250;
+        original.context_tokens = 450_000;
+        original.context_max = 1_000_000;
+        original.last_user_message_ts = 1_700_000_500_000;
+        original.activity_history = vec![0, 3, 7, 2];
+        original.telemetry_status = TelemetryStatus::Available;
+        original.status = SessionStatus::Processing;
+
+        let collected = original.to_json_value();
+        let restored = ClaudeSession::from_snapshot_value("linera-agent-2a14db7ea350", &collected)
+            .expect("a session we just serialised must be restorable");
+
+        assert_eq!(restored.last_user_message_ts, original.last_user_message_ts);
+        assert_eq!(restored.activity_history, original.activity_history);
+        assert_eq!(restored.context_tokens, original.context_tokens);
+        assert_eq!(restored.context_max, original.context_max);
+        assert_eq!(restored.telemetry_status, original.telemetry_status);
+        // Rendered forms must match, not merely the backing numbers.
+        assert_eq!(
+            restored.format_context_bar(6),
+            original.format_context_bar(6)
+        );
+        assert_eq!(restored.format_sparkline(), original.format_sparkline());
+        assert_eq!(restored.format_tokens(), original.format_tokens());
+        assert_eq!(restored.format_cost(), original.format_cost());
+        assert!(
+            restored.context_percent() > 0.0,
+            "Context rendered as empty, which is the bug"
+        );
+    }
+
+    #[test]
+    fn negative_control_stripping_the_new_fields_reproduces_the_blank_columns() {
+        // Proves the test above discriminates rather than passing vacuously:
+        // remove exactly the keys this PR added and the three columns go blank
+        // again, which is what the laptop was showing for every sandbox row.
+        let mut original = ClaudeSession::from_raw(RawSession {
+            pid: 1,
+            session_id: "abc-123".into(),
+            cwd: "/tmp".into(),
+            started_at: 0,
+            name: None,
+            name_source: None,
+        });
+        original.usage_metrics_available = true;
+        original.cost_usd = 1.0;
+        original.context_tokens = 450_000;
+        original.context_max = 1_000_000;
+        original.last_user_message_ts = 1_700_000_500_000;
+        original.activity_history = vec![1, 2, 3];
+
+        let mut collected = original.to_json_value();
+        let map = collected.as_object_mut().unwrap();
+        for key in [
+            "context_tokens",
+            "context_max",
+            "last_user_message_ts",
+            "activity_history",
+        ] {
+            map.remove(key);
+        }
+
+        let restored = ClaudeSession::from_snapshot_value("sbx", &collected).expect("restorable");
+        assert_eq!(
+            restored.context_percent(),
+            0.0,
+            "Context would render blank"
+        );
+        assert_eq!(
+            restored.format_sparkline(),
+            "-",
+            "Activity would render '-'"
+        );
+        assert_eq!(restored.last_user_message_ts, 0, "Last would render '—'");
+    }
+
+    #[test]
+    fn a_row_without_metrics_does_not_fabricate_a_context_bar() {
+        let bare = serde_json::json!({
+            "session_id": "abc-123",
+            "pid": 1,
+            "status": "Idle",
+            "usage_metrics_available": false,
+        });
+        let restored = ClaudeSession::from_snapshot_value("sbx", &bare).expect("restorable");
+        assert!(!restored.usage_metrics_available);
+        assert_eq!(restored.context_percent(), 0.0);
+        assert_eq!(restored.activity_history.len(), 0);
+        assert_eq!(restored.last_user_message_ts, 0);
     }
 
     #[test]
