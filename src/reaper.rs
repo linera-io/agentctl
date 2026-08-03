@@ -191,7 +191,10 @@ pub(crate) fn resolve_current_sandbox(pointer: Option<&str>, running: &[String])
 /// Errors are per-sandbox and non-fatal: one unreachable sandbox must not cost
 /// us the inventory of every other one, so the caller records an empty slice
 /// for it and carries on.
-fn collect_one_sandbox(name: &str) -> io::Result<Vec<serde_json::Value>> {
+fn collect_one_sandbox(
+    name: &str,
+    registry: &[sandbox_registry::SessionEntry],
+) -> io::Result<Vec<serde_json::Value>> {
     let output = Command::new("sbx")
         .args(["exec", name, "claudectl", "--json"])
         .output()?;
@@ -206,7 +209,54 @@ fn collect_one_sandbox(name: &str) -> io::Result<Vec<serde_json::Value>> {
     Ok(parsed
         .into_iter()
         .map(sandbox_registry::trim_snapshot_session)
+        .map(|session| backfill_identity_from_registry(session, registry))
         .collect())
+}
+
+/// Fill in identity fields the sandbox's own `claudectl --json` didn't provide.
+///
+/// A sandbox built from an older image runs an older claudectl, whose `--json`
+/// predates `session_id`/`session_name`/`cwd`. Those rows are unidentifiable,
+/// and the renderer drops what it cannot identify — so every session in an
+/// older sandbox silently vanished from the unified view (20 of them, on
+/// 2026-07-31).
+///
+/// The registry closes the gap: it is written by in-sandbox *hooks* rather than
+/// by `--json`, so it carries `session_id`, `name` and `cwd` for exactly those
+/// sessions. Join on pid, which is unique within one sandbox — and it is the
+/// same sandbox's slice on both sides, so a pid cannot mean two things here.
+///
+/// Only ever fills absent fields. A value the sandbox reported is fresher than
+/// the registry's copy and must win.
+fn backfill_identity_from_registry(
+    mut session: serde_json::Value,
+    registry: &[sandbox_registry::SessionEntry],
+) -> serde_json::Value {
+    let Some(map) = session.as_object_mut() else {
+        return session;
+    };
+    let missing = |map: &serde_json::Map<String, serde_json::Value>, key: &str| {
+        map.get(key).is_none_or(|v| v.is_null())
+    };
+    if !missing(map, "session_id") {
+        return session;
+    }
+    let Some(pid) = map.get("pid").and_then(serde_json::Value::as_u64) else {
+        return session;
+    };
+    let Some(entry) = registry.iter().find(|e| e.pid == Some(pid as u32)) else {
+        return session;
+    };
+    map.insert("session_id".into(), entry.session_id.clone().into());
+    if missing(map, "cwd") {
+        map.insert("cwd".into(), entry.cwd.clone().into());
+    }
+    if missing(map, "session_name") {
+        if let Some(name) = entry.name.clone() {
+            map.insert("session_name".into(), name.into());
+        }
+    }
+    session
 }
 
 /// Collect every running sandbox into the host snapshot and write it.
@@ -225,8 +275,13 @@ fn collect_and_write_snapshot(out: &mut impl Write) -> io::Result<()> {
             .unwrap_or(0),
         ..Default::default()
     };
+    // Read once, outside the loop: the hook-written registry is the identity
+    // source for sandboxes whose claudectl is too old to report it itself.
+    let registry = sandbox_registry::load();
+    let no_entries: Vec<sandbox_registry::SessionEntry> = Vec::new();
     for name in &running {
-        let sessions = match collect_one_sandbox(name) {
+        let slice = registry.sandboxes.get(name).unwrap_or(&no_entries);
+        let sessions = match collect_one_sandbox(name, slice) {
             Ok(sessions) => sessions,
             Err(e) => {
                 // Log which sandbox and why, not just that collection was
@@ -1990,6 +2045,110 @@ mod tests {
     fn current_sandbox_is_none_when_nothing_runs() {
         assert_eq!(resolve_current_sandbox(None, &[]), None);
         assert_eq!(resolve_current_sandbox(Some("linera-agent"), &[]), None);
+    }
+
+    fn registry_entry(pid: u32, id: &str, name: Option<&str>) -> sandbox_registry::SessionEntry {
+        sandbox_registry::SessionEntry {
+            session_id: id.to_string(),
+            cwd: "/Users/ndr/repos/linera-infra".to_string(),
+            transcript: String::new(),
+            started_at_ms: 0,
+            name: name.map(str::to_string),
+            pid: Some(pid),
+            owner_pid: None,
+            owner_started_at: None,
+        }
+    }
+
+    /// Verbatim shape from an OLD sandbox's `claudectl --json` — the fields
+    /// #27/#28 added are absent, which is what made 20 sessions invisible.
+    fn legacy_session(pid: u64) -> serde_json::Value {
+        serde_json::json!({ "pid": pid, "project": "ndr", "status": "Idle" })
+    }
+
+    #[test]
+    fn backfill_recovers_identity_an_old_sandbox_could_not_report() {
+        let registry = vec![registry_entry(
+            11036,
+            "9905252f-e0aa-43d0-b578-c3023b36b2fb",
+            Some("argo-validator-migration-strategy"),
+        )];
+        let filled = backfill_identity_from_registry(legacy_session(11036), &registry);
+        assert_eq!(
+            filled["session_id"], "9905252f-e0aa-43d0-b578-c3023b36b2fb",
+            "without an id the renderer drops the row entirely"
+        );
+        assert_eq!(filled["session_name"], "argo-validator-migration-strategy");
+        assert_eq!(filled["cwd"], "/Users/ndr/repos/linera-infra");
+    }
+
+    #[test]
+    fn backfill_never_overwrites_what_the_sandbox_reported() {
+        // A current sandbox's own values are fresher than the registry's copy.
+        let registry = vec![registry_entry(42, "stale-id", Some("stale-name"))];
+        let fresh = serde_json::json!({
+            "pid": 42,
+            "session_id": "fresh-id",
+            "session_name": "fresh-name",
+            "cwd": "/fresh",
+        });
+        let filled = backfill_identity_from_registry(fresh, &registry);
+        assert_eq!(filled["session_id"], "fresh-id");
+        assert_eq!(filled["session_name"], "fresh-name");
+        assert_eq!(filled["cwd"], "/fresh");
+    }
+
+    #[test]
+    fn backfill_leaves_a_session_the_registry_does_not_know() {
+        let registry = vec![registry_entry(11036, "some-id", None)];
+        let filled = backfill_identity_from_registry(legacy_session(999), &registry);
+        assert!(
+            filled.get("session_id").is_none(),
+            "a pid with no registry entry stays unidentified rather than borrowing another session's id"
+        );
+    }
+
+    #[test]
+    fn backfill_tolerates_an_empty_registry_and_odd_shapes() {
+        let filled = backfill_identity_from_registry(legacy_session(1), &[]);
+        assert!(filled.get("session_id").is_none());
+        // A non-object element must pass through instead of aborting collection.
+        let scalar = serde_json::json!("not an object");
+        assert_eq!(backfill_identity_from_registry(scalar.clone(), &[]), scalar);
+        // A row with no pid at all cannot be joined.
+        let no_pid = serde_json::json!({"project": "x"});
+        assert_eq!(
+            backfill_identity_from_registry(no_pid.clone(), &[registry_entry(1, "i", None)]),
+            no_pid
+        );
+    }
+
+    #[test]
+    fn backfilled_row_survives_from_snapshot_value() {
+        // End to end: the legacy row that used to be dropped now renders.
+        let registry = vec![registry_entry(11036, "abc-123", Some("my-title"))];
+        let filled = backfill_identity_from_registry(legacy_session(11036), &registry);
+        let session = crate::session::ClaudeSession::from_snapshot_value("linera-agent", &filled)
+            .expect("a backfilled row must be renderable");
+        assert_eq!(session.session_id, "abc-123");
+        assert_eq!(session.display_name(), "my-title");
+        assert_eq!(
+            session.origin,
+            crate::session::SessionOrigin::Sandbox("linera-agent".into())
+        );
+    }
+
+    #[test]
+    fn unbackfilled_legacy_row_is_still_dropped() {
+        // Negative control: without the backfill this is exactly what happened
+        // to all 20 sessions — proves the tests above are testing something.
+        assert!(
+            crate::session::ClaudeSession::from_snapshot_value(
+                "linera-agent",
+                &legacy_session(11036)
+            )
+            .is_none()
+        );
     }
 
     #[test]
