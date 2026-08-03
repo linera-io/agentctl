@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 ///
 /// Every entry maps to a deterministic state transition for the matching
 /// session — see `hook_state.rs` for the receiver. The hook command is the
-/// same `claudectl` binary; main detects the JSON payload on stdin and routes
-/// to the state-update path before any other dispatch.
+/// dedicated `claudectl-hook` binary (`src/bin/claudectl-hook.rs`), which does
+/// nothing but read the payload from stdin and record it. `claudectl` itself
+/// keeps the same fast-path, so settings written by older versions keep
+/// working until `--init` migrates them.
 ///
 /// `Notification` matchers `permission_prompt` and `worker_permission_prompt`
 /// are the load-bearing ones for the "Needs Input" status — main-agent and
@@ -33,7 +35,34 @@ impl HookSpec {
     }
 }
 
-const HOOK_CMD: &str = "claudectl 2>/dev/null || true";
+/// The command Claude Code runs on every hook event.
+///
+/// `claudectl-hook` rather than `claudectl`: the receiver is a tiny binary of
+/// its own so the agent sandbox can ship only that (see
+/// `src/bin/claudectl-hook.rs`). `claudectl` keeps its own hook fast-path, so
+/// settings still pointing at the old command keep working.
+const HOOK_CMD: &str = "claudectl-hook 2>/dev/null || true";
+
+/// Hook commands this tool owns, newest first. `--init` rewrites any of these
+/// to [`HOOK_CMD`], so an existing install migrates by re-running it rather
+/// than by hand-editing settings.
+///
+/// Matching on the exact historical strings, not on "contains claudectl":
+/// a substring test would also claim a hook an engineer wrote themselves that
+/// happens to call claudectl, and silently rewrite it.
+/// Every form must be listed or an old install silently never migrates. The
+/// `--json` variant is not hypothetical: it was the real installed command in
+/// 5f7fb789, so settings written then still carry it.
+const OWNED_HOOK_CMDS: &[&str] = &[
+    "claudectl-hook 2>/dev/null || true",
+    "claudectl 2>/dev/null || true",
+    "claudectl --json 2>/dev/null || true",
+];
+
+/// Is `command` one this tool installed (in any version)?
+pub(crate) fn is_owned_hook_command(command: &str) -> bool {
+    OWNED_HOOK_CMDS.contains(&command.trim())
+}
 
 pub const HOOKS: &[HookSpec] = &[
     // Permission prompts — the deterministic "Needs Input" signal. Covers
@@ -176,7 +205,7 @@ fn has_claudectl_hooks(existing: &serde_json::Value) -> bool {
                 if hook
                     .get("command")
                     .and_then(|c| c.as_str())
-                    .is_some_and(|s| s.contains("claudectl"))
+                    .is_some_and(is_owned_hook_command)
                 {
                     return true;
                 }
@@ -218,10 +247,54 @@ fn is_spec_installed(
                 inner.iter().any(|hook| {
                     hook.get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|s| s.contains("claudectl"))
+                        .is_some_and(is_owned_hook_command)
                 })
             })
     })
+}
+
+/// Rewrite hook commands we own but that are out of date, in place. Returns
+/// how many were rewritten.
+///
+/// In place, rather than letting drift detection treat them as missing and
+/// re-merge: `merge_specs` PUSHES a matcher entry, so a re-merge would leave
+/// the stale command sitting next to the new one and every event would fire
+/// the receiver twice.
+///
+/// Only exact historical commands are touched ([`is_owned_hook_command`]), so
+/// a hook the engineer wrote themselves that happens to invoke claudectl is
+/// left completely alone.
+pub(crate) fn migrate_owned_hook_commands(existing: &mut serde_json::Value) -> usize {
+    let Some(hooks) = existing.get_mut("hooks").and_then(|v| v.as_object_mut()) else {
+        return 0;
+    };
+    let mut migrated = 0;
+    for matchers in hooks.values_mut() {
+        let Some(matchers) = matchers.as_array_mut() else {
+            continue;
+        };
+        for entry in matchers.iter_mut() {
+            let Some(inner) = entry.get_mut("hooks").and_then(|v| v.as_array_mut()) else {
+                continue;
+            };
+            for hook in inner.iter_mut() {
+                let is_stale = hook
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| is_owned_hook_command(s) && s.trim() != HOOK_CMD);
+                if is_stale {
+                    if let Some(obj) = hook.as_object_mut() {
+                        obj.insert(
+                            "command".to_string(),
+                            serde_json::Value::String(HOOK_CMD.to_string()),
+                        );
+                        migrated += 1;
+                    }
+                }
+            }
+        }
+    }
+    migrated
 }
 
 /// Merge the given specs into existing settings, preserving every other key
@@ -264,10 +337,13 @@ fn merge_hooks(existing: &mut serde_json::Value) {
 fn filter_claudectl_hooks(matcher_entry: &mut serde_json::Value) -> bool {
     if let Some(inner_hooks) = matcher_entry.get_mut("hooks") {
         if let Some(arr) = inner_hooks.as_array_mut() {
+            // Only commands we installed. The old substring test also
+            // deleted a hook the engineer wrote themselves that happened to
+            // call claudectl.
             arr.retain(|hook| {
                 hook.get("command")
                     .and_then(|c| c.as_str())
-                    .is_none_or(|s| !s.contains("claudectl"))
+                    .is_none_or(|s| !is_owned_hook_command(s))
             });
             return !arr.is_empty();
         }
@@ -462,8 +538,12 @@ pub fn ensure_hooks_installed(project: bool) -> io::Result<Vec<&'static HookSpec
     let mut settings = load_settings(&path)?;
 
     let stale_removed = drop_stale_claudectl_hooks(&mut settings);
+    // Upgrade commands we own before drift detection runs. Afterwards every
+    // owned hook is on the current command, so `find_missing_hooks` cannot
+    // mistake an outdated one for missing and push a duplicate beside it.
+    let migrated = migrate_owned_hook_commands(&mut settings);
     let missing = find_missing_hooks(&settings);
-    if missing.is_empty() && stale_removed == 0 {
+    if missing.is_empty() && stale_removed == 0 && migrated == 0 {
         return Ok(Vec::new());
     }
 
@@ -558,6 +638,135 @@ mod tests {
                 assert!(inner[0]["command"].as_str().unwrap().contains("claudectl"));
             }
         }
+    }
+
+    /// Settings as written by a previous claudectl version.
+    fn settings_with_old_command() -> serde_json::Value {
+        serde_json::json!({
+            "hooks": {
+                "Stop": [{
+                    "matcher": "",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "claudectl 2>/dev/null || true",
+                        "timeout": 5,
+                    }],
+                }],
+            }
+        })
+    }
+
+    fn commands_in(settings: &serde_json::Value, event: &str) -> Vec<String> {
+        settings["hooks"][event]
+            .as_array()
+            .map(|matchers| {
+                matchers
+                    .iter()
+                    .flat_map(|m| m["hooks"].as_array().cloned().unwrap_or_default())
+                    .filter_map(|h| h["command"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn migration_rewrites_an_old_command_in_place() {
+        let mut settings = settings_with_old_command();
+        assert_eq!(migrate_owned_hook_commands(&mut settings), 1);
+        assert_eq!(commands_in(&settings, "Stop"), vec![HOOK_CMD.to_string()]);
+    }
+
+    #[test]
+    fn migration_does_not_duplicate_the_hook() {
+        // The whole reason migration rewrites in place: `merge_specs` PUSHES,
+        // so treating an outdated hook as "missing" would leave the stale
+        // command beside the new one and fire the receiver twice per event.
+        let mut settings = settings_with_old_command();
+        migrate_owned_hook_commands(&mut settings);
+        let missing = find_missing_hooks(&settings);
+        merge_specs(&mut settings, &missing);
+        assert_eq!(
+            commands_in(&settings, "Stop"),
+            vec![HOOK_CMD.to_string()],
+            "exactly one Stop hook must remain after a migrate+merge cycle"
+        );
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let mut settings = settings_with_old_command();
+        assert_eq!(migrate_owned_hook_commands(&mut settings), 1);
+        assert_eq!(
+            migrate_owned_hook_commands(&mut settings),
+            0,
+            "a second --init must report nothing to do"
+        );
+    }
+
+    #[test]
+    fn migration_leaves_a_hook_we_do_not_own_alone() {
+        // A hook the engineer wrote that happens to call claudectl. The old
+        // substring test would have claimed — and rewritten — this.
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Stop": [{
+                    "matcher": "",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "claudectl --json > /tmp/mine.json",
+                        "timeout": 5,
+                    }],
+                }],
+            }
+        });
+        assert_eq!(migrate_owned_hook_commands(&mut settings), 0);
+        assert_eq!(
+            commands_in(&settings, "Stop"),
+            vec!["claudectl --json > /tmp/mine.json".to_string()]
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_ours_and_spares_theirs() {
+        let mut entry = serde_json::json!({
+            "matcher": "",
+            "hooks": [
+                {"type": "command", "command": "claudectl 2>/dev/null || true"},
+                {"type": "command", "command": "claudectl-hook 2>/dev/null || true"},
+                {"type": "command", "command": "claudectl --json > /tmp/mine.json"},
+            ],
+        });
+        assert!(filter_claudectl_hooks(&mut entry));
+        let remaining: Vec<String> = entry["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|h| h["command"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            remaining,
+            vec!["claudectl --json > /tmp/mine.json".to_string()],
+            "both owned commands go; the engineer's own hook stays"
+        );
+    }
+
+    #[test]
+    fn ownership_check_is_exact_not_substring() {
+        assert!(is_owned_hook_command("claudectl 2>/dev/null || true"));
+        assert!(is_owned_hook_command("claudectl-hook 2>/dev/null || true"));
+        assert!(is_owned_hook_command(
+            "  claudectl-hook 2>/dev/null || true  "
+        ));
+        assert!(!is_owned_hook_command("claudectl --json"));
+        assert!(!is_owned_hook_command("my-claudectl-wrapper"));
+        assert!(!is_owned_hook_command(""));
+    }
+
+    #[test]
+    fn old_settings_still_count_as_installed() {
+        // Until --init runs, a pre-migration install must not be reported as
+        // unconfigured, or `--doctor` would cry wolf on every existing setup.
+        assert!(has_claudectl_hooks(&settings_with_old_command()));
     }
 
     #[test]
