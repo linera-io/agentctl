@@ -1111,6 +1111,70 @@ const SYSTEMD_UNIT_BASENAME: &str = "claudectl-reaper";
 pub const MIN_INTERVAL_SECONDS: u64 = 10;
 pub const MAX_INTERVAL_SECONDS: u64 = 3600;
 
+/// Default period for `--install-reaper`, and the fallback any reader uses
+/// when the installed unit cannot be consulted. Lives here rather than as a
+/// bare literal in the clap attribute so the scheduler and every consumer of
+/// snapshot freshness agree on one number.
+pub const DEFAULT_INTERVAL_SECONDS: u64 = 300;
+
+/// Process-wide cache for [`installed_interval_seconds`]. The installed unit
+/// does not change under a running claudectl, and this is consulted on every
+/// refresh, so read it at most once.
+static INSTALLED_INTERVAL: OnceLock<Option<u64>> = OnceLock::new();
+
+/// The reaper period actually installed on this host, read from the scheduler
+/// unit, or `None` when no unit is installed or it cannot be parsed.
+///
+/// Readers need this because `--reaper-interval` spans 10 s to an hour: a host
+/// running a 30-minute reaper would have every snapshot judged expired against
+/// the 5-minute default, and a host running a 10-second one would keep showing
+/// measurements long after they stopped arriving. `None` is honest — on a host
+/// with no reaper installed, nothing is writing the snapshot at all.
+pub fn installed_interval_seconds() -> Option<u64> {
+    *INSTALLED_INTERVAL.get_or_init(read_installed_interval)
+}
+
+#[cfg(target_os = "macos")]
+fn read_installed_interval() -> Option<u64> {
+    let body = std::fs::read_to_string(plist_path().ok()?).ok()?;
+    parse_plist_interval(&body)
+}
+
+#[cfg(target_os = "linux")]
+fn read_installed_interval() -> Option<u64> {
+    let body = std::fs::read_to_string(systemd_timer_path().ok()?).ok()?;
+    parse_timer_interval(&body)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn read_installed_interval() -> Option<u64> {
+    None
+}
+
+/// Pure parser for the `StartInterval` integer in an installed launchd plist.
+/// Its own function so it can be tested against [`build_plist`]'s output on
+/// every platform — the pair must round-trip or the reader silently falls back
+/// to the default on a host that configured something else.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn parse_plist_interval(body: &str) -> Option<u64> {
+    let after_key = body.split("<key>StartInterval</key>").nth(1)?;
+    let open = after_key.find("<integer>")? + "<integer>".len();
+    let close = after_key.find("</integer>")?;
+    after_key.get(open..close)?.trim().parse().ok()
+}
+
+/// Pure parser for `OnUnitActiveSec` in an installed systemd timer. Same
+/// round-trip obligation as [`parse_plist_interval`].
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn parse_timer_interval(body: &str) -> Option<u64> {
+    body.lines()
+        .find_map(|line| line.trim().strip_prefix("OnUnitActiveSec="))?
+        .trim()
+        .trim_end_matches('s')
+        .parse()
+        .ok()
+}
+
 fn home_dir() -> io::Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -2310,10 +2374,18 @@ notapid   1.0  1024 claude
         assert_eq!(rows[0]["mem_mb"], 1024.0);
     }
 
+    /// Fixed collection time for snapshots built in tests. Any value works as
+    /// long as it is also the "now" passed to the reader — these tests are
+    /// about field agreement, not expiry, which `app` covers separately.
+    const COLLECTED_AT_MS: u64 = 1_785_814_692_000;
+
     /// Wrap collected rows the way the snapshot file stores them, so a test can
     /// hand them to the reader side exactly as it will find them on disk.
     fn snapshot_of(name: &str, rows: Vec<serde_json::Value>) -> sandbox_registry::SandboxSnapshot {
-        let mut snapshot = sandbox_registry::SandboxSnapshot::default();
+        let mut snapshot = sandbox_registry::SandboxSnapshot {
+            collected_at_ms: COLLECTED_AT_MS,
+            ..Default::default()
+        };
         snapshot.sandboxes.insert(
             name.to_string(),
             sandbox_registry::SandboxOrigin {
@@ -2333,7 +2405,11 @@ notapid   1.0  1024 claude
         // copy of the key names, which is how the two drifted before.
         let entries = vec![registry_entry(11036, "abc-123", Some("my-title"))];
         let rows = sessions_from_registry(&entries, &live_map(vec![sample(11036, 7.5, 256.0)]));
-        let vitals = crate::app::snapshot_vitals(&snapshot_of("linera-agent", rows));
+        let vitals = crate::app::snapshot_vitals_at(
+            &snapshot_of("linera-agent", rows),
+            COLLECTED_AT_MS,
+            Duration::from_secs(DEFAULT_INTERVAL_SECONDS),
+        );
         let seen = vitals
             .get("abc-123")
             .expect("the renderer must find the collected row by session id");
@@ -2350,7 +2426,11 @@ notapid   1.0  1024 claude
         let map = rows[0].as_object_mut().expect("collected rows are objects");
         map.remove("cpu");
         map.remove("mem_mb");
-        let vitals = crate::app::snapshot_vitals(&snapshot_of("linera-agent", rows));
+        let vitals = crate::app::snapshot_vitals_at(
+            &snapshot_of("linera-agent", rows),
+            COLLECTED_AT_MS,
+            Duration::from_secs(DEFAULT_INTERVAL_SECONDS),
+        );
         let seen = vitals.get("abc-123").expect("row is still identifiable");
         assert_eq!(seen.cpu_percent, 0.0);
         assert_eq!(seen.mem_mb, 0.0);
@@ -2752,5 +2832,55 @@ WantedBy=timers.target\n";
         assert!(body.contains("OnBootSec=300s"));
         assert!(body.contains("Persistent=true"));
         assert!(body.contains("WantedBy=timers.target"));
+    }
+
+    #[test]
+    fn the_plist_writer_and_the_interval_reader_agree() {
+        // Two hand-written halves of one format. If they drift, snapshot
+        // freshness is silently judged against the default on every host that
+        // configured something else — a wrong answer that looks like a right
+        // one, which is why this asserts agreement rather than either half's
+        // output in isolation.
+        for interval in [MIN_INTERVAL_SECONDS, 60, DEFAULT_INTERVAL_SECONDS, 1800] {
+            let body = build_plist(
+                Path::new("/usr/local/bin/claudectl"),
+                interval,
+                Path::new("/tmp/err.log"),
+                Path::new("/Users/ndr"),
+            );
+            assert_eq!(
+                parse_plist_interval(&body),
+                Some(interval),
+                "plist round trip failed for {interval}s"
+            );
+        }
+    }
+
+    #[test]
+    fn the_timer_writer_and_the_interval_reader_agree() {
+        for interval in [MIN_INTERVAL_SECONDS, 60, DEFAULT_INTERVAL_SECONDS, 1800] {
+            assert_eq!(
+                parse_timer_interval(&build_systemd_timer(interval)),
+                Some(interval),
+                "timer round trip failed for {interval}s"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_unit_yields_no_interval_rather_than_a_guess() {
+        // The caller falls back to the default on `None`. A parser that
+        // invented a number instead would make "no reaper installed" — where
+        // nothing writes the snapshot at all — look like a healthy 5-minute
+        // one, and every stale snapshot would render as fresh.
+        assert_eq!(parse_plist_interval("<plist><dict></dict></plist>"), None);
+        assert_eq!(parse_plist_interval(""), None);
+        assert_eq!(
+            parse_plist_interval("<key>StartInterval</key><integer>not-a-number</integer>"),
+            None
+        );
+        assert_eq!(parse_timer_interval("[Timer]\nPersistent=true\n"), None);
+        assert_eq!(parse_timer_interval(""), None);
+        assert_eq!(parse_timer_interval("OnUnitActiveSec=abcs\n"), None);
     }
 }

@@ -302,7 +302,7 @@ pub(crate) struct Cli {
     #[arg(
         long = "reaper-interval",
         help_heading = "Cleanup",
-        default_value_t = 300
+        default_value_t = claudectl::reaper::DEFAULT_INTERVAL_SECONDS
     )]
     pub(crate) reaper_interval: u64,
 

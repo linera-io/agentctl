@@ -128,23 +128,34 @@ fn foreign_sessions(local: &[ClaudeSession]) -> Vec<ClaudeSession> {
     let registry = crate::sandbox_registry::load();
     let snapshot = crate::sandbox_registry::load_snapshot();
     let running = running_sandbox_filter(&snapshot);
-    foreign_sessions_from(&registry, &snapshot, &running, here.as_deref(), local)
+    foreign_sessions_from(
+        &registry,
+        &snapshot,
+        &running,
+        here.as_deref(),
+        local,
+        now_ms(),
+        collector_interval(),
+    )
 }
 
 /// The pure half of [`foreign_sessions`], with every input passed in.
 ///
 /// Split out so the selection rules can be tested against a constructed
-/// registry: the wrapper's three reads all resolve through process-global
-/// state (`HOME`, the `CLAUDECTL_*` overrides) and one of them shells out to
-/// `sbx`, none of which a test of "which rows render" should have to arrange.
+/// registry: the wrapper's reads all resolve through process-global state
+/// (`HOME`, the `CLAUDECTL_*` overrides, the wall clock) and one of them shells
+/// out to `sbx`, none of which a test of "which rows render" should have to
+/// arrange.
 pub(crate) fn foreign_sessions_from(
     registry: &crate::sandbox_registry::Registry,
     snapshot: &crate::sandbox_registry::SandboxSnapshot,
     running: &RunningFilter,
     here: Option<&str>,
     local: &[ClaudeSession],
+    now_ms: u64,
+    collector_interval: std::time::Duration,
 ) -> Vec<ClaudeSession> {
-    let vitals = snapshot_vitals(snapshot);
+    let vitals = snapshot_vitals_at(snapshot, now_ms, collector_interval);
 
     let mut seen: std::collections::HashSet<String> = local
         .iter()
@@ -208,6 +219,29 @@ fn running_sandbox_filter(snapshot: &crate::sandbox_registry::SandboxSnapshot) -
     }
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The reaper period this host is actually running, read from the installed
+/// scheduler unit rather than assumed.
+///
+/// The default is only a default: `--install-reaper --reaper-interval` accepts
+/// anything from 10 s to an hour, and a host running a 30-minute reaper would
+/// otherwise have every snapshot judged expired the moment it aged past ten
+/// minutes. Falling back to the CLI default when the unit cannot be read keeps
+/// this honest on a host where the reaper was never installed — there, no
+/// snapshot is being written at all, and expiring it is the correct outcome.
+fn collector_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        crate::reaper::installed_interval_seconds()
+            .unwrap_or(crate::reaper::DEFAULT_INTERVAL_SECONDS),
+    )
+}
+
 /// The per-VM measurements the host cannot take itself.
 pub(crate) struct SnapshotVitals {
     pub cpu_percent: f32,
@@ -218,10 +252,26 @@ pub(crate) struct SnapshotVitals {
 /// can pick up its CPU and memory. Rows the collector has not seen yet simply
 /// find nothing and keep `from_raw`'s defaults — an unmeasured session renders
 /// with blank vitals rather than being withheld from the list entirely.
-pub(crate) fn snapshot_vitals(
+///
+/// Returns nothing at all once the snapshot has expired. CPU and memory are
+/// instantaneous samples; minutes-old ones are not "slightly stale", they are
+/// measurements of a moment that has passed, and a row showing 7.5% for a
+/// process that has since gone quiet is a confident lie. Blank cells say "we
+/// don't know", which is the truth. Session membership is unaffected — it
+/// comes from the registry and stays live regardless.
+///
+/// Clock and collector period are passed in rather than read from the process,
+/// so the expiry rule can be tested without sleeping or installing a scheduler
+/// unit; [`foreign_sessions`] supplies the ambient values.
+pub(crate) fn snapshot_vitals_at(
     snapshot: &crate::sandbox_registry::SandboxSnapshot,
+    now_ms: u64,
+    collector_interval: std::time::Duration,
 ) -> std::collections::HashMap<String, SnapshotVitals> {
     let mut out = std::collections::HashMap::new();
+    if !snapshot.is_fresh(now_ms, collector_interval) {
+        return out;
+    }
     for origin in snapshot.sandboxes.values() {
         for value in &origin.sessions {
             let Some(id) = value.get("session_id").and_then(serde_json::Value::as_str) else {
@@ -2857,6 +2907,8 @@ mod foreign_session_tests {
             &running(&["linera-agent-5e85"]),
             None,
             &[],
+            NOW,
+            INTERVAL,
         );
         assert_eq!(ids(&rows), ["250a74d3"]);
         assert_eq!(rows[0].display_name(), "new");
@@ -2878,6 +2930,8 @@ mod foreign_session_tests {
             &running(&["linera-agent-live"]),
             None,
             &[],
+            NOW,
+            INTERVAL,
         );
         assert_eq!(ids(&rows), ["250a74d3"]);
         assert_eq!(
@@ -2899,6 +2953,8 @@ mod foreign_session_tests {
             &running(&["linera-agent-dead"]),
             None,
             &[],
+            NOW,
+            INTERVAL,
         );
         assert_eq!(ids(&rows), ["f5bb6dba"]);
     }
@@ -2915,6 +2971,8 @@ mod foreign_session_tests {
             &running(&["linera-agent-here", "linera-agent-other"]),
             Some("linera-agent-here"),
             &[],
+            NOW,
+            INTERVAL,
         );
         assert_eq!(ids(&rows), ["remote-1"]);
     }
@@ -2934,6 +2992,8 @@ mod foreign_session_tests {
             &running(&["linera-agent-new", "linera-agent-old"]),
             None,
             &[],
+            NOW,
+            INTERVAL,
         );
         assert_eq!(ids(&rows), ["a02a0bcd"]);
     }
@@ -2956,6 +3016,8 @@ mod foreign_session_tests {
             &running(&["linera-agent-live"]),
             None,
             std::slice::from_ref(&local),
+            NOW,
+            INTERVAL,
         );
         assert!(rows.is_empty());
     }
@@ -2963,24 +3025,18 @@ mod foreign_session_tests {
     #[test]
     fn vitals_are_overlaid_from_the_snapshot_when_it_has_them() {
         let registry = registry_of(&[("linera-agent-live", vec![entry("abc-123", "row", 11036)])]);
-        let mut snapshot = SandboxSnapshot::default();
-        snapshot.sandboxes.insert(
-            "linera-agent-live".to_string(),
-            SandboxOrigin {
-                is_current: true,
-                sessions: vec![serde_json::json!({
-                    "session_id": "abc-123",
-                    "cpu": 7.5,
-                    "mem_mb": 256.0,
-                })],
-            },
-        );
+        // Stamped, not defaulted: an unstamped snapshot now reads as expired,
+        // which is the point of the freshness check and would make this test
+        // assert the wrong thing.
+        let snapshot = snapshot_collected_at(NOW - 60_000);
         let rows = foreign_sessions_from(
             &registry,
             &snapshot,
             &running(&["linera-agent-live"]),
             None,
             &[],
+            NOW,
+            INTERVAL,
         );
         assert_eq!(rows[0].cpu_percent, 7.5);
         assert_eq!(rows[0].mem_mb, 256.0);
@@ -2998,6 +3054,8 @@ mod foreign_session_tests {
             &running(&["linera-agent-live"]),
             None,
             &[],
+            NOW,
+            INTERVAL,
         );
         assert_eq!(ids(&rows), ["fresh-1"]);
         assert_eq!(rows[0].cpu_percent, 0.0);
@@ -3028,8 +3086,112 @@ mod foreign_session_tests {
             &running_sandbox_filter_for_test(None, &snapshot),
             None,
             &[],
+            NOW,
+            INTERVAL,
         );
         assert_eq!(ids(&rows), ["seen-1"]);
+    }
+
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+    const NOW: u64 = 1_785_814_692_000;
+
+    fn snapshot_collected_at(collected_at_ms: u64) -> SandboxSnapshot {
+        let mut snapshot = SandboxSnapshot {
+            collected_at_ms,
+            ..Default::default()
+        };
+        snapshot.sandboxes.insert(
+            "linera-agent-live".to_string(),
+            SandboxOrigin {
+                is_current: true,
+                sessions: vec![serde_json::json!({
+                    "session_id": "abc-123", "cpu": 7.5, "mem_mb": 256.0,
+                })],
+            },
+        );
+        snapshot
+    }
+
+    #[test]
+    fn a_fresh_snapshot_supplies_vitals() {
+        let snapshot = snapshot_collected_at(NOW - 60_000);
+        let vitals = snapshot_vitals_at(&snapshot, NOW, INTERVAL);
+        assert_eq!(vitals["abc-123"].cpu_percent, 7.5);
+    }
+
+    #[test]
+    fn an_expired_snapshot_supplies_none() {
+        // Past two intervals the collector is presumed dead. CPU and memory are
+        // instantaneous samples: showing 11-minute-old ones as current is a
+        // confident lie, and a blank cell is the honest answer.
+        let snapshot = snapshot_collected_at(NOW - 11 * 60 * 1000);
+        assert!(snapshot_vitals_at(&snapshot, NOW, INTERVAL).is_empty());
+    }
+
+    #[test]
+    fn one_missed_tick_is_not_treated_as_a_dead_collector() {
+        // 6 minutes on a 5-minute reaper is a single skipped fire — a slow
+        // `sbx exec` or a sleeping laptop. Expiring here would flap the vitals
+        // off and on for a healthy fleet.
+        let snapshot = snapshot_collected_at(NOW - 6 * 60 * 1000);
+        assert!(!snapshot_vitals_at(&snapshot, NOW, INTERVAL).is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_with_no_collection_time_is_never_trusted() {
+        // `collected_at_ms == 0` means a writer that predates the field, or a
+        // default-constructed value. Unknown age must read as expired, never
+        // as "fresh" — the zero would otherwise compute an enormous age or,
+        // worse, be mistaken for "just collected".
+        let snapshot = snapshot_collected_at(0);
+        assert!(snapshot_vitals_at(&snapshot, NOW, INTERVAL).is_empty());
+        assert_eq!(snapshot.age(NOW), None);
+    }
+
+    #[test]
+    fn the_bound_scales_with_the_configured_collector_interval() {
+        // A host running `--reaper-interval 1800` must not have every snapshot
+        // judged expired against the 5-minute default.
+        let snapshot = snapshot_collected_at(NOW - 20 * 60 * 1000);
+        assert!(
+            snapshot_vitals_at(&snapshot, NOW, INTERVAL).is_empty(),
+            "20 min is expired on a 5-minute reaper"
+        );
+        assert!(
+            !snapshot_vitals_at(&snapshot, NOW, std::time::Duration::from_secs(1800)).is_empty(),
+            "the same age is fine on a 30-minute reaper"
+        );
+    }
+
+    #[test]
+    fn a_clock_that_went_backwards_does_not_read_as_fresh() {
+        // `saturating_sub` floors the age at zero for a snapshot stamped in the
+        // future (NTP step, or a sandbox clock ahead of the host). Age zero is
+        // "fresh", which is the safe direction: it shows real measurements
+        // rather than blanking a working fleet.
+        let snapshot = snapshot_collected_at(NOW + 60_000);
+        assert_eq!(snapshot.age(NOW), Some(std::time::Duration::ZERO));
+        assert!(!snapshot_vitals_at(&snapshot, NOW, INTERVAL).is_empty());
+    }
+
+    #[test]
+    fn membership_is_unaffected_by_an_expired_snapshot() {
+        // The whole point of the split: staleness costs a row its CPU and MEM
+        // cells, never its place in the list. Membership comes from the
+        // registry and does not depend on the collector being alive at all.
+        let registry = registry_of(&[("linera-agent-live", vec![entry("abc-123", "row", 11036)])]);
+        let stale = snapshot_collected_at(NOW - 60 * 60 * 1000);
+        let rows = foreign_sessions_from(
+            &registry,
+            &stale,
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+        );
+        assert_eq!(ids(&rows), ["abc-123"]);
+        assert_eq!(rows[0].cpu_percent, 0.0, "stale vitals must not be shown");
     }
 
     /// `running_sandbox_filter` with the `sbx` call's result injected.
