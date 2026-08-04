@@ -31,25 +31,6 @@ impl fmt::Display for SessionStatus {
 }
 
 impl SessionStatus {
-    /// Inverse of [`fmt::Display`], for reading a status back out of collected
-    /// `--json` output. Unrecognised input becomes `Unknown` rather than a
-    /// guess — the variant that already means "the process is there but we
-    /// can't say what it's doing".
-    ///
-    /// Kept adjacent to the `Display` impl on purpose; `status_labels_round_trip`
-    /// asserts the two stay inverses instead of trusting that they will.
-    pub fn from_label(label: &str) -> Self {
-        match label {
-            "Needs Input" => Self::NeedsInput,
-            "Compacting" => Self::Compacting,
-            "Processing" => Self::Processing,
-            "Waiting" => Self::WaitingInput,
-            "Idle" => Self::Idle,
-            "Finished" => Self::Finished,
-            _ => Self::Unknown,
-        }
-    }
-
     pub fn sort_key(&self) -> u8 {
         match self {
             Self::NeedsInput => 0,
@@ -84,19 +65,6 @@ impl TelemetryStatus {
             Self::MissingTranscript => "No transcript",
             Self::UnreadableTranscript => "Unreadable transcript",
             Self::UnsupportedTranscript => "Unsupported transcript",
-        }
-    }
-
-    /// Inverse of [`label`](Self::label), for reading a collected row back.
-    /// Unrecognised input becomes `Pending` — "we don't know yet" — rather than
-    /// a guess. `telemetry_labels_round_trip` keeps the two in step.
-    pub fn from_label(label: &str) -> Self {
-        match label {
-            "Available" => Self::Available,
-            "No transcript" => Self::MissingTranscript,
-            "Unreadable transcript" => Self::UnreadableTranscript,
-            "Unsupported transcript" => Self::UnsupportedTranscript,
-            _ => Self::Pending,
         }
     }
 
@@ -473,7 +441,8 @@ impl ClaudeSession {
             session_id: raw.session_id,
             // Everything reaching `from_raw` came from this VM's own sidecars
             // or process table, so it is by construction local. Foreign
-            // sessions are built by `from_snapshot_value` instead.
+            // sessions are built by `from_registry_entry` instead, which
+            // overwrites this.
             origin: SessionOrigin::Local,
             cwd: raw.cwd,
             project_name,
@@ -602,127 +571,45 @@ impl ClaudeSession {
             .collect()
     }
 
-    /// Rebuild a session from one row of the host-collected snapshot
-    /// (`sandboxes.json`), i.e. a session belonging to another sandbox.
+    /// Build a foreign session row from one hook-written registry entry.
     ///
-    /// The reaper's collector assembles those rows from each sandbox's
-    /// hook-written registry plus an in-VM `ps` probe. Older snapshots on disk
-    /// were assembled from that sandbox's own `claudectl --json` and carry more
-    /// fields (cost, status, activity); they are still read here, but the host
-    /// recomputes every transcript-derived one immediately afterwards in
-    /// `app::do_refresh_io`, so what they say no longer decides anything.
+    /// This is the *membership* constructor: the registry is written by hooks
+    /// inside each sandbox onto the host-shared `~/.local/share/claudectl`
+    /// mount, so a session appears here the moment it starts and leaves the
+    /// moment it deliberately closes — no collector tick in between. The
+    /// snapshot is only consulted afterwards, to overlay the two facts
+    /// (`cpu`, `mem_mb`) the host genuinely cannot measure for another VM.
     ///
-    /// Returns `None` when the entry carries no `session_id` — an unidentified
-    /// row can be neither resumed nor de-duplicated against local discovery,
-    /// so showing it would be worse than omitting it.
+    /// `transcript` is taken as the JSONL path when the entry carries one. It
+    /// names a file on the shared `~/.claude` mount, so the host can read it
+    /// directly, and doing so here is what lets cost, context and status be
+    /// recomputed live for a session the collector has never seen.
     ///
-    /// Only fields the collected payload actually carries are overlaid. The
-    /// rest keep `from_raw`'s defaults rather than being invented: a fabricated
-    /// zero would render as a real measurement, and "we didn't collect this"
-    /// must not look like "this session is idle".
-    pub fn from_snapshot_value(sandbox: &str, value: &serde_json::Value) -> Option<Self> {
-        let session_id = value.get("session_id")?.as_str()?.to_string();
-        let str_field = |key: &str| {
-            value
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        };
+    /// Returns `None` for an entry with no `session_id`: an unidentifiable row
+    /// can be neither resumed nor de-duplicated against local discovery, so
+    /// showing it would be worse than omitting it.
+    pub fn from_registry_entry(
+        sandbox: &str,
+        entry: &crate::sandbox_registry::SessionEntry,
+    ) -> Option<Self> {
+        if entry.session_id.is_empty() {
+            return None;
+        }
         let raw = RawSession {
-            pid: value
-                .get("pid")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as u32,
-            session_id,
-            cwd: str_field("cwd"),
-            started_at: value
-                .get("started_at")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
-            // Pass the recorded title through as-is. It has already survived
-            // the placeholder filter on the producing side, so re-running
-            // `title()` here would be a second filter over clean input.
-            name: Some(str_field("session_name")).filter(|name| !name.is_empty()),
+            pid: entry.pid.unwrap_or(0),
+            session_id: entry.session_id.clone(),
+            cwd: entry.cwd.clone(),
+            started_at: entry.started_at_ms,
+            // The registry's `name` has already been through the placeholder
+            // filter on the writing side, so pass it through with no source
+            // marker rather than letting `title()` filter it a second time.
+            name: entry.name.clone(),
             name_source: None,
         };
         let mut session = Self::from_raw(raw);
         session.origin = SessionOrigin::Sandbox(sandbox.to_string());
-
-        if let Some(cpu) = value.get("cpu").and_then(serde_json::Value::as_f64) {
-            session.cpu_percent = cpu as f32;
-        }
-        if let Some(mem) = value.get("mem_mb").and_then(serde_json::Value::as_f64) {
-            session.mem_mb = mem;
-        }
-        // The cost/token block is emitted as null when the producing side had
-        // no usage metrics. Prefer the producer's own flag; fall back to "a
-        // cost number is present" for rows collected from an older claudectl
-        // that didn't emit the flag.
-        let has_metrics = value
-            .get("usage_metrics_available")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or_else(|| {
-                value
-                    .get("cost_usd")
-                    .and_then(serde_json::Value::as_f64)
-                    .is_some()
-            });
-        if has_metrics {
-            session.usage_metrics_available = true;
-            session.cost_usd = value
-                .get("cost_usd")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0);
-            session.burn_rate_per_hr = value
-                .get("burn_rate_per_hr")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0);
-            session.total_input_tokens = value
-                .get("tokens_in")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            session.total_output_tokens = value
-                .get("tokens_out")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            // Both sides of the ratio: `context_percent` returns 0 unless it
-            // has each of them, which rendered the Context bar blank on every
-            // collected row.
-            session.context_tokens = value
-                .get("context_tokens")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            session.context_max = value
-                .get("context_max")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-        }
-        if let Some(ts) = value
-            .get("last_user_message_ts")
-            .and_then(serde_json::Value::as_u64)
-        {
-            session.last_user_message_ts = ts;
-        }
-        if let Some(history) = value
-            .get("activity_history")
-            .and_then(serde_json::Value::as_array)
-        {
-            session.activity_history = history
-                .iter()
-                .filter_map(serde_json::Value::as_u64)
-                .map(|level| level as u8)
-                .collect();
-        }
-        if let Some(status) = value.get("status").and_then(serde_json::Value::as_str) {
-            session.status = SessionStatus::from_label(status);
-        }
-        if let Some(state) = value
-            .get("telemetry")
-            .and_then(|t| t.get("state"))
-            .and_then(serde_json::Value::as_str)
-        {
-            session.telemetry_status = TelemetryStatus::from_label(state);
+        if !entry.transcript.is_empty() {
+            session.jsonl_path = Some(PathBuf::from(&entry.transcript));
         }
         Some(session)
     }
@@ -1115,169 +1002,94 @@ fn subagent_label(path: &Path) -> String {
 mod origin_tests {
     use super::*;
 
-    const ALL_STATUSES: [SessionStatus; 7] = [
-        SessionStatus::NeedsInput,
-        SessionStatus::Compacting,
-        SessionStatus::Processing,
-        SessionStatus::WaitingInput,
-        SessionStatus::Unknown,
-        SessionStatus::Idle,
-        SessionStatus::Finished,
-    ];
-
-    #[test]
-    fn status_labels_round_trip() {
-        // `from_label` is a hand-written inverse of `Display`. Assert they are
-        // actually inverses rather than trusting two match arms to stay in
-        // step — a drifted pair would silently render every collected foreign
-        // session as Unknown.
-        for status in ALL_STATUSES {
-            assert_eq!(
-                SessionStatus::from_label(&status.to_string()),
-                status,
-                "round trip failed for {status}"
-            );
+    fn registry_entry(
+        session_id: &str,
+        name: Option<&str>,
+    ) -> crate::sandbox_registry::SessionEntry {
+        crate::sandbox_registry::SessionEntry {
+            session_id: session_id.to_string(),
+            cwd: "/Users/ndr/repos/linera-infra".to_string(),
+            transcript: String::new(),
+            started_at_ms: 1_700_000_000_000,
+            name: name.map(str::to_string),
+            pid: Some(4242),
+            owner_pid: None,
+            owner_started_at: None,
         }
     }
 
     #[test]
-    fn telemetry_labels_round_trip() {
-        for state in [
-            TelemetryStatus::Pending,
-            TelemetryStatus::Available,
-            TelemetryStatus::MissingTranscript,
-            TelemetryStatus::UnreadableTranscript,
-            TelemetryStatus::UnsupportedTranscript,
-        ] {
-            assert_eq!(
-                TelemetryStatus::from_label(state.label()),
-                state,
-                "round trip failed for {}",
-                state.label()
-            );
-        }
+    fn registry_entry_rebuilds_identity_and_marks_the_origin_foreign() {
+        let session = ClaudeSession::from_registry_entry(
+            "linera-agent-251d",
+            &registry_entry("abc-123", Some("fix-scylla-disk")),
+        )
+        .expect("well-formed entry");
+        assert_eq!(session.session_id, "abc-123");
+        assert_eq!(session.pid, 4242);
+        assert_eq!(session.cwd, "/Users/ndr/repos/linera-infra");
         assert_eq!(
-            TelemetryStatus::from_label("something new"),
-            TelemetryStatus::Pending
+            session.origin,
+            SessionOrigin::Sandbox("linera-agent-251d".into())
         );
+        // The pid belongs to another VM; signalling it here would hit an
+        // unrelated local process.
+        assert!(!session.origin.is_addressable());
+        assert_eq!(session.display_name(), "fix-scylla-disk");
     }
 
     #[test]
-    fn every_rendered_column_survives_a_round_trip_through_the_snapshot() {
-        // The Last / Context / Activity columns rendered blank on every
-        // collected row because the fields behind them were never emitted.
-        // Assert on the RENDERED output, not just the fields — that is what
-        // was actually broken.
-        let mut original = ClaudeSession::from_raw(RawSession {
-            pid: 4242,
-            session_id: "abc-123".into(),
-            cwd: "/Users/ndr/repos/linera-infra".into(),
-            started_at: 1_700_000_000_000,
-            name: Some("fix-scylla-disk".into()),
-            name_source: None,
-        });
-        original.usage_metrics_available = true;
-        original.cost_usd = 12.5;
-        original.burn_rate_per_hr = 3.25;
-        original.total_input_tokens = 1000;
-        original.total_output_tokens = 250;
-        original.context_tokens = 450_000;
-        original.context_max = 1_000_000;
-        original.last_user_message_ts = 1_700_000_500_000;
-        original.activity_history = vec![0, 3, 7, 2];
-        original.telemetry_status = TelemetryStatus::Available;
-        original.status = SessionStatus::Processing;
-
-        let collected = original.to_json_value();
-        let restored = ClaudeSession::from_snapshot_value("linera-agent-2a14db7ea350", &collected)
-            .expect("a session we just serialised must be restorable");
-
-        assert_eq!(restored.last_user_message_ts, original.last_user_message_ts);
-        assert_eq!(restored.activity_history, original.activity_history);
-        assert_eq!(restored.context_tokens, original.context_tokens);
-        assert_eq!(restored.context_max, original.context_max);
-        assert_eq!(restored.telemetry_status, original.telemetry_status);
-        // Rendered forms must match, not merely the backing numbers.
-        assert_eq!(
-            restored.format_context_bar(6),
-            original.format_context_bar(6)
-        );
-        assert_eq!(restored.format_sparkline(), original.format_sparkline());
-        assert_eq!(restored.format_tokens(), original.format_tokens());
-        assert_eq!(restored.format_cost(), original.format_cost());
+    fn registry_entry_without_an_id_is_dropped() {
         assert!(
-            restored.context_percent() > 0.0,
-            "Context rendered as empty, which is the bug"
+            ClaudeSession::from_registry_entry("sbx", &registry_entry("", Some("nameless")))
+                .is_none()
         );
     }
 
     #[test]
-    fn negative_control_stripping_the_new_fields_reproduces_the_blank_columns() {
-        // Proves the test above discriminates rather than passing vacuously:
-        // remove exactly the keys this PR added and the three columns go blank
-        // again, which is what the laptop was showing for every sandbox row.
-        let mut original = ClaudeSession::from_raw(RawSession {
-            pid: 1,
-            session_id: "abc-123".into(),
-            cwd: "/tmp".into(),
-            started_at: 0,
-            name: None,
-            name_source: None,
-        });
-        original.usage_metrics_available = true;
-        original.cost_usd = 1.0;
-        original.context_tokens = 450_000;
-        original.context_max = 1_000_000;
-        original.last_user_message_ts = 1_700_000_500_000;
-        original.activity_history = vec![1, 2, 3];
-
-        let mut collected = original.to_json_value();
-        let map = collected.as_object_mut().unwrap();
-        for key in [
-            "context_tokens",
-            "context_max",
-            "last_user_message_ts",
-            "activity_history",
-        ] {
-            map.remove(key);
-        }
-
-        let restored = ClaudeSession::from_snapshot_value("sbx", &collected).expect("restorable");
-        assert_eq!(
-            restored.context_percent(),
-            0.0,
-            "Context would render blank"
-        );
-        assert_eq!(
-            restored.format_sparkline(),
-            "-",
-            "Activity would render '-'"
-        );
-        assert_eq!(restored.last_user_message_ts, 0, "Last would render '—'");
+    fn an_unnamed_entry_still_renders_under_its_project() {
+        let session = ClaudeSession::from_registry_entry("sbx", &registry_entry("abc-123", None))
+            .expect("an unnamed session is still identifiable");
+        assert_eq!(session.session_name, "");
+        assert_eq!(session.display_name(), "linera-infra");
     }
 
     #[test]
-    fn a_row_without_metrics_does_not_fabricate_a_context_bar() {
-        let bare = serde_json::json!({
-            "session_id": "abc-123",
-            "pid": 1,
-            "status": "Idle",
-            "usage_metrics_available": false,
-        });
-        let restored = ClaudeSession::from_snapshot_value("sbx", &bare).expect("restorable");
-        assert!(!restored.usage_metrics_available);
-        assert_eq!(restored.context_percent(), 0.0);
-        assert_eq!(restored.activity_history.len(), 0);
-        assert_eq!(restored.last_user_message_ts, 0);
+    fn the_recorded_transcript_becomes_the_jsonl_path() {
+        // This is what lets the host recompute cost, context and status for a
+        // session it has never collected: the transcript lives on the shared
+        // `~/.claude` mount, so naming it here is the whole handoff to
+        // `monitor::update_tokens`.
+        let mut entry = registry_entry("abc-123", Some("named"));
+        entry.transcript = "/Users/ndr/.claude/projects/-Users-ndr/abc-123.jsonl".to_string();
+        let session = ClaudeSession::from_registry_entry("sbx", &entry).expect("well-formed entry");
+        assert_eq!(
+            session.jsonl_path.as_deref(),
+            Some(Path::new(
+                "/Users/ndr/.claude/projects/-Users-ndr/abc-123.jsonl"
+            ))
+        );
     }
 
     #[test]
-    fn unknown_status_label_degrades_to_unknown() {
-        assert_eq!(
-            SessionStatus::from_label("Something From The Future"),
-            SessionStatus::Unknown
-        );
-        assert_eq!(SessionStatus::from_label(""), SessionStatus::Unknown);
+    fn an_entry_without_a_transcript_leaves_the_path_for_discovery_to_resolve() {
+        // `do_refresh_io` falls back to `resolve_jsonl_paths` when this is
+        // None; inventing a path here would defeat that.
+        let session = ClaudeSession::from_registry_entry("sbx", &registry_entry("abc-123", None))
+            .expect("well-formed entry");
+        assert!(session.jsonl_path.is_none());
+    }
+
+    #[test]
+    fn registry_entry_does_not_fabricate_metrics() {
+        // The registry carries identity only. A zero cost rendered as a real
+        // measurement would be worse than a blank cell.
+        let session = ClaudeSession::from_registry_entry("sbx", &registry_entry("abc-123", None))
+            .expect("well-formed entry");
+        assert!(!session.usage_metrics_available);
+        assert_eq!(session.cost_usd, 0.0);
+        assert_eq!(session.total_input_tokens, 0);
+        assert_eq!(session.context_percent(), 0.0);
     }
 
     #[test]
@@ -1300,84 +1112,6 @@ mod origin_tests {
         // The guard that stops us signalling a pid in someone else's namespace.
         assert!(SessionOrigin::Local.is_addressable());
         assert!(!SessionOrigin::Sandbox("elsewhere".into()).is_addressable());
-    }
-
-    fn collected(extra: serde_json::Value) -> serde_json::Value {
-        let mut base = serde_json::json!({
-            "session_id": "abc-123",
-            "cwd": "/Users/ndr/repos/linera-infra",
-            "session_name": "fix-scylla-disk",
-            "started_at": 1_700_000_000_000u64,
-            "pid": 4242,
-            "project": "fix-scylla-disk",
-            "status": "Processing",
-        });
-        let (base_map, extra_map) = (base.as_object_mut().unwrap(), extra.as_object().unwrap());
-        for (key, value) in extra_map {
-            base_map.insert(key.clone(), value.clone());
-        }
-        base
-    }
-
-    #[test]
-    fn snapshot_value_rebuilds_identity_and_origin() {
-        let session = ClaudeSession::from_snapshot_value(
-            "linera-agent-251d",
-            &collected(serde_json::json!({})),
-        )
-        .expect("well-formed entry");
-        assert_eq!(session.session_id, "abc-123");
-        assert_eq!(session.pid, 4242);
-        assert_eq!(session.cwd, "/Users/ndr/repos/linera-infra");
-        assert_eq!(session.status, SessionStatus::Processing);
-        assert_eq!(
-            session.origin,
-            SessionOrigin::Sandbox("linera-agent-251d".into())
-        );
-        assert!(!session.origin.is_addressable());
-        // `session_name` must survive separately from `project`, or the Name
-        // and Project columns collapse into one on the way back.
-        assert_eq!(session.display_name(), "fix-scylla-disk");
-    }
-
-    #[test]
-    fn snapshot_value_without_an_id_is_dropped() {
-        let mut value = collected(serde_json::json!({}));
-        value.as_object_mut().unwrap().remove("session_id");
-        assert!(ClaudeSession::from_snapshot_value("sbx", &value).is_none());
-    }
-
-    #[test]
-    fn snapshot_value_does_not_invent_uncollected_metrics() {
-        // No cost block in the payload means the producing side had no usage
-        // metrics. A fabricated 0.0 would render as a real measurement.
-        let session = ClaudeSession::from_snapshot_value("sbx", &collected(serde_json::json!({})))
-            .expect("well-formed entry");
-        assert!(!session.usage_metrics_available);
-        assert_eq!(session.cost_usd, 0.0);
-        assert_eq!(session.total_input_tokens, 0);
-    }
-
-    #[test]
-    fn snapshot_value_overlays_collected_metrics() {
-        let session = ClaudeSession::from_snapshot_value(
-            "sbx",
-            &collected(serde_json::json!({
-                "cost_usd": 12.5,
-                "burn_rate_per_hr": 3.25,
-                "tokens_in": 1000,
-                "tokens_out": 250,
-                "cpu": 7.5,
-                "mem_mb": 512.0,
-            })),
-        )
-        .expect("well-formed entry");
-        assert!(session.usage_metrics_available);
-        assert_eq!(session.cost_usd, 12.5);
-        assert_eq!(session.burn_rate_per_hr, 3.25);
-        assert_eq!(session.total_input_tokens, 1000);
-        assert_eq!(session.total_output_tokens, 250);
-        assert_eq!(session.mem_mb, 512.0);
     }
 
     #[test]

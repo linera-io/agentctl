@@ -35,8 +35,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::sandbox_registry;
 
@@ -95,6 +95,55 @@ fn sbx_list_json() -> io::Result<String> {
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// How long a `sbx ls --json` result is reused before the next caller re-runs
+/// it. The render path asks once per refresh (default every 2 s), but sandboxes
+/// are created and destroyed on a human timescale of minutes, so a few seconds
+/// of staleness is invisible while the cache keeps the TUI from spawning a
+/// process every tick.
+const RUNNING_SET_TTL: Duration = Duration::from_secs(10);
+
+/// Last `sbx ls --json` result and when it was taken. `None` inside means the
+/// last attempt failed; it is re-attempted on the same TTL rather than cached
+/// forever, so a transient `sbx` hiccup self-heals.
+#[expect(clippy::type_complexity, reason = "one private cache cell, not an API")]
+static RUNNING_SET_CACHE: OnceLock<Mutex<Option<(Instant, Option<Vec<String>>)>>> = OnceLock::new();
+
+/// Names of every currently running sandbox, or `None` when this process
+/// cannot ask.
+///
+/// `None` and `Some(vec![])` mean genuinely different things and callers must
+/// not conflate them. `Some(vec![])` is an answer — `sbx` ran and reported
+/// nothing running. `None` is the absence of one: no `sbx` on PATH (the
+/// in-sandbox case, where the bridges deliberately keep it unreachable) or a
+/// failed invocation. A caller that read `None` as "nothing is running" would
+/// hide every sandbox session on exactly the hosts that cannot self-diagnose.
+///
+/// Cached for [`RUNNING_SET_TTL`] because the render path calls this on every
+/// refresh; the reaper's own collection deliberately does not use this cache,
+/// since a tick that runs minutes apart should observe the world fresh.
+pub(crate) fn running_sandboxes() -> Option<Vec<String>> {
+    let cell = RUNNING_SET_CACHE.get_or_init(|| Mutex::new(None));
+    // A poisoned lock means a previous caller panicked mid-update. That is not
+    // a reason to deny every later caller the sandbox list, so take the data
+    // and carry on rather than propagating the panic.
+    let mut guard = match cell.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some((taken_at, cached)) = guard.as_ref() {
+        if taken_at.elapsed() < RUNNING_SET_TTL {
+            return cached.clone();
+        }
+    }
+    let fresh = sbx_list_json().ok().map(|out| {
+        let mut names = parse_sbx_ls_running_names(&out);
+        names.sort();
+        names
+    });
+    *guard = Some((Instant::now(), fresh.clone()));
+    fresh
 }
 
 /// Pure parser: given `sbx ls --json` stdout, return the name of the unique
@@ -2261,33 +2310,50 @@ notapid   1.0  1024 claude
         assert_eq!(rows[0]["mem_mb"], 1024.0);
     }
 
-    #[test]
-    fn collected_row_survives_from_snapshot_value() {
-        // End to end: what the collector writes is what the renderer accepts.
-        let entries = vec![registry_entry(11036, "abc-123", Some("my-title"))];
-        let rows = sessions_from_registry(&entries, &live_map(vec![sample(11036, 7.5, 256.0)]));
-        let session = crate::session::ClaudeSession::from_snapshot_value("linera-agent", &rows[0])
-            .expect("a collected row must be renderable");
-        assert_eq!(session.session_id, "abc-123");
-        assert_eq!(session.display_name(), "my-title");
-        assert_eq!(session.cwd, "/Users/ndr/repos/linera-infra");
-        assert_eq!(session.pid, 11036);
-        assert_eq!(session.cpu_percent, 7.5);
-        assert_eq!(session.mem_mb, 256.0);
-        assert_eq!(
-            session.origin,
-            crate::session::SessionOrigin::Sandbox("linera-agent".into())
+    /// Wrap collected rows the way the snapshot file stores them, so a test can
+    /// hand them to the reader side exactly as it will find them on disk.
+    fn snapshot_of(name: &str, rows: Vec<serde_json::Value>) -> sandbox_registry::SandboxSnapshot {
+        let mut snapshot = sandbox_registry::SandboxSnapshot::default();
+        snapshot.sandboxes.insert(
+            name.to_string(),
+            sandbox_registry::SandboxOrigin {
+                is_current: true,
+                sessions: rows,
+            },
         );
+        snapshot
     }
 
     #[test]
-    fn an_unnamed_session_still_renders_under_its_project() {
-        let entries = vec![registry_entry(11036, "abc-123", None)];
-        let rows = sessions_from_registry(&entries, &live_map(vec![sample(11036, 0.0, 1.0)]));
-        let session = crate::session::ClaudeSession::from_snapshot_value("linera-agent", &rows[0])
-            .expect("an unnamed session is still identifiable");
-        assert_eq!(session.session_name, "");
-        assert_eq!(session.display_name(), "linera-infra");
+    fn collected_row_carries_the_vitals_the_renderer_reads_back() {
+        // End to end across the file, in the only direction that still matters:
+        // membership now comes from the registry, so what the collector owes
+        // the renderer is the pair of per-VM measurements the host cannot take
+        // for itself. Assert against the real reader rather than a restated
+        // copy of the key names, which is how the two drifted before.
+        let entries = vec![registry_entry(11036, "abc-123", Some("my-title"))];
+        let rows = sessions_from_registry(&entries, &live_map(vec![sample(11036, 7.5, 256.0)]));
+        let vitals = crate::app::snapshot_vitals(&snapshot_of("linera-agent", rows));
+        let seen = vitals
+            .get("abc-123")
+            .expect("the renderer must find the collected row by session id");
+        assert_eq!(seen.cpu_percent, 7.5);
+        assert_eq!(seen.mem_mb, 256.0);
+    }
+
+    #[test]
+    fn negative_control_dropping_the_vitals_keeps_them_out_of_the_renderer() {
+        // Proves the test above discriminates: strip exactly the two keys and
+        // the reader reports zeroes, which is what a blank CPU/MEM column is.
+        let entries = vec![registry_entry(11036, "abc-123", Some("my-title"))];
+        let mut rows = sessions_from_registry(&entries, &live_map(vec![sample(11036, 7.5, 256.0)]));
+        let map = rows[0].as_object_mut().expect("collected rows are objects");
+        map.remove("cpu");
+        map.remove("mem_mb");
+        let vitals = crate::app::snapshot_vitals(&snapshot_of("linera-agent", rows));
+        let seen = vitals.get("abc-123").expect("row is still identifiable");
+        assert_eq!(seen.cpu_percent, 0.0);
+        assert_eq!(seen.mem_mb, 0.0);
     }
 
     #[test]
