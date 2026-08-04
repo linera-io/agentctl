@@ -45,6 +45,7 @@ use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -341,6 +342,46 @@ impl Default for SandboxSnapshot {
             version: current_version(),
             collected_at_ms: 0,
             sandboxes: BTreeMap::new(),
+        }
+    }
+}
+
+/// How many collector intervals a snapshot may fall behind before its
+/// measurements are treated as expired.
+///
+/// Two rather than one: the reaper is a timer, not a guarantee. A single tick
+/// can be skipped by a slow `sbx exec`, a laptop asleep between fires, or a
+/// run that lost the race with the orphan-scan cache — none of which mean the
+/// collector is dead, and all of which would make a one-interval bound flap
+/// the vitals off and on for a perfectly healthy fleet.
+const STALE_AFTER_INTERVALS: u64 = 2;
+
+impl SandboxSnapshot {
+    /// Age of this snapshot, or `None` if it carries no collection time.
+    ///
+    /// `None` is not zero: it means a writer that predates `collected_at_ms`,
+    /// or a default-constructed value. Callers must treat it as "unknown", the
+    /// same way they treat expired — never as "fresh".
+    pub fn age(&self, now_ms: u64) -> Option<Duration> {
+        (self.collected_at_ms != 0)
+            .then(|| Duration::from_millis(now_ms.saturating_sub(self.collected_at_ms)))
+    }
+
+    /// Whether the collected measurements may still be shown.
+    ///
+    /// The field this reads has been written and documented as load-bearing
+    /// since the snapshot was introduced, but until now nothing read it, so a
+    /// dead collector rendered an arbitrarily old CPU and memory column with
+    /// full confidence and no indication. A reader that cannot tell a fresh
+    /// snapshot from an abandoned one has to assume the worst.
+    ///
+    /// `collector_interval` is the reaper's configured period, so raising
+    /// `--reaper-interval` widens this automatically instead of silently
+    /// expiring every snapshot the moment it exceeds a hardcoded guess.
+    pub fn is_fresh(&self, now_ms: u64, collector_interval: Duration) -> bool {
+        match self.age(now_ms) {
+            Some(age) => age < collector_interval * STALE_AFTER_INTERVALS as u32,
+            None => false,
         }
     }
 }
