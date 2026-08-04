@@ -53,6 +53,63 @@ fn make_session(cpu: f32, last_message_age_secs: u64) -> ClaudeSession {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[test]
+fn a_session_blocked_on_a_permission_prompt_reads_as_needs_input() {
+    // The bug this file's `isolate_hook_state_dir` normally hides, asserted
+    // deliberately: a session whose hook state was written by *another*
+    // machine — a sandbox — must reach `NeedsInput` on the host that renders
+    // it. Before hook state moved to the shared mount this was unreachable:
+    // `HookState::load` looked in the reader's own private `~/.claudectl`,
+    // always missed for a sandbox session, and fell through to the heuristic,
+    // which by design never produces `NeedsInput`.
+    //
+    // The transcript tail here is the one both stuck sessions had on
+    // 2026-08-04 — `user` / `tool_result`, because a pending permission prompt
+    // writes nothing to the JSONL — which is exactly what made the heuristic
+    // answer `Processing`.
+    let mut session = make_session(0.6, 5);
+    session.session_id = "cf54da79-2d23-4231-81fd-ce2a441e6e39".into();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let state = serde_json::json!({
+        "session_id": session.session_id,
+        "last_notification_ts_ms": now_ms - 5_000,
+        "notification_kind": "permission_prompt",
+        "last_pretooluse_ts_ms": now_ms - 9_000,
+        "last_posttooluse_ts_ms": now_ms - 8_000,
+    });
+    let dir = std::env::var("CLAUDECTL_STATE_DIR").expect("isolated by make_session");
+    std::fs::write(
+        std::path::Path::new(&dir).join(format!("{}.json", session.session_id)),
+        serde_json::to_string(&state).unwrap(),
+    )
+    .unwrap();
+
+    monitor::infer_status(&mut session, "user", "", false);
+
+    assert_eq!(
+        session.status,
+        SessionStatus::NeedsInput,
+        "a pending permission prompt must not render as Processing"
+    );
+
+    // Negative control: same session, same transcript tail, no state file.
+    // This is precisely the pre-fix situation, and it must still answer
+    // Processing — proving the assertion above is carried by the shared state
+    // and not by something incidental to the session fixture.
+    std::fs::remove_file(std::path::Path::new(&dir).join(format!("{}.json", session.session_id)))
+        .unwrap();
+    monitor::infer_status(&mut session, "user", "", false);
+    assert_eq!(
+        session.status,
+        SessionStatus::Processing,
+        "without the state file the heuristic still cannot know"
+    );
+}
+
+#[test]
 fn status_high_cpu_always_processing() {
     let mut s = make_session(50.0, 0);
     monitor::infer_status(&mut s, "", "", false);
