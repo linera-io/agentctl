@@ -2453,17 +2453,41 @@ notapid   1.0  1024 claude
             .spawn()
             .expect("spawn a process posing as claude");
         let pid = child.id();
-        let out = std::process::Command::new("bash")
-            .args(["-c", PROC_PROBE_SCRIPT, "--", &pid.to_string()])
-            .output()
-            .expect("run the probe script");
+
+        // Poll rather than probe once. `spawn` returns as soon as *bash* is
+        // running, and bash has yet to `exec`; during that window `ps` cannot
+        // read the new `/proc/<pid>/cmdline` and falls back to the bracketed
+        // `[sleep]` form, which the parser then drops as "not claude" —
+        // correctly, since that is exactly the recycled-pid case it exists to
+        // reject. The single immediate probe made this test a coin flip on a
+        // loaded runner: it failed 1 run in 12 locally and took CI down twice
+        // on a branch that never touched the probe.
+        //
+        // Waiting for the argv0 the test itself asked for is not a weakened
+        // assertion — the assertion IS that the script and parser agree on a
+        // process named `claude`, and until the exec lands there is no such
+        // process to agree about.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let (procs, last_stdout) = loop {
+            let out = std::process::Command::new("bash")
+                .args(["-c", PROC_PROBE_SCRIPT, "--", &pid.to_string()])
+                .output()
+                .expect("run the probe script");
+            let procs = parse_sandbox_procs(&String::from_utf8_lossy(&out.stdout));
+            if procs.contains_key(&pid) || std::time::Instant::now() >= deadline {
+                break (procs, out.stdout);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
         let _ = child.kill();
         let _ = child.wait();
 
-        let procs = parse_sandbox_procs(&String::from_utf8_lossy(&out.stdout));
-        let observed = procs
-            .get(&pid)
-            .unwrap_or_else(|| panic!("pid {pid} missing; probe said {:?}", out.stdout));
+        let observed = procs.get(&pid).unwrap_or_else(|| {
+            panic!(
+                "pid {pid} never appeared as `claude` within 10s; last probe said {:?}",
+                String::from_utf8_lossy(&last_stdout)
+            )
+        });
         assert!(
             observed.mem_mb > 0.0,
             "a running process has resident memory"
