@@ -101,33 +101,148 @@ pub fn do_refresh_io(prev_sessions: Vec<ClaudeSession>) -> RefreshIoOutput {
     }
 }
 
-/// Sessions from every origin that is not this one, read from the host-side
-/// snapshot.
+/// Sessions from every origin that is not this one.
 ///
-/// Excludes our own sandbox's slice: we discovered those natively a few lines
-/// above, live, and the snapshot's copy is as old as the last collector pass.
-/// De-dupes on `session_id` as a backstop so a mislabelled slice can't render
-/// the same session twice.
+/// Membership comes from the hook-written registry, not the collected
+/// snapshot. Both files sit on the host-shared mount, but they move at wildly
+/// different speeds: hooks write the registry as sessions start and stop,
+/// while the snapshot is rewritten only by the reaper's timer — 300 s apart by
+/// default, and measured at 311 s on a live host. Reading membership from the
+/// snapshot meant a session took up to five minutes to appear after it started
+/// and up to five more to disappear after it was closed, no matter how fast
+/// the TUI refreshed. Refreshing faster than the writer changes nothing, so
+/// the fix is to read the file that is already current.
+///
+/// The snapshot keeps exactly the job it is fast enough for: overlaying `cpu`
+/// and `mem_mb`, the only two facts about another VM's process that the host
+/// cannot compute for itself. Everything else on the row is either identity
+/// (the registry carries it) or transcript-derived (recomputed live from the
+/// shared `~/.claude` mount by the caller, immediately after this returns).
+///
+/// Excludes our own sandbox's slice — those were discovered natively above —
+/// and de-dupes on `session_id`, which now matters for more than mislabelling:
+/// one session id legitimately appears under two sandbox keys once a session
+/// has been resumed in a newer sandbox, and only one row should render.
 fn foreign_sessions(local: &[ClaudeSession]) -> Vec<ClaudeSession> {
     let here = crate::sandbox_registry::current_sandbox();
+    let registry = crate::sandbox_registry::load();
     let snapshot = crate::sandbox_registry::load_snapshot();
-    let seen: std::collections::HashSet<&str> = local
+    let running = running_sandbox_filter(&snapshot);
+    foreign_sessions_from(&registry, &snapshot, &running, here.as_deref(), local)
+}
+
+/// The pure half of [`foreign_sessions`], with every input passed in.
+///
+/// Split out so the selection rules can be tested against a constructed
+/// registry: the wrapper's three reads all resolve through process-global
+/// state (`HOME`, the `CLAUDECTL_*` overrides) and one of them shells out to
+/// `sbx`, none of which a test of "which rows render" should have to arrange.
+pub(crate) fn foreign_sessions_from(
+    registry: &crate::sandbox_registry::Registry,
+    snapshot: &crate::sandbox_registry::SandboxSnapshot,
+    running: &RunningFilter,
+    here: Option<&str>,
+    local: &[ClaudeSession],
+) -> Vec<ClaudeSession> {
+    let vitals = snapshot_vitals(snapshot);
+
+    let mut seen: std::collections::HashSet<String> = local
         .iter()
-        .map(|session| session.session_id.as_str())
+        .map(|session| session.session_id.clone())
         .collect();
 
-    snapshot
-        .sandboxes
-        .iter()
-        .filter(|(name, _)| here.as_deref() != Some(name.as_str()))
-        .flat_map(|(name, origin)| {
-            origin
-                .sessions
-                .iter()
-                .filter_map(move |value| ClaudeSession::from_snapshot_value(name, value))
-        })
-        .filter(|session| !seen.contains(session.session_id.as_str()))
-        .collect()
+    let mut out = Vec::new();
+    for (name, entries) in &registry.sandboxes {
+        if here == Some(name.as_str()) {
+            continue;
+        }
+        // A slice whose sandbox is gone is not stale data to be cleaned up —
+        // it is the payload `--restore-sbx-sessions` replays after `sbx rm`,
+        // frozen deliberately at its last live state because a removed sandbox
+        // fires no further hooks. It must survive on disk and simply not
+        // render, so the filter belongs here and never in the registry writer.
+        if !running.allows(name) {
+            continue;
+        }
+        for entry in entries {
+            let Some(mut session) = ClaudeSession::from_registry_entry(name, entry) else {
+                continue;
+            };
+            if !seen.insert(session.session_id.clone()) {
+                continue;
+            }
+            if let Some(vitals) = vitals.get(session.session_id.as_str()) {
+                session.cpu_percent = vitals.cpu_percent;
+                session.mem_mb = vitals.mem_mb;
+            }
+            out.push(session);
+        }
+    }
+    out
+}
+
+/// Which sandboxes may render, and on what authority.
+pub(crate) enum RunningFilter {
+    /// `sbx` answered: exactly these names are running. An empty set is a real
+    /// answer meaning "none", not a failure.
+    Known(std::collections::HashSet<String>),
+    /// `sbx` could not be asked — no binary on PATH, which is the ordinary
+    /// case for an in-sandbox claudectl, where the host bridges deliberately
+    /// keep `sbx` unreachable. Fall back to the collector's last observed
+    /// running set: staler, but it is the same question answered earlier.
+    Collected(std::collections::HashSet<String>),
+}
+
+impl RunningFilter {
+    fn allows(&self, name: &str) -> bool {
+        match self {
+            Self::Known(names) | Self::Collected(names) => names.contains(name),
+        }
+    }
+}
+
+fn running_sandbox_filter(snapshot: &crate::sandbox_registry::SandboxSnapshot) -> RunningFilter {
+    match crate::reaper::running_sandboxes() {
+        Some(names) => RunningFilter::Known(names.into_iter().collect()),
+        None => RunningFilter::Collected(snapshot.sandboxes.keys().cloned().collect()),
+    }
+}
+
+/// The per-VM measurements the host cannot take itself.
+pub(crate) struct SnapshotVitals {
+    pub cpu_percent: f32,
+    pub mem_mb: f64,
+}
+
+/// Index the snapshot's collected rows by session id so a registry-built row
+/// can pick up its CPU and memory. Rows the collector has not seen yet simply
+/// find nothing and keep `from_raw`'s defaults — an unmeasured session renders
+/// with blank vitals rather than being withheld from the list entirely.
+pub(crate) fn snapshot_vitals(
+    snapshot: &crate::sandbox_registry::SandboxSnapshot,
+) -> std::collections::HashMap<String, SnapshotVitals> {
+    let mut out = std::collections::HashMap::new();
+    for origin in snapshot.sandboxes.values() {
+        for value in &origin.sessions {
+            let Some(id) = value.get("session_id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            out.insert(
+                id.to_string(),
+                SnapshotVitals {
+                    cpu_percent: value
+                        .get("cpu")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0) as f32,
+                    mem_mb: value
+                        .get("mem_mb")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0),
+                },
+            );
+        }
+    }
+    out
 }
 
 /// Refresh-driven application state. Owned exclusively by `App.data` and
@@ -2690,6 +2805,242 @@ impl App {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         result
+    }
+}
+
+#[cfg(test)]
+mod foreign_session_tests {
+    use super::*;
+    use crate::sandbox_registry::{Registry, SandboxOrigin, SandboxSnapshot, SessionEntry};
+
+    fn entry(session_id: &str, name: &str, pid: u32) -> SessionEntry {
+        SessionEntry {
+            session_id: session_id.to_string(),
+            cwd: "/Users/ndr/repos/linera-infra".to_string(),
+            transcript: String::new(),
+            started_at_ms: 1_700_000_000_000,
+            name: Some(name.to_string()),
+            pid: Some(pid),
+            owner_pid: None,
+            owner_started_at: None,
+        }
+    }
+
+    fn registry_of(slices: &[(&str, Vec<SessionEntry>)]) -> Registry {
+        let mut registry = Registry::default();
+        for (name, entries) in slices {
+            registry
+                .sandboxes
+                .insert((*name).to_string(), entries.clone());
+        }
+        registry
+    }
+
+    fn running(names: &[&str]) -> RunningFilter {
+        RunningFilter::Known(names.iter().map(|n| (*n).to_string()).collect())
+    }
+
+    fn ids(sessions: &[ClaudeSession]) -> Vec<&str> {
+        sessions.iter().map(|s| s.session_id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_session_renders_from_the_registry_alone() {
+        // The reported bug's second half: a session started in a sandbox the
+        // collector has not yet visited never appeared at all, because the
+        // snapshot was the only membership source and it is rewritten by a
+        // 300 s timer. An empty snapshot must not hide a live session.
+        let registry = registry_of(&[("linera-agent-5e85", vec![entry("250a74d3", "new", 386)])]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-5e85"]),
+            None,
+            &[],
+        );
+        assert_eq!(ids(&rows), ["250a74d3"]);
+        assert_eq!(rows[0].display_name(), "new");
+    }
+
+    #[test]
+    fn a_removed_sandboxs_slice_is_not_rendered_but_is_not_required_to_be_gone() {
+        // `sbx rm` fires no hooks, so the slice freezes at its last live state
+        // — deliberately, because that frozen copy is what
+        // `--restore-sbx-sessions` replays. It must stay on disk and simply
+        // not render, which is why the filter lives here and not in the writer.
+        let registry = registry_of(&[
+            ("linera-agent-dead", vec![entry("f5bb6dba", "reaped", 9302)]),
+            ("linera-agent-live", vec![entry("250a74d3", "current", 386)]),
+        ]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+        );
+        assert_eq!(ids(&rows), ["250a74d3"]);
+        assert_eq!(
+            registry.sandboxes["linera-agent-dead"].len(),
+            1,
+            "the restore payload must survive being filtered out of the view"
+        );
+    }
+
+    #[test]
+    fn negative_control_the_same_slice_renders_once_its_sandbox_is_running() {
+        // Proves the test above filters on liveness rather than passing for
+        // some unrelated reason: same registry, same row, sandbox now running.
+        let registry =
+            registry_of(&[("linera-agent-dead", vec![entry("f5bb6dba", "reaped", 9302)])]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-dead"]),
+            None,
+            &[],
+        );
+        assert_eq!(ids(&rows), ["f5bb6dba"]);
+    }
+
+    #[test]
+    fn our_own_slice_is_left_to_native_discovery() {
+        let registry = registry_of(&[
+            ("linera-agent-here", vec![entry("local-1", "mine", 1)]),
+            ("linera-agent-other", vec![entry("remote-1", "theirs", 2)]),
+        ]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-here", "linera-agent-other"]),
+            Some("linera-agent-here"),
+            &[],
+        );
+        assert_eq!(ids(&rows), ["remote-1"]);
+    }
+
+    #[test]
+    fn a_session_resumed_in_a_newer_sandbox_renders_once() {
+        // One id legitimately sits in two slices once a session has moved to a
+        // rolled sandbox, and both can be running at the same time while the
+        // older one drains.
+        let registry = registry_of(&[
+            ("linera-agent-new", vec![entry("a02a0bcd", "moved", 8234)]),
+            ("linera-agent-old", vec![entry("a02a0bcd", "moved", 5181)]),
+        ]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-new", "linera-agent-old"]),
+            None,
+            &[],
+        );
+        assert_eq!(ids(&rows), ["a02a0bcd"]);
+    }
+
+    #[test]
+    fn a_locally_discovered_session_is_not_duplicated() {
+        let registry = registry_of(&[("linera-agent-live", vec![entry("dup-1", "seen", 7)])]);
+        let mut local = ClaudeSession::from_raw(crate::session::RawSession {
+            pid: 7,
+            session_id: "dup-1".into(),
+            cwd: "/tmp".into(),
+            started_at: 0,
+            name: None,
+            name_source: None,
+        });
+        local.project_name = "tmp".into();
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-live"]),
+            None,
+            std::slice::from_ref(&local),
+        );
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn vitals_are_overlaid_from_the_snapshot_when_it_has_them() {
+        let registry = registry_of(&[("linera-agent-live", vec![entry("abc-123", "row", 11036)])]);
+        let mut snapshot = SandboxSnapshot::default();
+        snapshot.sandboxes.insert(
+            "linera-agent-live".to_string(),
+            SandboxOrigin {
+                is_current: true,
+                sessions: vec![serde_json::json!({
+                    "session_id": "abc-123",
+                    "cpu": 7.5,
+                    "mem_mb": 256.0,
+                })],
+            },
+        );
+        let rows = foreign_sessions_from(
+            &registry,
+            &snapshot,
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+        );
+        assert_eq!(rows[0].cpu_percent, 7.5);
+        assert_eq!(rows[0].mem_mb, 256.0);
+    }
+
+    #[test]
+    fn a_session_the_collector_has_not_measured_yet_still_renders() {
+        // The whole point of the split: missing vitals cost a row its CPU and
+        // MEM cells, never its place in the list.
+        let registry =
+            registry_of(&[("linera-agent-live", vec![entry("fresh-1", "brand-new", 42)])]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+        );
+        assert_eq!(ids(&rows), ["fresh-1"]);
+        assert_eq!(rows[0].cpu_percent, 0.0);
+        assert_eq!(rows[0].mem_mb, 0.0);
+    }
+
+    #[test]
+    fn without_sbx_the_collectors_last_running_set_is_used() {
+        // In-sandbox claudectl cannot run `sbx` at all — the host bridges are
+        // closed allowlists. Falling back to the collector's observed set keeps
+        // the view working there; treating "cannot ask" as "nothing running"
+        // would blank it entirely.
+        let registry = registry_of(&[
+            ("linera-agent-live", vec![entry("seen-1", "known", 1)]),
+            ("linera-agent-dead", vec![entry("gone-1", "reaped", 2)]),
+        ]);
+        let mut snapshot = SandboxSnapshot::default();
+        snapshot.sandboxes.insert(
+            "linera-agent-live".to_string(),
+            SandboxOrigin {
+                is_current: true,
+                sessions: vec![],
+            },
+        );
+        let rows = foreign_sessions_from(
+            &registry,
+            &snapshot,
+            &running_sandbox_filter_for_test(None, &snapshot),
+            None,
+            &[],
+        );
+        assert_eq!(ids(&rows), ["seen-1"]);
+    }
+
+    /// `running_sandbox_filter` with the `sbx` call's result injected.
+    fn running_sandbox_filter_for_test(
+        sbx_said: Option<Vec<String>>,
+        snapshot: &SandboxSnapshot,
+    ) -> RunningFilter {
+        match sbx_said {
+            Some(names) => RunningFilter::Known(names.into_iter().collect()),
+            None => RunningFilter::Collected(snapshot.sandboxes.keys().cloned().collect()),
+        }
     }
 }
 
