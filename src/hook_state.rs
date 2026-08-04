@@ -8,8 +8,14 @@
 //! those events to a per-session JSON file, `infer_status` can return a
 //! deterministic answer instead of guessing from CPU + JSONL tail.
 //!
-//! State files live at `~/.claudectl/state/<session_id>.json`. The file is
-//! tiny (a few hundred bytes) and rewritten atomically on each hook event.
+//! State files live at `~/.local/share/claudectl/state/<session_id>.json`. The
+//! file is tiny (a few hundred bytes) and rewritten atomically on each hook
+//! event.
+//!
+//! That directory is deliberately the host-shared one, not `~/.claudectl`
+//! where these files used to live: inside an agent-sandbox the old path
+//! resolved into the VM's private overlay, so the laptop claudectl that
+//! renders a sandbox session could never read its state. See [`state_dir`].
 
 use std::fs;
 use std::io::{self, Read};
@@ -63,22 +69,115 @@ pub struct HookState {
     pub current_tool_name: Option<String>,
 }
 
-/// Returns the directory holding per-session state files. Creates it if needed.
+/// Returns the directory holding per-session state files.
 ///
-/// Honors the `CLAUDECTL_STATE_DIR` env var when set — used by tests to avoid
-/// stomping on the real `~/.claudectl/state` directory.
+/// `~/.local/share/claudectl/state`, alongside the session registries, and
+/// **not** `~/.claudectl/state` where this used to live. The old path is
+/// private to whichever machine wrote it: inside an agent-sandbox it resolves
+/// into the VM's own overlay, so a session's hook state was invisible to the
+/// laptop claudectl that renders it. `infer_status` therefore never found a
+/// state file for any sandbox session, always fell through to the heuristic —
+/// which by design never produces `NeedsInput` — and reported every session
+/// blocked on a permission prompt as `Processing`. The new path is a
+/// host-shared mount, which is what makes the deterministic status usable at
+/// all from outside the VM.
+///
+/// Measured on 2026-08-04: `~/.claudectl` reported the same `st_dev` as `/etc`
+/// and `/root` (the sandbox overlay), while `~/.local/share/claudectl`,
+/// `~/.claude` and `~/repos` each had their own — the three host-shared binds.
+///
+/// Honors `CLAUDECTL_STATE_DIR` when set, for tests.
 pub fn state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("CLAUDECTL_STATE_DIR") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var_os("HOME")
+    shared_state_dir()
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".claudectl/state")
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+fn shared_state_dir() -> PathBuf {
+    home_dir().join(".local/share/claudectl/state")
+}
+
+/// Where state files lived before they had to be readable from another machine.
+fn legacy_state_dir() -> PathBuf {
+    home_dir().join(".claudectl/state")
+}
+
+/// Carry any state left in [`legacy_state_dir`] over to the shared directory,
+/// once per process.
+///
+/// Without this, upgrading mid-session silently resets every live session's
+/// deterministic state: the next `infer_status` finds no file, falls back to
+/// the heuristic, and a session sitting on a permission prompt reads as
+/// `Processing` until its next hook fires — exactly the bug being fixed,
+/// reintroduced for one turn on every session at once.
+///
+/// **Never overwrites.** Each sandbox migrates its own legacy directory into
+/// one shared destination, and a session resumed in a newer sandbox has state
+/// in both. The shared copy is the one a live writer is maintaining; a legacy
+/// file is by definition from before this upgrade, so it must not clobber it.
+///
+/// Best-effort throughout: a failure here costs one turn of heuristic status,
+/// which is strictly better than failing the hook that called us.
+fn migrate_legacy_state(from: &std::path::Path, to: &std::path::Path) -> io::Result<usize> {
+    if !from.is_dir() || from == to {
+        return Ok(0);
+    }
+    fs::create_dir_all(to)?;
+    let mut moved = 0;
+    for entry in fs::read_dir(from)?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let destination = to.join(name);
+        if destination.exists() {
+            // A live writer already owns this session here. Drop the stale
+            // copy rather than leaving it to be re-migrated on every run.
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        // Rename first (atomic, same filesystem); fall back to copy for the
+        // cross-device case, which is the norm here — the legacy directory is
+        // on the sandbox overlay and the destination is a virtiofs bind.
+        if fs::rename(&path, &destination).is_err() {
+            fs::copy(&path, &destination)?;
+            let _ = fs::remove_file(&path);
+        }
+        moved += 1;
+    }
+    Ok(moved)
+}
+
+/// Run [`migrate_legacy_state`] at most once per process.
+///
+/// Called from `state_path` rather than `state_dir` so it covers both readers
+/// and writers, and cheap enough to sit on that path: after the first call it
+/// is one relaxed atomic load.
+fn migrate_legacy_state_once() {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| {
+        if std::env::var_os("CLAUDECTL_STATE_DIR").is_some() {
+            // A test (or an operator) has pinned the directory explicitly;
+            // moving real state into it would be a surprise.
+            return;
+        }
+        let _ = migrate_legacy_state(&legacy_state_dir(), &shared_state_dir());
+    });
 }
 
 /// Path to one session's state file.
 fn state_path(session_id: &str) -> PathBuf {
+    migrate_legacy_state_once();
     state_dir().join(format!("{session_id}.json"))
 }
 
@@ -589,6 +688,143 @@ mod tests {
             session_id: session_id.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn state_lives_on_the_shared_mount_not_the_sandbox_private_one() {
+        // The whole point of the move. `~/.claudectl` is the sandbox's own
+        // overlay — a state file written there is invisible to the laptop
+        // claudectl that renders the session, which is why every sandbox
+        // session blocked on a permission prompt reported `Processing`.
+        // `~/.local/share/claudectl` is a host-shared bind, the same one the
+        // session registries already cross the VM boundary through.
+        let home = std::path::Path::new("/Users/ndr");
+        assert_eq!(
+            home.join(".local/share/claudectl/state"),
+            home.join(".local/share/claudectl").join("state"),
+        );
+        // Asserted against the real resolver, with HOME pinned.
+        let _guard = crate::sandbox_registry::tests::env_guard();
+        let saved = std::env::var_os("HOME");
+        let saved_override = std::env::var_os("CLAUDECTL_STATE_DIR");
+        // SAFETY: env access is serialized by the held `ENV_LOCK`.
+        unsafe {
+            std::env::remove_var("CLAUDECTL_STATE_DIR");
+            std::env::set_var("HOME", home);
+        }
+        let resolved = state_dir();
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            if let Some(value) = saved_override {
+                std::env::set_var("CLAUDECTL_STATE_DIR", value);
+            }
+        }
+        assert_eq!(resolved, home.join(".local/share/claudectl/state"));
+        assert!(
+            !resolved.starts_with(home.join(".claudectl")),
+            "must not resolve back into the sandbox-private directory"
+        );
+    }
+
+    #[test]
+    fn a_permission_prompt_recorded_by_another_machine_reads_as_needs_input() {
+        // End to end across the boundary, in the shape that was broken: a
+        // sandbox's hook writes the state file, and a *different* process
+        // reads it back off the shared directory and infers status. Nothing
+        // here is sandbox-aware — the file is keyed by session id, which is
+        // globally unique, so "written elsewhere" and "written here" are the
+        // same code path once the directory is shared.
+        let dir = tempfile::tempdir().unwrap();
+        let written = HookState {
+            session_id: "cf54da79-2d23-4231-81fd-ce2a441e6e39".into(),
+            last_notification_ts_ms: now_ms().saturating_sub(5_000),
+            notification_kind: Some("permission_prompt".into()),
+            // A tool ran before the prompt opened, as it does in the real
+            // sequence: PreToolUse -> Notification -> (blocked).
+            last_pretooluse_ts_ms: now_ms().saturating_sub(9_000),
+            last_posttooluse_ts_ms: now_ms().saturating_sub(8_000),
+            ..Default::default()
+        };
+        let path = dir.path().join(format!("{}.json", written.session_id));
+        std::fs::write(&path, serde_json::to_string(&written).unwrap()).unwrap();
+
+        let reloaded: HookState =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            is_at_permission_prompt(&reloaded),
+            "a prompt recorded by another machine must survive the round trip"
+        );
+        // `is_responding` is *also* true here, and that is correct: a session
+        // blocked on a prompt is mid-turn. `NeedsInput` wins on precedence,
+        // not because the turn looks finished — see `status_from_hook_state`.
+        assert!(is_responding(&reloaded));
+    }
+
+    #[test]
+    fn migration_moves_legacy_state_to_the_shared_directory() {
+        let legacy = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        std::fs::write(
+            legacy.path().join("sid-1.json"),
+            r#"{"session_id":"sid-1"}"#,
+        )
+        .unwrap();
+        std::fs::write(legacy.path().join("notes.txt"), "ignored").unwrap();
+
+        let moved = migrate_legacy_state(legacy.path(), shared.path()).unwrap();
+
+        assert_eq!(moved, 1);
+        assert!(shared.path().join("sid-1.json").exists());
+        assert!(!legacy.path().join("sid-1.json").exists());
+        assert!(
+            legacy.path().join("notes.txt").exists(),
+            "only .json state files are claimed"
+        );
+    }
+
+    #[test]
+    fn migration_never_overwrites_state_a_live_writer_owns() {
+        // Each sandbox migrates its own legacy directory into one shared
+        // destination, and a session resumed in a newer sandbox has a file in
+        // both. The shared copy is the live one; a legacy file predates the
+        // upgrade by construction and must lose.
+        let legacy = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        std::fs::write(
+            legacy.path().join("sid-1.json"),
+            r#"{"session_id":"stale"}"#,
+        )
+        .unwrap();
+        std::fs::write(shared.path().join("sid-1.json"), r#"{"session_id":"live"}"#).unwrap();
+
+        let moved = migrate_legacy_state(legacy.path(), shared.path()).unwrap();
+
+        assert_eq!(moved, 0);
+        assert!(
+            std::fs::read_to_string(shared.path().join("sid-1.json"))
+                .unwrap()
+                .contains("live"),
+            "the live writer's state must survive"
+        );
+        assert!(
+            !legacy.path().join("sid-1.json").exists(),
+            "the stale copy is dropped so it is not re-migrated forever"
+        );
+    }
+
+    #[test]
+    fn migration_is_a_no_op_without_a_legacy_directory() {
+        let shared = tempfile::tempdir().unwrap();
+        let absent = shared.path().join("does-not-exist");
+        assert_eq!(migrate_legacy_state(&absent, shared.path()).unwrap(), 0);
+        // And self-migration cannot loop or delete anything.
+        assert_eq!(
+            migrate_legacy_state(shared.path(), shared.path()).unwrap(),
+            0
+        );
     }
 
     #[test]

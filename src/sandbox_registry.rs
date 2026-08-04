@@ -679,8 +679,9 @@ pub(crate) mod tests {
 
         /// Like [`TempRegistry::new`], but also points `HOME` at the temp dir,
         /// so code that derives paths from it — `discovery::live_sessions`
-        /// reading `~/.claude/sessions`, hook state under `~/.claudectl` —
-        /// sees an isolated, empty view instead of the real machine's.
+        /// reading `~/.claude/sessions`, hook state under
+        /// `~/.local/share/claudectl/state` — sees an isolated, empty view
+        /// instead of the real machine's.
         pub(crate) fn with_home(tag: &str) -> Self {
             let mut fixture = Self::new(tag);
             fixture.saved_home = Some(std::env::var_os("HOME"));
