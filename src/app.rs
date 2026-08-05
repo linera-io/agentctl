@@ -2936,6 +2936,7 @@ mod foreign_session_tests {
             pid: Some(pid),
             owner_pid: None,
             owner_started_at: None,
+            ..Default::default()
         }
     }
 

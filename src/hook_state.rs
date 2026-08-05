@@ -338,6 +338,18 @@ pub fn record_live_sessions(check: &crate::terminal_owner::OwnerCheck) -> io::Re
                 .to_string_lossy()
                 .into_owned();
             let name = (!session.session_name.is_empty()).then_some(session.session_name);
+            // Carry the host-side routing keys for sandbox sessions. Only the
+            // sandbox can read them (they come from its own per-pid sidecar),
+            // and only the host can use them — so if this writer drops them,
+            // nothing downstream can reconstruct them, and Tab on the row is
+            // left guessing from a container pid and a container cwd.
+            let (host_terminal_id, host_tty) = match sandbox {
+                Some(_) => crate::process::host_terminal_routing(session.pid),
+                // On the host these describe *this* machine already and are
+                // rediscovered every tick; persisting them would just add a
+                // second, staler copy.
+                None => (None, None),
+            };
             crate::sandbox_registry::SessionEntry {
                 session_id: session.session_id,
                 cwd: session.cwd,
@@ -347,6 +359,8 @@ pub fn record_live_sessions(check: &crate::terminal_owner::OwnerCheck) -> io::Re
                 pid: Some(session.pid),
                 owner_pid: owner.as_ref().map(|owner| owner.pid),
                 owner_started_at: owner.map(|owner| owner.started_at),
+                host_terminal_id,
+                host_tty,
             }
         })
         .collect();
@@ -983,6 +997,7 @@ mod tests {
             pid: Some(std::process::id()),
             owner_pid: Some(2_000_000_000),
             owner_started_at: Some("long-gone".to_string()),
+            ..Default::default()
         };
         let check = crate::terminal_owner::OwnerCheck::lazy();
         let resolved = resolve_owner(
@@ -1044,6 +1059,7 @@ mod tests {
             pid: Some(std::process::id()),
             owner_pid: None,
             owner_started_at: None,
+            ..Default::default()
         };
         crate::sandbox_registry::update_local(|_| vec![seed("closed"), seed("kept")]).unwrap();
 

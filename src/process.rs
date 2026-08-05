@@ -325,6 +325,23 @@ fn read_terminal_sidecar(pid: u32) -> Option<TerminalSidecar> {
     first_sidecar_in(&sidecar_candidate_dirs(), pid)
 }
 
+/// The HOST-side `(terminal_id, tty)` for a session running in this sandbox,
+/// straight from its sidecar (falling back to the process environment the
+/// sidecar was written from).
+///
+/// Deliberately re-probes rather than reading `ClaudeSession::tty`: that field
+/// holds the host tty only when the sidecar probe happened to succeed, and the
+/// container tty from `ps` otherwise. The two are indistinguishable after the
+/// fact, so inferring from it would sometimes persist a *container* tty into
+/// the registry labelled as a host one — a wrong routing key is worse than an
+/// absent one, because the absent one still falls back to the cwd/title chain.
+pub fn host_terminal_routing(pid: u32) -> (Option<String>, Option<String>) {
+    match read_terminal_sidecar(pid).or_else(|| sidecar_from_proc_env(pid)) {
+        Some(sidecar) => (sidecar.terminal_id, sidecar.host_tty),
+        None => (None, None),
+    }
+}
+
 /// Sidecar search path, most authoritative first. The sandbox dir honors the
 /// same `CLAUDECTL_SANDBOX_SESSIONS_DIR` override as the reaper — with one
 /// caveat: the reaper interpolates the value into a bash script (where `~`

@@ -94,7 +94,7 @@ fn find_terminal_script(session: &ClaudeSession) -> String {
                 set matches to every terminal whose working directory contains "{cwd}"
             end if
             if (count of matches) = 0 then error "No Ghostty terminal found for {cwd}"
-            set t to item 1 of matches
+            set t to missing value
 "#
     ));
     if !session_name.is_empty() {
@@ -112,6 +112,26 @@ fn find_terminal_script(session: &ClaudeSession) -> String {
 "#
         ));
     }
+    // Refuse to guess between equally-good candidates.
+    //
+    // This used to be an unconditional `set t to item 1 of matches`, which for
+    // a session with no surface id and no tty meant "focus whichever surface
+    // Ghostty happens to list first among every window sitting in $HOME". An
+    // UNNAMED sandbox session hit that path every time — the title loop above
+    // is skipped entirely when the name is empty, so nothing ever narrowed the
+    // list and Tab appeared to do nothing (it focused an arbitrary tab).
+    //
+    // Guessing is not merely unhelpful here: this same matcher backs
+    // `send_input` and `approve`, so a wrong pick TYPES INTO an unrelated
+    // session. One candidate is still resolved silently; a genuine tie now
+    // fails loudly with something the user can act on.
+    find.push_str(
+        r#"            if t is missing value then
+                if (count of matches) > 1 then error "claudectl: " & ((count of matches) as text) & " Ghostty surfaces match this session equally and none could be told apart by title, so it was not focused rather than risk acting on the wrong one. A sandbox session needs its host surface id, which is recorded at launch — restart the session under a current agent-sandbox to get one."
+                set t to item 1 of matches
+            end if
+"#,
+    );
     find
 }
 
@@ -431,5 +451,55 @@ mod tests {
         let has_trailing = text.ends_with('\n') || text.ends_with('\r');
         assert_eq!(trimmed, "some text");
         assert!(!has_trailing);
+    }
+
+    /// An unnamed session with no surface id and no tty is the shape that made
+    /// Tab silently focus an arbitrary tab: the title loop is skipped when the
+    /// name is empty, so nothing narrowed the `$HOME` cwd match and the script
+    /// took `item 1 of matches`.
+    #[test]
+    fn find_script_refuses_to_pick_between_equal_candidates_for_an_unnamed_session() {
+        let session = routed_session(None, "", "/Users/ndr", "");
+        let script = find_terminal_script(&session);
+
+        assert!(
+            !script.contains("name of candidate contains"),
+            "no title disambiguator exists for an unnamed session: {script}"
+        );
+        assert!(
+            script.contains("if (count of matches) > 1 then error"),
+            "a tie must fail loudly rather than focus an arbitrary surface: {script}"
+        );
+        // `item 1` survives, but only inside the single-candidate branch.
+        let guard = script
+            .find("if t is missing value then")
+            .expect("guard block present");
+        assert!(
+            script[guard..].contains("set t to item 1 of matches"),
+            "one unambiguous candidate must still resolve silently"
+        );
+        assert!(
+            !script[..guard].contains("set t to item 1 of matches"),
+            "nothing may take item 1 before the ambiguity check: {script}"
+        );
+    }
+
+    /// A sandbox session that reached the host WITH its surface id skips the
+    /// whole guessing chain — which is the point of carrying it through the
+    /// registry.
+    #[test]
+    fn find_script_uses_the_surface_id_carried_from_the_sandbox() {
+        let session = routed_session(
+            Some("8161D3F2-17C1-40CA-814F-4D714DB8F7BC"),
+            "",
+            "/Users/ndr",
+            "",
+        );
+        let script = find_terminal_script(&session);
+        assert!(script.contains(r#"whose id is "8161D3F2-17C1-40CA-814F-4D714DB8F7BC""#));
+        assert!(
+            !script.contains("working directory"),
+            "a surface id must not fall through to cwd guessing: {script}"
+        );
     }
 }

@@ -1644,6 +1644,7 @@ mod tests {
                 pid: Some(std::process::id()),
                 owner_pid: Some(live_owner.pid),
                 owner_started_at: Some(live_owner.started_at.clone()),
+                ..Default::default()
             },
             // Departed, owner (this test's terminal) still alive → hand-closed → pruned.
             crate::sandbox_registry::SessionEntry {
@@ -1655,6 +1656,7 @@ mod tests {
                 pid: Some(4_000_000),
                 owner_pid: Some(live_owner.pid),
                 owner_started_at: Some(live_owner.started_at),
+                ..Default::default()
             },
             // Departed, owner gone (impossible pid) → died with its terminal → kept.
             crate::sandbox_registry::SessionEntry {
@@ -1666,6 +1668,7 @@ mod tests {
                 pid: Some(4_000_001),
                 owner_pid: Some(4_000_002),
                 owner_started_at: Some("some-dead-terminal".into()),
+                ..Default::default()
             },
         ]);
 
@@ -1698,6 +1701,7 @@ mod tests {
             pid: Some(4_000_000),
             owner_pid: Some(live_owner.pid),
             owner_started_at: Some(live_owner.started_at),
+            ..Default::default()
         }]);
 
         prune_closed_sessions_after(Duration::ZERO);
@@ -1733,6 +1737,7 @@ mod tests {
             pid: Some(4_000_000),
             owner_pid: Some(live_owner.pid),
             owner_started_at: Some(live_owner.started_at),
+            ..Default::default()
         }]);
 
         prune_closed_sessions_after(Duration::ZERO);
@@ -1774,6 +1779,7 @@ mod tests {
             pid: Some(std::process::id()),
             owner_pid: Some(live_owner.pid),
             owner_started_at: Some(live_owner.started_at),
+            ..Default::default()
         }]);
 
         prune_closed_sessions_after(Duration::ZERO);
@@ -2277,6 +2283,7 @@ mod tests {
             pid: Some(pid),
             owner_pid: None,
             owner_started_at: None,
+            ..Default::default()
         }
     }
 
