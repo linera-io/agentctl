@@ -924,6 +924,68 @@ fn scan_host_open_ttys() -> io::Result<HashSet<String>> {
     Ok(extract_open_ttys(&text, &sandbox_name()))
 }
 
+/// How long a host `ps` sweep is reused. The render path asks once per refresh
+/// (default every 2 s); a terminal closing is a human-scale event, so a couple
+/// of seconds of staleness is invisible and one `ps` per tick is avoided.
+const OPEN_TTY_TTL: Duration = Duration::from_secs(2);
+
+#[expect(clippy::type_complexity, reason = "one private cache cell, not an API")]
+static OPEN_TTY_CACHE: OnceLock<Mutex<Option<(Instant, Option<String>)>>> = OnceLock::new();
+
+/// Raw host `ps` output, cached for [`OPEN_TTY_TTL`], or `None` if `ps` failed.
+fn cached_host_ps() -> Option<String> {
+    let cell = OPEN_TTY_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = match cell.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some((taken_at, cached)) = guard.as_ref() {
+        if taken_at.elapsed() < OPEN_TTY_TTL {
+            return cached.clone();
+        }
+    }
+    let fresh = Command::new("ps")
+        .args(["-ax", "-o", "pid,command"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
+    *guard = Some((Instant::now(), fresh.clone()));
+    fresh
+}
+
+/// Host-visible terminals still attached to `sandbox`, or `None` when the host
+/// cannot answer.
+///
+/// This is the liveness signal the host owns. Every `sc` session is launched by
+/// an `sbx exec` that carries `SANDBOX_HOST_TTY=` in its argv, so when the
+/// engineer closes that terminal window the process disappears from the host
+/// process table **immediately** — no hook, no in-sandbox writer, no image
+/// refresh required.
+///
+/// That last part is the point. The registry's departure stamp is written by
+/// `claudectl-hook` *inside* the sandbox, which ships in the sandbox image, so
+/// it only starts working once that image rolls. This path works against any
+/// image, including one built before the stamp existed.
+///
+/// `None` means "could not ask" (no `ps`, or it failed) and callers must treat
+/// it as "no opinion", never as "nothing is alive".
+///
+/// Takes every sandbox at once because it is one `ps` sweep either way, and
+/// because the render path needs the whole map before it starts iterating —
+/// which is what keeps the selection logic itself free of process calls.
+pub(crate) fn open_host_ttys_by_sandbox(
+    sandboxes: &[String],
+) -> Option<HashMap<String, HashSet<String>>> {
+    let ps = cached_host_ps()?;
+    Some(
+        sandboxes
+            .iter()
+            .map(|name| (name.clone(), extract_open_ttys(&ps, name)))
+            .collect(),
+    )
+}
+
 /// Pure parser: takes `ps -ax -o pid,command` output, returns the set of
 /// `SANDBOX_HOST_TTY` values from `sbx exec ... <sandbox>` lines.
 fn extract_open_ttys(ps_output: &str, sandbox: &str) -> HashSet<String> {
