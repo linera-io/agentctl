@@ -361,6 +361,10 @@ pub fn record_live_sessions(check: &crate::terminal_owner::OwnerCheck) -> io::Re
                 owner_started_at: owner.map(|owner| owner.started_at),
                 host_terminal_id,
                 host_tty,
+                // Seeing a session live is what un-departs it: `--resume`
+                // reuses the id, so a stamp left from the previous run would
+                // hide the resumed session indefinitely.
+                departed_at_ms: None,
             }
         })
         .collect();
@@ -428,6 +432,21 @@ fn is_deliberate_user_close(reason: &str) -> bool {
     matches!(reason, "prompt_input_exit" | "logout")
 }
 
+/// Whether a `SessionEnd` reason means the session is actually gone.
+///
+/// All of them except `clear`, which fires `SessionEnd` without ending
+/// anything — the process carries straight on. Stamping that one as departed
+/// would hide a live session from the dashboard until its next hook, which is
+/// the exact failure this stamping exists to fix, only mirrored.
+///
+/// An unrecognised or absent reason counts as ended: `SessionEnd` fired, and a
+/// row wrongly hidden for one hook is a far smaller error than a dead row that
+/// lingers for minutes. `clear` is named explicitly, so a future reason that
+/// also doesn't end the session has to be added here deliberately.
+fn ends_the_session(reason: &str) -> bool {
+    reason != "clear"
+}
+
 /// Apply a Claude Code hook payload to the per-session state file.
 ///
 /// Unknown event names are ignored (best-effort — Claude Code may add new
@@ -465,6 +484,11 @@ pub fn record_hook_event(payload: &serde_json::Value) -> io::Result<()> {
         let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
         if is_deliberate_user_close(reason) {
             let _ = crate::sandbox_registry::forget_session(&session_id);
+        } else if ends_the_session(reason) {
+            // Restore material: must stay on disk, but must stop rendering as
+            // live immediately rather than waiting for an unrelated session in
+            // the same sandbox to trigger a reconcile.
+            let _ = crate::sandbox_registry::mark_session_departed(&session_id, now_ms());
         }
         return HookState::remove(&session_id);
     }
@@ -1083,6 +1107,94 @@ mod tests {
             ids,
             vec!["kept".to_string()],
             "'closed' forgotten on prompt_input_exit; 'kept' left by reason 'other'"
+        );
+
+        // ...and 'kept' is now STAMPED, not merely present. Retention alone was
+        // ambiguous: the dashboard read this file as the live set and could not
+        // tell restore material from a running session, so a closed terminal
+        // kept rendering until an unrelated hook forced a reconcile.
+        let kept = crate::sandbox_registry::load_local()
+            .sessions
+            .into_iter()
+            .find(|entry| entry.session_id == "kept")
+            .expect("restore material stays on disk");
+        assert!(
+            kept.departed_at_ms.is_some(),
+            "a terminal-teardown SessionEnd must stamp the entry so the view can skip it"
+        );
+    }
+
+    #[test]
+    fn clear_does_not_stamp_a_session_that_is_still_running() {
+        // `clear` fires SessionEnd without ending anything. Stamping it would
+        // hide a live session until its next hook — the same bug this stamping
+        // fixes, only mirrored.
+        let _fixture = crate::sandbox_registry::tests::TempRegistry::with_home("session-end-clear");
+        crate::sandbox_registry::update_local(|_| {
+            vec![crate::sandbox_registry::SessionEntry {
+                session_id: "alive".to_string(),
+                pid: Some(std::process::id()),
+                ..Default::default()
+            }]
+        })
+        .unwrap();
+
+        record_hook_event(
+            &json!({"hook_event_name": "SessionEnd", "session_id": "alive", "reason": "clear"}),
+        )
+        .unwrap();
+
+        let entry = crate::sandbox_registry::load_local()
+            .sessions
+            .into_iter()
+            .find(|entry| entry.session_id == "alive")
+            .expect("clear must not remove the entry either");
+        assert!(
+            entry.departed_at_ms.is_none(),
+            "`clear` does not end the session, so it must not be stamped"
+        );
+    }
+
+    #[test]
+    fn ends_the_session_covers_every_reason_the_binary_emits() {
+        // The six reasons Claude Code 2.1.221 actually emits, read out of the
+        // shipped binary. Only `clear` leaves the session running.
+        for reason in [
+            "other",
+            "host_exit",
+            "nonzero_exit",
+            "prompt_input_exit",
+            "logout",
+            "",
+        ] {
+            assert!(ends_the_session(reason), "{reason:?} ends the session");
+        }
+        assert!(!ends_the_session("clear"));
+    }
+
+    #[test]
+    fn a_duplicate_session_end_does_not_move_the_departure_clock() {
+        let _fixture = crate::sandbox_registry::tests::TempRegistry::with_home("session-end-dup");
+        crate::sandbox_registry::update_local(|_| {
+            vec![crate::sandbox_registry::SessionEntry {
+                session_id: "gone".to_string(),
+                ..Default::default()
+            }]
+        })
+        .unwrap();
+
+        crate::sandbox_registry::mark_session_departed("gone", 1_000).unwrap();
+        crate::sandbox_registry::mark_session_departed("gone", 9_999).unwrap();
+
+        let entry = crate::sandbox_registry::load_local()
+            .sessions
+            .into_iter()
+            .find(|entry| entry.session_id == "gone")
+            .expect("still on disk");
+        assert_eq!(
+            entry.departed_at_ms,
+            Some(1_000),
+            "the first SessionEnd is the departure; a redelivery must not reset it"
         );
     }
 

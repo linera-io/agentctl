@@ -131,6 +131,26 @@ pub struct SessionEntry {
     /// Terminal.app, tmux, WezTerm).
     #[serde(default)]
     pub host_tty: Option<String>,
+    /// When `SessionEnd` fired for this session, if it has.
+    ///
+    /// This file serves two consumers whose retention needs are opposites. The
+    /// dashboard wants the *live* set. `--restore-sbx-sessions` wants exactly
+    /// the sessions that died with their terminal, and deliberately keeps them
+    /// — `session_end_forgets_the_entry_only_on_a_deliberate_close` asserts an
+    /// entry closed by reason `other` is *kept*, because that is the restore
+    /// material.
+    ///
+    /// Before this field the two were indistinguishable, so once the renderer
+    /// started reading membership from here a closed terminal left its row on
+    /// screen until some *unrelated* session in the same sandbox happened to
+    /// fire a hook and trigger the wholesale reconcile — a minute or more, and
+    /// unbounded when the rest of the sandbox is idle.
+    ///
+    /// Marking instead of deleting keeps both consumers honest: the view skips
+    /// these, restore still finds them. Cleared when the id is seen live again,
+    /// so a `--resume` un-departs the session rather than stranding it hidden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub departed_at_ms: Option<u64>,
 }
 
 impl SessionEntry {
@@ -609,6 +629,48 @@ pub fn forget_session(session_id: &str) -> io::Result<()> {
     }
 }
 
+/// Stamp `session_id` as departed in the current scope, keeping the entry.
+///
+/// The counterpart to [`forget_session`], for the `SessionEnd` reasons that are
+/// *not* a deliberate user close. Those must stay on disk — a session whose
+/// terminal died is precisely what `--restore-sbx-sessions` brings back — but
+/// they must stop rendering as live the moment the hook fires, rather than
+/// waiting for an unrelated session in the same sandbox to trigger a reconcile.
+///
+/// Idempotent, and it does not overwrite an existing stamp: the first
+/// `SessionEnd` is the departure, and a duplicate delivery must not move the
+/// clock. A no-op when the id is absent.
+pub fn mark_session_departed(session_id: &str, at_ms: u64) -> io::Result<()> {
+    let stamp = |entries: &[SessionEntry]| -> Vec<SessionEntry> {
+        entries
+            .iter()
+            .map(|entry| {
+                if entry.session_id == session_id && entry.departed_at_ms.is_none() {
+                    SessionEntry {
+                        departed_at_ms: Some(at_ms),
+                        ..entry.clone()
+                    }
+                } else {
+                    entry.clone()
+                }
+            })
+            .collect()
+    };
+    match current_sandbox() {
+        Some(sandbox) => {
+            let slice = load().sandboxes.remove(&sandbox).unwrap_or_default();
+            // Nothing recorded for this sandbox yet ⇒ nothing to stamp. Writing
+            // an empty slice here would remove the key and, with it, any
+            // restore material a concurrent writer had just added.
+            if slice.is_empty() {
+                return Ok(());
+            }
+            replace_sandbox_slice(&sandbox, stamp(&slice))
+        }
+        None => update_local(|current| stamp(current)),
+    }
+}
+
 /// Pretty JSON with a trailing newline.
 fn serialize<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
@@ -673,6 +735,8 @@ pub(crate) mod tests {
         dir: std::path::PathBuf,
         /// `Some(previous)` when the test also pointed `HOME` at the temp dir.
         saved_home: Option<Option<std::ffi::OsString>>,
+        /// Previous `LINERA_SANDBOX`, restored on drop. See [`TempRegistry::new`].
+        saved_sandbox_marker: Option<std::ffi::OsString>,
         _lock: MutexGuard<'static, ()>,
     }
 
@@ -687,15 +751,30 @@ pub(crate) mod tests {
                 .join(format!("claudectl-reg-test-{}-{tag}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
+            // Pin the scope to the HOST by clearing the sandbox marker.
+            //
+            // `current_sandbox()` routes every registry write to either the
+            // local file or a sandbox slice, and these fixtures seed the local
+            // one. Left inherited, the same test asserts against a file the
+            // code never wrote — passing on CI and failing inside an
+            // agent-sandbox, where `LINERA_SANDBOX=1` is always set. That is
+            // what made `session_end_forgets_the_entry_only_on_a_deliberate_close`
+            // look like an unexplained environment flake for weeks; it was a
+            // scope mismatch, not flakiness. Tests that want sandbox scope set
+            // the variable themselves after constructing the fixture (see
+            // `reaper.rs`), and Drop restores whatever was here.
+            let saved_sandbox_marker = std::env::var_os(ENV_SANDBOX_MARKER);
             // SAFETY: env access here is serialized by the held `ENV_LOCK`.
             unsafe {
                 std::env::set_var("CLAUDECTL_SANDBOX_REGISTRY", dir.join("sandbox.json"));
                 std::env::set_var("CLAUDECTL_LOCAL_REGISTRY", dir.join("local.json"));
                 std::env::set_var("CLAUDECTL_SANDBOX_SNAPSHOT", dir.join("sandboxes.json"));
+                std::env::remove_var(ENV_SANDBOX_MARKER);
             }
             TempRegistry {
                 dir,
                 saved_home: None,
+                saved_sandbox_marker,
                 _lock: lock,
             }
         }
@@ -723,6 +802,10 @@ pub(crate) mod tests {
                 std::env::remove_var("CLAUDECTL_SANDBOX_REGISTRY");
                 std::env::remove_var("CLAUDECTL_LOCAL_REGISTRY");
                 std::env::remove_var("CLAUDECTL_SANDBOX_SNAPSHOT");
+                match self.saved_sandbox_marker.take() {
+                    Some(value) => std::env::set_var(ENV_SANDBOX_MARKER, value),
+                    None => std::env::remove_var(ENV_SANDBOX_MARKER),
+                }
                 if let Some(previous) = self.saved_home.take() {
                     match previous {
                         Some(home) => std::env::set_var("HOME", home),
@@ -1235,14 +1318,33 @@ pub(crate) mod tests {
         // what `--restore-sessions` reads seconds later.
         let end = serde_json::json!({"hook_event_name": "SessionEnd", "session_id": "aaa"});
         crate::hook_state::record_hook_event(&end).unwrap();
-        assert_eq!(load_local().sessions, vec![entry("aaa", "/work/a")]);
+        // Everything restore reads is intact. The entry additionally carries a
+        // departure stamp, which is what lets the dashboard stop rendering it
+        // immediately without deleting the restore material — the two used to
+        // be indistinguishable, so a dead row lingered until an unrelated hook
+        // forced a reconcile.
+        let stored = load_local().sessions;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            (
+                stored[0].session_id.as_str(),
+                stored[0].cwd.as_str(),
+                stored[0].transcript.as_str(),
+                stored[0].started_at_ms
+            ),
+            ("aaa", "/work/a", "/tmp/aaa.jsonl", 42),
+            "restore material must survive SessionEnd verbatim"
+        );
+        assert!(stored[0].departed_at_ms.is_some(), "and be marked departed");
 
         // Nor may any other hook event forget it. Hooks fire from one session
         // while another terminal may be mid-quit; a hook that pruned on a single
         // look could delete a quitting terminal's whole restore set.
         let stop = serde_json::json!({"hook_event_name": "Stop", "session_id": "aaa"});
         crate::hook_state::record_hook_event(&stop).unwrap();
-        assert_eq!(load_local().sessions, vec![entry("aaa", "/work/a")]);
+        let after_stop = load_local().sessions;
+        assert_eq!(after_stop.len(), 1);
+        assert_eq!(after_stop[0].session_id, "aaa");
     }
 
     #[test]
