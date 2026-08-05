@@ -52,6 +52,7 @@ fn visible_session_ids() -> Vec<String> {
         &[],
         NOW,
         INTERVAL,
+        None,
     )
     .into_iter()
     .map(|session| session.session_id)

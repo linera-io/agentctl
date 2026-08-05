@@ -128,6 +128,10 @@ fn foreign_sessions(local: &[ClaudeSession]) -> Vec<ClaudeSession> {
     let registry = crate::sandbox_registry::load();
     let snapshot = crate::sandbox_registry::load_snapshot();
     let running = running_sandbox_filter(&snapshot);
+    // One `ps` sweep for every sandbox we are about to consider, taken before
+    // the selection loop so the loop itself stays free of process calls.
+    let names: Vec<String> = registry.sandboxes.keys().cloned().collect();
+    let open_ttys = crate::reaper::open_host_ttys_by_sandbox(&names);
     foreign_sessions_from(
         &registry,
         &snapshot,
@@ -136,6 +140,7 @@ fn foreign_sessions(local: &[ClaudeSession]) -> Vec<ClaudeSession> {
         local,
         now_ms(),
         collector_interval(),
+        open_ttys.as_ref(),
     )
 }
 
@@ -146,6 +151,10 @@ fn foreign_sessions(local: &[ClaudeSession]) -> Vec<ClaudeSession> {
 /// (`HOME`, the `CLAUDECTL_*` overrides, the wall clock) and one of them shells
 /// out to `sbx`, none of which a test of "which rows render" should have to
 /// arrange.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is one ambient input this function exists to exclude"
+)]
 pub(crate) fn foreign_sessions_from(
     registry: &crate::sandbox_registry::Registry,
     snapshot: &crate::sandbox_registry::SandboxSnapshot,
@@ -154,6 +163,7 @@ pub(crate) fn foreign_sessions_from(
     local: &[ClaudeSession],
     now_ms: u64,
     collector_interval: std::time::Duration,
+    open_ttys: Option<&std::collections::HashMap<String, std::collections::HashSet<String>>>,
 ) -> Vec<ClaudeSession> {
     let vitals = snapshot_vitals_at(snapshot, now_ms, collector_interval);
 
@@ -175,6 +185,7 @@ pub(crate) fn foreign_sessions_from(
         if !running.allows(name) {
             continue;
         }
+        let open_ttys = open_ttys.and_then(|by_sandbox| by_sandbox.get(name.as_str()));
         for entry in entries {
             // A stamped entry is a session whose `SessionEnd` has fired. It
             // stays on disk as `--restore-sbx-sessions` material and stops
@@ -183,6 +194,9 @@ pub(crate) fn foreign_sessions_from(
             // until an unrelated session in the same sandbox happened to fire
             // a hook and trigger the wholesale reconcile.
             if entry.departed_at_ms.is_some() {
+                continue;
+            }
+            if terminal_is_gone(entry, open_ttys) {
                 continue;
             }
             let Some(mut session) = ClaudeSession::from_registry_entry(name, entry) else {
@@ -199,6 +213,45 @@ pub(crate) fn foreign_sessions_from(
         }
     }
     out
+}
+
+/// Whether this session's terminal is provably gone from the host.
+///
+/// The second, independent liveness signal, and the only one that works
+/// without deploying anything into the sandbox. `SessionEnd` stamping
+/// (`departed_at_ms`) is written by `claudectl-hook` *inside* the VM, so it
+/// only takes effect once the sandbox image ships a new binary — measured on a
+/// live host, every one of 47 registry entries across 6 sandboxes was unstamped
+/// because the installed hook predated the field. Meanwhile every `sc` session
+/// is launched by an `sbx exec` carrying `SANDBOX_HOST_TTY=` in its argv, which
+/// vanishes from the host process table the instant the window closes.
+///
+/// **Fails open at every step.** Each of these returns "still alive":
+///
+/// - `ps` could not be run or failed ⇒ `open` is `None`.
+/// - The entry predates `host_tty`, or the session was not launched by the
+///   wrapper ⇒ nothing to match on.
+/// - The sandbox has no open ttys at all ⇒ indistinguishable from a parsing or
+///   format mismatch, and hiding every row of a sandbox on a signal we cannot
+///   corroborate is far worse than the lag this removes. The departure stamp
+///   and the reconcile still cover that case.
+///
+/// So a row is dropped only when the host positively observes *other* live
+/// terminals for the same sandbox and this session's is not among them.
+fn terminal_is_gone(
+    entry: &crate::sandbox_registry::SessionEntry,
+    open: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    let Some(open) = open else {
+        return false;
+    };
+    if open.is_empty() {
+        return false;
+    }
+    let Some(tty) = entry.host_tty.as_deref().filter(|tty| !tty.is_empty()) else {
+        return false;
+    };
+    !open.contains(tty)
 }
 
 /// Which sandboxes may render, and on what authority.
@@ -2982,6 +3035,7 @@ mod foreign_session_tests {
             &[],
             NOW,
             INTERVAL,
+            None,
         );
         assert_eq!(ids(&rows), ["250a74d3"]);
         assert_eq!(rows[0].display_name(), "new");
@@ -3005,6 +3059,7 @@ mod foreign_session_tests {
             &[],
             NOW,
             INTERVAL,
+            None,
         );
         assert_eq!(ids(&rows), ["250a74d3"]);
         assert_eq!(
@@ -3028,6 +3083,7 @@ mod foreign_session_tests {
             &[],
             NOW,
             INTERVAL,
+            None,
         );
         assert_eq!(ids(&rows), ["f5bb6dba"]);
     }
@@ -3054,6 +3110,7 @@ mod foreign_session_tests {
             &[],
             NOW,
             INTERVAL,
+            None,
         );
         assert_eq!(ids(&rows), ["250a74d3"]);
     }
@@ -3077,6 +3134,7 @@ mod foreign_session_tests {
             &[],
             NOW,
             INTERVAL,
+            None,
         );
         assert_eq!(ids(&rows), ["f5bb6dba", "250a74d3"]);
     }
@@ -3097,6 +3155,7 @@ mod foreign_session_tests {
             &[],
             NOW,
             INTERVAL,
+            None,
         );
         assert!(rows.is_empty(), "hidden from the view");
         assert_eq!(
@@ -3104,6 +3163,177 @@ mod foreign_session_tests {
             1,
             "but still on disk for --restore-sbx-sessions"
         );
+    }
+
+    fn ttys(
+        sandbox: &str,
+        open: &[&str],
+    ) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+        std::iter::once((
+            sandbox.to_string(),
+            open.iter().map(|t| (*t).to_string()).collect(),
+        ))
+        .collect()
+    }
+
+    fn with_tty(session_id: &str, name: &str, pid: u32, tty: &str) -> SessionEntry {
+        let mut e = entry(session_id, name, pid);
+        e.host_tty = Some(tty.to_string());
+        e
+    }
+
+    #[test]
+    fn a_session_whose_host_terminal_is_gone_stops_rendering() {
+        // The signal that works WITHOUT deploying anything into the sandbox.
+        // `departed_at_ms` is written by claudectl-hook inside the VM, so it is
+        // inert until the sandbox image ships a new binary; on a live host all
+        // 47 entries across 6 sandboxes were unstamped for exactly that reason.
+        // The `sbx exec` carrying SANDBOX_HOST_TTY dies with the window, and
+        // the host sees that immediately.
+        let registry = registry_of(&[(
+            "linera-agent-live",
+            vec![
+                with_tty("gone-1", "closed-window", 1, "/dev/ttys055"),
+                with_tty("here-1", "still-open", 2, "/dev/ttys001"),
+            ],
+        )]);
+        let open = ttys("linera-agent-live", &["/dev/ttys001"]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+            Some(&open),
+        );
+        assert_eq!(ids(&rows), ["here-1"]);
+    }
+
+    #[test]
+    fn negative_control_both_render_while_both_terminals_are_open() {
+        let registry = registry_of(&[(
+            "linera-agent-live",
+            vec![
+                with_tty("gone-1", "closed-window", 1, "/dev/ttys055"),
+                with_tty("here-1", "still-open", 2, "/dev/ttys001"),
+            ],
+        )]);
+        let open = ttys("linera-agent-live", &["/dev/ttys001", "/dev/ttys055"]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+            Some(&open),
+        );
+        assert_eq!(ids(&rows), ["gone-1", "here-1"]);
+    }
+
+    #[test]
+    fn liveness_fails_open_when_the_host_cannot_be_asked() {
+        // `None` means "no ps" — in-sandbox claudectl, or a failed call. It must
+        // never read as "nothing is alive", which would blank the whole view.
+        let registry = registry_of(&[(
+            "linera-agent-live",
+            vec![with_tty("gone-1", "closed-window", 1, "/dev/ttys055")],
+        )]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+            None,
+        );
+        assert_eq!(ids(&rows), ["gone-1"]);
+    }
+
+    #[test]
+    fn liveness_fails_open_when_the_sandbox_shows_no_open_ttys() {
+        // An empty set cannot be told apart from a parse or format mismatch,
+        // and hiding every row of a sandbox on an uncorroborated signal is far
+        // worse than the lag this removes. The stamp and the reconcile still
+        // cover the genuine "last window closed" case.
+        let registry = registry_of(&[(
+            "linera-agent-live",
+            vec![with_tty("gone-1", "closed-window", 1, "/dev/ttys055")],
+        )]);
+        let open = ttys("linera-agent-live", &[]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+            Some(&open),
+        );
+        assert_eq!(ids(&rows), ["gone-1"]);
+    }
+
+    #[test]
+    fn liveness_fails_open_for_an_entry_with_no_recorded_tty() {
+        // Entries written before #41, and sessions not launched by the wrapper,
+        // carry no host_tty. There is nothing to match on, so they must render.
+        let registry = registry_of(&[(
+            "linera-agent-live",
+            vec![
+                entry("no-tty", "older-entry", 1),
+                with_tty("here-1", "still-open", 2, "/dev/ttys001"),
+            ],
+        )]);
+        let open = ttys("linera-agent-live", &["/dev/ttys001"]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+            Some(&open),
+        );
+        assert_eq!(ids(&rows), ["no-tty", "here-1"]);
+    }
+
+    #[test]
+    fn one_sandboxs_terminals_never_judge_anothers() {
+        // Two sandboxes can hand out the same tty number. Judging a session
+        // against the wrong sandbox's set would hide a live row.
+        let registry = registry_of(&[
+            (
+                "linera-agent-a",
+                vec![with_tty("a-1", "in-a", 1, "/dev/ttys001")],
+            ),
+            (
+                "linera-agent-b",
+                vec![with_tty("b-1", "in-b", 2, "/dev/ttys001")],
+            ),
+        ]);
+        let mut open = ttys("linera-agent-a", &["/dev/ttys001"]);
+        open.insert(
+            "linera-agent-b".to_string(),
+            std::iter::once("/dev/ttys009".to_string()).collect(),
+        );
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-a", "linera-agent-b"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+            Some(&open),
+        );
+        assert_eq!(ids(&rows), ["a-1"], "b-1's window is closed; a-1's is not");
     }
 
     #[test]
@@ -3120,6 +3350,7 @@ mod foreign_session_tests {
             &[],
             NOW,
             INTERVAL,
+            None,
         );
         assert_eq!(ids(&rows), ["remote-1"]);
     }
@@ -3141,6 +3372,7 @@ mod foreign_session_tests {
             &[],
             NOW,
             INTERVAL,
+            None,
         );
         assert_eq!(ids(&rows), ["a02a0bcd"]);
     }
@@ -3165,6 +3397,7 @@ mod foreign_session_tests {
             std::slice::from_ref(&local),
             NOW,
             INTERVAL,
+            None,
         );
         assert!(rows.is_empty());
     }
@@ -3184,6 +3417,7 @@ mod foreign_session_tests {
             &[],
             NOW,
             INTERVAL,
+            None,
         );
         assert_eq!(rows[0].cpu_percent, 7.5);
         assert_eq!(rows[0].mem_mb, 256.0);
@@ -3203,6 +3437,7 @@ mod foreign_session_tests {
             &[],
             NOW,
             INTERVAL,
+            None,
         );
         assert_eq!(ids(&rows), ["fresh-1"]);
         assert_eq!(rows[0].cpu_percent, 0.0);
@@ -3235,6 +3470,7 @@ mod foreign_session_tests {
             &[],
             NOW,
             INTERVAL,
+            None,
         );
         assert_eq!(ids(&rows), ["seen-1"]);
     }
@@ -3336,6 +3572,7 @@ mod foreign_session_tests {
             &[],
             NOW,
             INTERVAL,
+            None,
         );
         assert_eq!(ids(&rows), ["abc-123"]);
         assert_eq!(rows[0].cpu_percent, 0.0, "stale vitals must not be shown");
