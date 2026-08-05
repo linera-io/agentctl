@@ -365,6 +365,20 @@ pub fn record_live_sessions(check: &crate::terminal_owner::OwnerCheck) -> io::Re
         })
         .collect();
 
+    // The shape of what we're about to write. "19 sessions, 0 routed" and
+    // "0 sessions" are wildly different failures that produce the same
+    // outcome on the host (rows that Tab can't reach), and neither was
+    // distinguishable from the outside.
+    crate::logger::log(
+        "DEBUG",
+        &format!(
+            "registry: live set = {} sessions, {} with host routing, scope={}",
+            live.len(),
+            live.iter().filter(|e| e.host_terminal_id.is_some()).count(),
+            sandbox.as_deref().unwrap_or("host-local"),
+        ),
+    );
+
     match sandbox {
         Some(sandbox) => crate::sandbox_registry::replace_sandbox_slice(&sandbox, live),
         None => crate::sandbox_registry::update_local(|previous| {
@@ -476,7 +490,14 @@ pub fn record_hook_event(payload: &serde_json::Value) -> io::Result<()> {
     // Cost: one `ps x` snapshot per event (~40ms on a busy machine) — the
     // price of discovery that survives Claude Code deleting pointer files
     // mid-session; owner resolution itself stays fork-free in steady state.
-    let _ = record_live_sessions(&crate::terminal_owner::OwnerCheck::lazy());
+    // Still best-effort — a registry failure must never fail the hook — but no
+    // longer silent. This discarded `Result` was the only thing standing
+    // between "the registry write failed" and "the registry write was a no-op
+    // because nothing changed", two states that look identical from outside
+    // and needed telling apart on 2026-08-05.
+    if let Err(e) = record_live_sessions(&crate::terminal_owner::OwnerCheck::lazy()) {
+        crate::logger::log("ERROR", &format!("registry: live-set write failed: {e}"));
+    }
 
     let mut state = HookState::load(&session_id).unwrap_or_default();
     state.session_id = session_id;

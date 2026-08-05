@@ -336,10 +336,55 @@ fn read_terminal_sidecar(pid: u32) -> Option<TerminalSidecar> {
 /// the registry labelled as a host one — a wrong routing key is worse than an
 /// absent one, because the absent one still falls back to the cwd/title chain.
 pub fn host_terminal_routing(pid: u32) -> (Option<String>, Option<String>) {
-    match read_terminal_sidecar(pid).or_else(|| sidecar_from_proc_env(pid)) {
-        Some(sidecar) => (sidecar.terminal_id, sidecar.host_tty),
-        None => (None, None),
+    // Log the INPUTS and which branch answered, not just the result. A silent
+    // `None` here is indistinguishable from "the sidecar was fine but nothing
+    // asked", and it is written into the registry as a plain null — so the
+    // symptom surfaces much later, on the host, as "Tab went nowhere".
+    let dirs = sidecar_candidate_dirs();
+    if let Some(sidecar) = read_terminal_sidecar(pid) {
+        crate::logger::log(
+            "DEBUG",
+            &format!(
+                "routing: pid {pid} resolved from sidecar file (id={} tty={})",
+                sidecar.terminal_id.as_deref().unwrap_or("-"),
+                sidecar.host_tty.as_deref().unwrap_or("-")
+            ),
+        );
+        return (sidecar.terminal_id, sidecar.host_tty);
     }
+    if let Some(sidecar) = sidecar_from_proc_env(pid) {
+        crate::logger::log(
+            "DEBUG",
+            &format!(
+                "routing: pid {pid} resolved from /proc environ (id={} tty={})",
+                sidecar.terminal_id.as_deref().unwrap_or("-"),
+                sidecar.host_tty.as_deref().unwrap_or("-")
+            ),
+        );
+        return (sidecar.terminal_id, sidecar.host_tty);
+    }
+    // Name the paths that were actually tried and whether each file existed,
+    // so "no sidecar" can be told apart from "wrong directory" without
+    // re-deriving the probe order by hand.
+    let tried: Vec<String> = dirs
+        .iter()
+        .map(|dir| {
+            let path = dir.join(format!("{pid}.terminal.json"));
+            format!(
+                "{}={}",
+                path.display(),
+                if path.exists() { "present" } else { "absent" }
+            )
+        })
+        .collect();
+    crate::logger::log(
+        "WARN",
+        &format!(
+            "routing: pid {pid} unresolved — no host terminal id or tty; tried {}",
+            tried.join(" ")
+        ),
+    );
+    (None, None)
 }
 
 /// Sidecar search path, most authoritative first. The sandbox dir honors the
