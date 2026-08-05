@@ -186,6 +186,7 @@ pub(crate) fn foreign_sessions_from(
             continue;
         }
         let open_ttys = open_ttys.and_then(|by_sandbox| by_sandbox.get(name.as_str()));
+        let collector_saw = collector_live_ids(snapshot, name, now_ms, collector_interval);
         for entry in entries {
             // A stamped entry is a session whose `SessionEnd` has fired. It
             // stays on disk as `--restore-sbx-sessions` material and stops
@@ -194,6 +195,9 @@ pub(crate) fn foreign_sessions_from(
             // until an unrelated session in the same sandbox happened to fire
             // a hook and trigger the wholesale reconcile.
             if entry.departed_at_ms.is_some() {
+                continue;
+            }
+            if collector_says_gone(entry, collector_saw.as_ref(), snapshot.collected_at_ms) {
                 continue;
             }
             if terminal_is_gone(entry, open_ttys) {
@@ -213,6 +217,74 @@ pub(crate) fn foreign_sessions_from(
         }
     }
     out
+}
+
+/// Session ids the collector actually observed alive in `sandbox`, or `None`
+/// when its snapshot is too old to be evidence of anything.
+///
+/// This is the only liveness signal that requires **nothing** to be running
+/// inside the sandbox. The other two both do, which is why both shipped and
+/// changed nothing on a real machine:
+///
+/// - `departed_at_ms` is stamped by `claudectl-hook`, baked into the sandbox
+///   image. Measured on a live host: **0 of 46** registry entries stamped,
+///   because the installed hook predated the field.
+/// - `host_tty` is recorded by `record_live_sessions`, also in-sandbox. Same
+///   host: **21 of 46** entries had it, so the terminal check silently failed
+///   open for more than half of them — including the session being reported.
+///
+/// The collector, by contrast, runs on the host and probes each sandbox with a
+/// real in-VM `ps`, then writes what it saw to `sandboxes.json`. Whatever the
+/// image contains, that file is the host's own record of who was alive. It is
+/// only as fresh as the collector interval, so this bounds the staleness of a
+/// dead row instead of leaving it unbounded — it does not replace the stamp,
+/// which is what makes removal immediate.
+fn collector_live_ids<'a>(
+    snapshot: &'a crate::sandbox_registry::SandboxSnapshot,
+    sandbox: &str,
+    now_ms: u64,
+    collector_interval: std::time::Duration,
+) -> Option<std::collections::HashSet<&'a str>> {
+    if !snapshot.is_fresh(now_ms, collector_interval) {
+        return None;
+    }
+    let origin = snapshot.sandboxes.get(sandbox)?;
+    Some(
+        origin
+            .sessions
+            .iter()
+            .filter_map(|value| value.get("session_id").and_then(serde_json::Value::as_str))
+            .collect(),
+    )
+}
+
+/// Whether the collector positively observed this sandbox and did **not** find
+/// this session alive.
+///
+/// Fails open at every step, and the `started_at_ms` guard is the load-bearing
+/// one: a session that started *after* the last collection is missing from the
+/// snapshot because the collector never had a chance to see it, not because it
+/// is dead. Without that check this would hide every newly started session for
+/// up to a full interval — reintroducing the appearance lag that #36 fixed, in
+/// exchange for fixing the removal lag. Both halves have to hold at once.
+fn collector_says_gone(
+    entry: &crate::sandbox_registry::SessionEntry,
+    collector_saw: Option<&std::collections::HashSet<&str>>,
+    collected_at_ms: u64,
+) -> bool {
+    let Some(saw) = collector_saw else {
+        return false;
+    };
+    // The collector only reports sessions it could probe by pid; an entry
+    // without one could never appear, so its absence proves nothing.
+    if entry.pid.is_none() {
+        return false;
+    }
+    // Unknown or post-collection start ⇒ the collector cannot have seen it.
+    if entry.started_at_ms == 0 || entry.started_at_ms >= collected_at_ms {
+        return false;
+    }
+    !saw.contains(entry.session_id.as_str())
 }
 
 /// Whether this session's terminal is provably gone from the host.
@@ -3334,6 +3406,198 @@ mod foreign_session_tests {
             Some(&open),
         );
         assert_eq!(ids(&rows), ["a-1"], "b-1's window is closed; a-1's is not");
+    }
+
+    /// A snapshot in which the collector saw exactly `alive` in `sandbox`.
+    fn collected(sandbox: &str, alive: &[&str], collected_at_ms: u64) -> SandboxSnapshot {
+        let mut snapshot = SandboxSnapshot {
+            collected_at_ms,
+            ..Default::default()
+        };
+        snapshot.sandboxes.insert(
+            sandbox.to_string(),
+            SandboxOrigin {
+                is_current: true,
+                sessions: alive
+                    .iter()
+                    .map(|id| serde_json::json!({ "session_id": id, "cpu": 0.0, "mem_mb": 0.0 }))
+                    .collect(),
+            },
+        );
+        snapshot
+    }
+
+    /// An entry as an OLD sandbox image writes it: no departure stamp, no
+    /// `host_tty`. Both of those fields come from binaries baked into the
+    /// image, so on any sandbox that has not been rebuilt this is all the
+    /// renderer gets.
+    fn old_image_entry(session_id: &str, name: &str, pid: u32, started_at_ms: u64) -> SessionEntry {
+        let mut e = entry(session_id, name, pid);
+        e.host_tty = None;
+        e.host_terminal_id = None;
+        e.departed_at_ms = None;
+        e.started_at_ms = started_at_ms;
+        e
+    }
+
+    #[test]
+    fn a_dead_session_is_removed_even_when_the_sandbox_image_is_old() {
+        // THE regression test for this whole saga. Three fixes shipped and none
+        // helped a real machine, because each needed a field written by a
+        // binary inside the sandbox: #42's `departed_at_ms` (0 of 46 entries
+        // had it) and #45's `host_tty` (21 of 46). This asserts a dead row goes
+        // away with NEITHER field present — i.e. using only what the host can
+        // observe by itself.
+        let registry = registry_of(&[(
+            "linera-agent-live",
+            vec![
+                old_image_entry(
+                    "dead-1",
+                    "sandbox-image-prefetch-watcher",
+                    35939,
+                    NOW - 600_000,
+                ),
+                old_image_entry("alive-1", "still-running", 2, NOW - 600_000),
+            ],
+        )]);
+        // The collector probed the sandbox 60s ago and found only `alive-1`.
+        let snapshot = collected("linera-agent-live", &["alive-1"], NOW - 60_000);
+        let rows = foreign_sessions_from(
+            &registry,
+            &snapshot,
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+            None, // no host ps either — nothing but the snapshot
+        );
+        assert_eq!(
+            ids(&rows),
+            ["alive-1"],
+            "a dead session must disappear without any help from inside the sandbox"
+        );
+    }
+
+    #[test]
+    fn a_session_started_after_the_last_collection_still_appears() {
+        // The other half, and the one that makes this dangerous to get wrong:
+        // a brand-new session is absent from the snapshot because the collector
+        // has not run since it started, NOT because it is dead. Hiding it would
+        // trade the removal lag for the appearance lag #36 fixed.
+        let registry = registry_of(&[(
+            "linera-agent-live",
+            vec![old_image_entry("brand-new", "just-started", 3, NOW - 5_000)],
+        )]);
+        let snapshot = collected("linera-agent-live", &[], NOW - 60_000);
+        let rows = foreign_sessions_from(
+            &registry,
+            &snapshot,
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+            None,
+        );
+        assert_eq!(ids(&rows), ["brand-new"]);
+    }
+
+    #[test]
+    fn a_stale_snapshot_is_not_evidence_of_death() {
+        let registry = registry_of(&[(
+            "linera-agent-live",
+            vec![old_image_entry("dead-1", "gone", 1, NOW - 3_600_000)],
+        )]);
+        // Older than two collector intervals ⇒ the collector is presumed dead.
+        let snapshot = collected("linera-agent-live", &[], NOW - 3_000_000);
+        let rows = foreign_sessions_from(
+            &registry,
+            &snapshot,
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+            None,
+        );
+        assert_eq!(ids(&rows), ["dead-1"], "stale snapshot ⇒ no opinion");
+    }
+
+    #[test]
+    fn a_sandbox_the_collector_never_visited_is_not_judged() {
+        let registry = registry_of(&[(
+            "linera-agent-unvisited",
+            vec![old_image_entry(
+                "a-1",
+                "unknown-to-collector",
+                1,
+                NOW - 600_000,
+            )],
+        )]);
+        let snapshot = collected("linera-agent-other", &[], NOW - 60_000);
+        let rows = foreign_sessions_from(
+            &registry,
+            &snapshot,
+            &running(&["linera-agent-unvisited"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+            None,
+        );
+        assert_eq!(ids(&rows), ["a-1"]);
+    }
+
+    #[test]
+    fn an_entry_with_no_pid_is_not_judged_by_the_collector() {
+        // The collector can only report sessions it could probe by pid, so a
+        // pidless entry could never appear in the snapshot and its absence
+        // proves nothing.
+        let mut e = old_image_entry("no-pid", "pidless", 1, NOW - 600_000);
+        e.pid = None;
+        let registry = registry_of(&[("linera-agent-live", vec![e])]);
+        let snapshot = collected("linera-agent-live", &[], NOW - 60_000);
+        let rows = foreign_sessions_from(
+            &registry,
+            &snapshot,
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+            None,
+        );
+        assert_eq!(ids(&rows), ["no-pid"]);
+    }
+
+    #[test]
+    fn removal_needs_no_field_that_a_sandbox_binary_writes() {
+        // Stated as a property rather than a scenario, because "the fix relied
+        // on an in-sandbox writer" is the mistake that shipped three times.
+        // Every field a sandbox binary populates is cleared here; removal must
+        // still work. If a future change reintroduces such a dependency, this
+        // fails.
+        let mut dead = entry("dead-1", "closed", 9);
+        dead.departed_at_ms = None; // written by claudectl-hook (in-sandbox)
+        dead.host_tty = None; // written by record_live_sessions (in-sandbox)
+        dead.host_terminal_id = None; // ditto
+        dead.started_at_ms = NOW - 600_000;
+        let registry = registry_of(&[("linera-agent-live", vec![dead])]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &collected("linera-agent-live", &[], NOW - 60_000),
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+            None,
+        );
+        assert!(
+            rows.is_empty(),
+            "the host must be able to retire a dead row on its own"
+        );
     }
 
     #[test]
