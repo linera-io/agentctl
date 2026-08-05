@@ -27,6 +27,10 @@ pub mod recorder;
 pub mod rules;
 pub mod sandbox_registry;
 pub mod session;
+/// Seam tests joining the hook writer to the dashboard renderer. Test-only:
+/// every module it exercises is already public, this adds no surface.
+#[cfg(test)]
+mod session_lifecycle_tests;
 pub mod session_recorder;
 pub mod terminal_owner;
 pub mod terminals;
