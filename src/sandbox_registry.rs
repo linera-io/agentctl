@@ -58,8 +58,23 @@ pub const ENV_SANDBOX_MARKER: &str = "LINERA_SANDBOX";
 /// Env var carrying the sandbox's name (`sbx` container). Matches `sc`'s
 /// `SANDBOX_NAME`, which defaults to `linera-agent` for the shared sandbox.
 pub const ENV_SANDBOX_NAME: &str = "SANDBOX_NAME";
+/// Env var carrying the sandbox's id, set by `sbx` alongside `SANDBOX_NAME`.
+/// A second chance at the name when only one of the two was inherited.
+pub const ENV_SANDBOX_VM_ID: &str = "SANDBOX_VM_ID";
 /// Default when `SANDBOX_NAME` is unset — kept in sync with `sc`.
 const DEFAULT_SANDBOX_NAME: &str = "linera-agent";
+/// Directory the sandbox bootstrap creates for per-pid session sidecars.
+///
+/// Used here purely as a "am I inside a sandbox" marker. It is a property of
+/// the machine rather than of one process's environment, so unlike
+/// [`ENV_SANDBOX_MARKER`] no exec can drop it. Absent on hosts — the same
+/// assumption `process::read_terminal_sidecar` already relies on.
+const SANDBOX_MARKER_DIR: &str = "/var/lib/sandbox-sessions";
+/// The UTS hostname, which `sbx` sets to the sandbox name. Namespace-scoped,
+/// so it survives any exec. **Not** `/etc/hostname`, which reads
+/// `localhost.localdomain` inside these sandboxes and would silently become a
+/// bogus slice name.
+const UTS_HOSTNAME_PATH: &str = "/proc/sys/kernel/hostname";
 
 fn current_version() -> u32 {
     1
@@ -478,15 +493,93 @@ impl Default for LocalRegistry {
 
 /// The sandbox this process is running inside, or `None` on the host.
 ///
-/// Returns `Some(name)` only when the sandbox marker env var is present.
+/// This decides which registry a hook writes — the sandbox's own slice, or the
+/// **host's** file. Getting it wrong in the `None` direction is the dangerous
+/// one, and the env marker alone got it wrong that way: it **fails open**.
+/// `LINERA_SANDBOX` is set by the bootstrap, but `sbx exec` does not inherit
+/// it, so a `claudectl-hook` invoked that way concluded it was the laptop and
+/// wrote sandbox sessions into the host-local registry — precisely what the
+/// marker's doc claims it prevents ("a sandbox can never write the host's
+/// file"). Observed live 2026-08-05: `registry: live set = 19 sessions,
+/// 0 with host routing, scope=host-local` from inside a sandbox.
+///
+/// So presence is now established by either signal: the env marker, or a
+/// filesystem marker that no exec can drop. Absence of both still means host,
+/// which keeps the host's behaviour unchanged.
 pub fn current_sandbox() -> Option<String> {
-    std::env::var_os(ENV_SANDBOX_MARKER)?;
-    let name = std::env::var(ENV_SANDBOX_NAME)
+    if !in_sandbox() {
+        return None;
+    }
+    Some(registry_sandbox_name(
+        env_value(ENV_SANDBOX_NAME).as_deref(),
+        env_value(ENV_SANDBOX_VM_ID).as_deref(),
+        read_uts_hostname().as_deref(),
+    ))
+}
+
+fn in_sandbox() -> bool {
+    std::env::var_os(ENV_SANDBOX_MARKER).is_some() || marker_dir().is_dir()
+}
+
+/// The filesystem sandbox marker, overridable by `CLAUDECTL_SANDBOX_MARKER_DIR`.
+///
+/// The override exists for the same reason `CLAUDECTL_SANDBOX_REGISTRY` and
+/// friends do: a test that wants to exercise *host* behaviour must be able to
+/// say so while running inside a sandbox, where the real marker is present and
+/// unremovable. Clearing `LINERA_SANDBOX` used to be enough for that; adding a
+/// filesystem signal would otherwise have made host behaviour untestable here —
+/// exactly the "passes on CI, fails in the sandbox" scope mismatch documented
+/// on `TempRegistry`.
+fn marker_dir() -> PathBuf {
+    std::env::var_os("CLAUDECTL_SANDBOX_MARKER_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(SANDBOX_MARKER_DIR))
+}
+
+/// A non-empty, trimmed env var, or `None`.
+fn env_value(key: &str) -> Option<String> {
+    std::env::var(key)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_SANDBOX_NAME.to_string());
-    Some(name)
+}
+
+fn read_uts_hostname() -> Option<String> {
+    fs::read_to_string(UTS_HOSTNAME_PATH)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Pick the sandbox's name from the sources available to this exec.
+///
+/// Pure so the precedence is testable without mutating process-global env,
+/// which is shared across the test binary's threads. The explicit-beats-
+/// inferred-beats-default ordering itself is [`crate::reaper::resolve_sandbox_name`];
+/// what lives here is only which sources feed it and which are disqualified.
+///
+/// The hostname is inferred rather than explicit because a name the launcher
+/// set deliberately beats one read off the machine. It is still preferred over
+/// [`DEFAULT_SANDBOX_NAME`]: defaulting writes a slice under a name that may
+/// belong to a *different* sandbox, and a wrong slice is worse than the
+/// host-local misroute this function exists to fix. Loopback names are
+/// disqualified — inside these sandboxes `/etc/hostname` says
+/// `localhost.localdomain`, and a registry keyed on that would collide every
+/// sandbox that fell back to it into one slice.
+fn registry_sandbox_name(
+    name_env: Option<&str>,
+    vm_id_env: Option<&str>,
+    uts_hostname: Option<&str>,
+) -> String {
+    crate::reaper::resolve_sandbox_name(
+        name_env.or(vm_id_env),
+        uts_hostname.filter(|host| !is_loopback_name(host)),
+        DEFAULT_SANDBOX_NAME,
+    )
+}
+
+fn is_loopback_name(host: &str) -> bool {
+    host == "localhost" || host.starts_with("localhost.")
 }
 
 fn registry_dir() -> PathBuf {
@@ -770,6 +863,14 @@ pub(crate) mod tests {
                 std::env::set_var("CLAUDECTL_LOCAL_REGISTRY", dir.join("local.json"));
                 std::env::set_var("CLAUDECTL_SANDBOX_SNAPSHOT", dir.join("sandboxes.json"));
                 std::env::remove_var(ENV_SANDBOX_MARKER);
+                // Clearing the env marker alone no longer means "host": the
+                // filesystem marker is present in every sandbox and cannot be
+                // removed. Point it somewhere that doesn't exist so this
+                // fixture keeps meaning host scope in both places it runs.
+                std::env::set_var(
+                    "CLAUDECTL_SANDBOX_MARKER_DIR",
+                    dir.join("no-sandbox-marker"),
+                );
             }
             TempRegistry {
                 dir,
@@ -802,6 +903,7 @@ pub(crate) mod tests {
                 std::env::remove_var("CLAUDECTL_SANDBOX_REGISTRY");
                 std::env::remove_var("CLAUDECTL_LOCAL_REGISTRY");
                 std::env::remove_var("CLAUDECTL_SANDBOX_SNAPSHOT");
+                std::env::remove_var("CLAUDECTL_SANDBOX_MARKER_DIR");
                 match self.saved_sandbox_marker.take() {
                     Some(value) => std::env::set_var(ENV_SANDBOX_MARKER, value),
                     None => std::env::remove_var(ENV_SANDBOX_MARKER),
@@ -815,6 +917,52 @@ pub(crate) mod tests {
             }
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// `SANDBOX_NAME` is what the launcher set deliberately, so it wins.
+    #[test]
+    fn sandbox_name_prefers_the_explicit_env_over_everything() {
+        assert_eq!(
+            registry_sandbox_name(Some("linera-agent-abc"), Some("vm-id"), Some("host-name")),
+            "linera-agent-abc"
+        );
+    }
+
+    /// `sbx exec` inherits neither `SANDBOX_NAME` nor `LINERA_SANDBOX`. The UTS
+    /// hostname is the only name left, and it is what `sbx` sets — falling
+    /// through to `DEFAULT_SANDBOX_NAME` here would write a slice under a name
+    /// that may belong to a different sandbox.
+    #[test]
+    fn sandbox_name_falls_back_to_the_uts_hostname_when_no_env_survived() {
+        assert_eq!(
+            registry_sandbox_name(None, None, Some("linera-agent-cd708d9d80bc")),
+            "linera-agent-cd708d9d80bc"
+        );
+        assert_eq!(
+            registry_sandbox_name(None, Some("linera-agent-vm"), Some("ignored")),
+            "linera-agent-vm",
+            "an inherited vm id still beats the inferred hostname"
+        );
+    }
+
+    /// `/etc/hostname` reads `localhost.localdomain` inside these sandboxes.
+    /// Keying a registry slice on that would collide every sandbox that fell
+    /// back to it into one shared slice.
+    #[test]
+    fn sandbox_name_rejects_loopback_hostnames() {
+        assert_eq!(
+            registry_sandbox_name(None, None, Some("localhost.localdomain")),
+            DEFAULT_SANDBOX_NAME
+        );
+        assert_eq!(
+            registry_sandbox_name(None, None, Some("localhost")),
+            DEFAULT_SANDBOX_NAME
+        );
+        assert_eq!(
+            registry_sandbox_name(None, None, None),
+            DEFAULT_SANDBOX_NAME,
+            "no source at all still yields the documented default"
+        );
     }
 
     fn entry(id: &str, cwd: &str) -> SessionEntry {
@@ -1465,20 +1613,70 @@ pub(crate) mod tests {
     #[test]
     fn current_sandbox_gated_on_marker() {
         let _lock = env_guard();
+        let saved_vm_id = std::env::var_os(ENV_SANDBOX_VM_ID);
         // SAFETY: env access is serialized by the held `ENV_LOCK`.
         unsafe {
+            // Host scope now needs BOTH markers absent. Inside a sandbox the
+            // filesystem one is real and unremovable, so point it at a path
+            // that doesn't exist — otherwise this test asserts host behaviour
+            // while standing in a sandbox and fails there but not on CI.
+            std::env::set_var("CLAUDECTL_SANDBOX_MARKER_DIR", "/nonexistent/no-marker");
             std::env::remove_var(ENV_SANDBOX_MARKER);
             std::env::remove_var(ENV_SANDBOX_NAME);
+            // The real `SANDBOX_VM_ID` leaks in from the surrounding sandbox
+            // and would answer the name lookup below with a live sandbox name.
+            std::env::remove_var(ENV_SANDBOX_VM_ID);
             assert_eq!(current_sandbox(), None);
 
+            // Presence, not the exact name: with no name env left, the name now
+            // comes from the machine's UTS hostname, which differs between a
+            // sandbox and a CI runner. Precedence is pinned by the pure
+            // `registry_sandbox_name` tests instead, where it doesn't depend on
+            // where the suite happens to run.
             std::env::set_var(ENV_SANDBOX_MARKER, "1");
-            assert_eq!(current_sandbox(), Some(DEFAULT_SANDBOX_NAME.to_string()));
+            assert!(current_sandbox().is_some());
 
             std::env::set_var(ENV_SANDBOX_NAME, "pm-task");
             assert_eq!(current_sandbox(), Some("pm-task".to_string()));
 
             std::env::remove_var(ENV_SANDBOX_MARKER);
             std::env::remove_var(ENV_SANDBOX_NAME);
+            std::env::remove_var("CLAUDECTL_SANDBOX_MARKER_DIR");
+            if let Some(value) = saved_vm_id {
+                std::env::set_var(ENV_SANDBOX_VM_ID, value);
+            }
         }
+    }
+
+    /// The regression this whole change exists for: an exec that did not
+    /// inherit `LINERA_SANDBOX` concluded it was the laptop and wrote sandbox
+    /// sessions into the host's registry — the one thing the marker's doc
+    /// promises cannot happen.
+    #[test]
+    fn a_sandbox_that_lost_the_env_marker_is_still_a_sandbox() {
+        let _lock = env_guard();
+        let saved_vm_id = std::env::var_os(ENV_SANDBOX_VM_ID);
+        let marker = std::env::temp_dir().join("claudectl-marker-present");
+        fs::create_dir_all(&marker).unwrap();
+        // SAFETY: env access is serialized by the held `ENV_LOCK`.
+        unsafe {
+            std::env::set_var("CLAUDECTL_SANDBOX_MARKER_DIR", &marker);
+            std::env::remove_var(ENV_SANDBOX_MARKER);
+            std::env::remove_var(ENV_SANDBOX_NAME);
+            std::env::set_var(ENV_SANDBOX_VM_ID, "linera-agent-cd708d9d80bc");
+
+            assert_eq!(
+                current_sandbox(),
+                Some("linera-agent-cd708d9d80bc".to_string()),
+                "the filesystem marker must survive an exec that dropped the env one"
+            );
+
+            std::env::remove_var("CLAUDECTL_SANDBOX_MARKER_DIR");
+            std::env::remove_var(ENV_SANDBOX_VM_ID);
+            if let Some(value) = saved_vm_id {
+                std::env::set_var(ENV_SANDBOX_VM_ID, value);
+            }
+        }
+        let _ = fs::remove_dir_all(&marker);
     }
 }
