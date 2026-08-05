@@ -2565,7 +2565,7 @@ impl App {
             // order the grouped render emits them in), then sort by that rank.
             // `sort_by_key` is stable, so sessions keep snapshot order within
             // a group — which is what the grouped render produces too.
-            let groups = self.project_groups();
+            let groups = self.project_groups_in(snap);
             let ranks: HashMap<&str, usize> = groups
                 .iter()
                 .enumerate()
@@ -2861,13 +2861,20 @@ pub struct ProjectGroup {
 
 impl App {
     pub fn project_groups(&self) -> Vec<ProjectGroup> {
+        self.project_groups_in(&self.data_snapshot())
+    }
+
+    /// Groups computed against a caller-supplied snapshot, so
+    /// [`Self::ordered_indices`] can rank projects using the very same data it
+    /// is ordering — two `data_snapshot()` calls can straddle a refresh and
+    /// rank an ordering against a list it was not built from.
+    fn project_groups_in(&self, snap: &AppData) -> Vec<ProjectGroup> {
         // Deliberately built from the *unordered* filtered set: `ordered_indices`
         // asks this function for the group order, so going through
         // `visible_sessions()` here would recurse. Group stats don't depend on
         // the order sessions arrive in, so nothing is lost.
-        let snap = self.data_snapshot();
         let visible: Vec<&ClaudeSession> = self
-            .filtered_indices(&snap)
+            .filtered_indices(snap)
             .into_iter()
             .filter_map(|idx| snap.sessions.get(idx))
             .collect();
