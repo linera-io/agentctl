@@ -177,51 +177,65 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     let header = Row::new(header_cells).height(1);
 
-    let selected_pid = app.selected_session().map(|s| s.pid);
+    // The highlighted row is resolved by POSITION, never by identity.
+    //
+    // `table_state.selected()` is an index into `visible_sessions` (see
+    // `App::ordered_indices`), and that index is what Tab, kill, and approve
+    // act on — so the highlight has to be derived from the very same number.
+    // This used to search the list for the selected session's pid instead,
+    // which broke the moment the dashboard began rendering rows from several
+    // sandboxes at once: each sandbox is its own pid namespace, so two rows
+    // can legitimately share a pid, and the loop (no `break`, last match wins)
+    // handed the highlight to the *last* row holding that pid. The user then
+    // saw `▶` on one session while Tab opened a different one, and the row
+    // whose pid was duplicated further down could never be highlighted at all.
+    let selected = app.table_state.selected();
     let mut selected_row_idx = None;
     let rows: Vec<Row> = if app.grouped_view {
         let groups = app.project_groups();
         let mut rows = Vec::new();
         let mut row_idx = 0usize;
-        for group in &groups {
-            // Group header row
-            let cost_str = if group.total_cost < 1.0 {
-                format!("${:.2}", group.total_cost)
-            } else {
-                format!("${:.1}", group.total_cost)
-            };
-            let header_text = format!(
-                "{} ({} sessions, {} active, {}, ctx {:.0}%)",
-                group.name,
-                group.session_count,
-                group.active_count,
-                cost_str,
-                group.avg_context_pct
-            );
-            let mut cells: Vec<Cell> = vec![
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(header_text)
-                    .style(Style::default().fg(t.header).add_modifier(Modifier::BOLD)),
-            ];
-            for _ in 3..HEADER_NAMES.len() {
-                cells.push(Cell::from(""));
-            }
-            rows.push(Row::new(cells));
-            row_idx += 1;
-
-            // Session rows under this group
-            for s in visible_sessions
-                .iter()
-                .filter(|s| s.project_name == group.name)
-            {
-                if Some(s.pid) == selected_pid {
-                    selected_row_idx = Some(row_idx);
+        // `visible_sessions` already arrives in group order, so a header goes
+        // in wherever the project changes. Walking it linearly (rather than
+        // re-filtering per group) is what keeps the logical index below in
+        // step with navigation.
+        let mut current_group: Option<&str> = None;
+        for (logical_idx, s) in visible_sessions.iter().enumerate() {
+            if current_group != Some(s.project_name.as_str()) {
+                current_group = Some(s.project_name.as_str());
+                if let Some(group) = groups.iter().find(|g| g.name == s.project_name) {
+                    let cost_str = if group.total_cost < 1.0 {
+                        format!("${:.2}", group.total_cost)
+                    } else {
+                        format!("${:.1}", group.total_cost)
+                    };
+                    let header_text = format!(
+                        "{} ({} sessions, {} active, {}, ctx {:.0}%)",
+                        group.name,
+                        group.session_count,
+                        group.active_count,
+                        cost_str,
+                        group.avg_context_pct
+                    );
+                    let mut cells: Vec<Cell> = vec![
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(header_text)
+                            .style(Style::default().fg(t.header).add_modifier(Modifier::BOLD)),
+                    ];
+                    for _ in 3..HEADER_NAMES.len() {
+                        cells.push(Cell::from(""));
+                    }
+                    rows.push(Row::new(cells));
+                    row_idx += 1;
                 }
-                let session_rows = render_rows_for_session(s, app);
-                row_idx += session_rows.len();
-                rows.extend(session_rows);
             }
+            if selected == Some(logical_idx) {
+                selected_row_idx = Some(row_idx);
+            }
+            let session_rows = render_rows_for_session(s, app);
+            row_idx += session_rows.len();
+            rows.extend(session_rows);
         }
         rows
     } else {
@@ -232,7 +246,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             .filter(|s| app.is_parked(&s.session_id))
             .count();
         let mut separator_inserted = false;
-        for s in visible_sessions.iter() {
+        for (logical_idx, s) in visible_sessions.iter().enumerate() {
             let is_parked = app.is_parked(&s.session_id);
             // When we see the first parked session, insert a visual separator
             // so the section is obviously distinct from the working set above.
@@ -241,7 +255,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 row_idx += 1;
                 separator_inserted = true;
             }
-            if Some(s.pid) == selected_pid {
+            if selected == Some(logical_idx) {
                 selected_row_idx = Some(row_idx);
             }
             let session_rows = render_rows_for_session(s, app);
@@ -948,5 +962,193 @@ mod tests {
         assert_eq!(format_token_count(169_100_000_000), "169.1B tok");
         assert_eq!(format_token_count(1_500_000_000_000), "1.5T tok");
         assert_eq!(format_token_count(42_000_000_000_000), "42.0T tok");
+    }
+
+    // ---------------------------------------------------------------------
+    // Selection/highlight regression coverage.
+    //
+    // These render through a real `TestBackend` rather than asserting on a
+    // helper, because the defect they guard lived in the render loop itself:
+    // the highlight was resolved by searching the list for the selected
+    // session's pid. Once the dashboard started showing rows from several
+    // sandboxes, pids stopped being unique (each sandbox is its own pid
+    // namespace) and the highlight landed on the wrong row. Only a test that
+    // looks at the painted buffer can catch that.
+    // ---------------------------------------------------------------------
+
+    use crate::app::{App, AppData};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    /// A session identified by its own uuid, with a pid that callers may
+    /// deliberately duplicate — mirroring two sandboxes each numbering their
+    /// processes from a low base.
+    fn sandbox_session(pid: u32, session_id: &str, name: &str, project: &str) -> ClaudeSession {
+        let raw = RawSession {
+            pid,
+            session_id: session_id.into(),
+            cwd: format!("/Users/ndr/{project}"),
+            started_at: 0,
+            name: None,
+            name_source: None,
+        };
+        let mut s = ClaudeSession::from_raw(raw);
+        s.session_name = name.into();
+        s.project_name = project.into();
+        s
+    }
+
+    fn app_with(sessions: Vec<ClaudeSession>) -> App {
+        let app = App::new();
+        app.replace_data(AppData {
+            sessions,
+            ..Default::default()
+        });
+        app
+    }
+
+    /// Every painted line of the table, top to bottom.
+    fn rendered_lines(app: &App) -> Vec<String> {
+        let backend = TestBackend::new(200, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, frame.area(), app))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The line carrying the `▶` highlight symbol, if any.
+    fn highlighted_line(app: &App) -> Option<String> {
+        rendered_lines(app)
+            .into_iter()
+            .find(|line| line.contains('\u{25b6}'))
+    }
+
+    /// The exact shape from the 2026-08-05 report: `claudectl-sandbox-view-lag`
+    /// (sandbox A) and `readable-validator-alerts` (sandbox B) both ran as pid
+    /// 386. Selecting the first one highlighted the second, so row 0 could
+    /// never be reached and Tab opened a session the user wasn't looking at.
+    #[test]
+    fn highlight_follows_selection_index_when_two_sandboxes_share_a_pid() {
+        let mut app = app_with(vec![
+            sandbox_session(386, "250a74d3", "view-lag", "ndr"),
+            sandbox_session(35939, "3e17a325", "prefetch", "ndr"),
+            sandbox_session(21387, "8613908b", "untitled-one", "ndr"),
+            sandbox_session(1672, "391570a1", "untitled-two", "ndr"),
+            sandbox_session(386, "eeee842f", "validator-alerts", "ndr"),
+        ]);
+
+        app.table_state.select(Some(0));
+        let line = highlighted_line(&app).expect("a row must be highlighted");
+        assert!(
+            line.contains("view-lag"),
+            "selecting index 0 must highlight index 0, got: {line}"
+        );
+        assert!(
+            !line.contains("validator-alerts"),
+            "the highlight must not jump to the other row sharing pid 386: {line}"
+        );
+
+        // ...and the duplicate further down still highlights itself.
+        app.table_state.select(Some(4));
+        let line = highlighted_line(&app).expect("a row must be highlighted");
+        assert!(
+            line.contains("validator-alerts"),
+            "selecting index 4 must highlight index 4, got: {line}"
+        );
+    }
+
+    /// The generalisation: with a colliding pid present, walking the list with
+    /// the arrow keys must highlight a different, correct row at every step.
+    /// Before the fix, index 0 and index 4 both painted row 4.
+    #[test]
+    fn every_index_highlights_its_own_row_despite_duplicate_pids() {
+        let names = [
+            "view-lag",
+            "prefetch",
+            "untitled-one",
+            "untitled-two",
+            "validator-alerts",
+        ];
+        let mut app = app_with(vec![
+            sandbox_session(386, "250a74d3", names[0], "ndr"),
+            sandbox_session(35939, "3e17a325", names[1], "ndr"),
+            sandbox_session(21387, "8613908b", names[2], "ndr"),
+            sandbox_session(1672, "391570a1", names[3], "ndr"),
+            sandbox_session(386, "eeee842f", names[4], "ndr"),
+        ]);
+
+        for (index, expected) in names.iter().enumerate() {
+            app.table_state.select(Some(index));
+            let line = highlighted_line(&app)
+                .unwrap_or_else(|| panic!("index {index} highlighted nothing"));
+            assert!(
+                line.contains(expected),
+                "index {index} should highlight {expected}, got: {line}"
+            );
+        }
+    }
+
+    /// The highlight must survive the row offsets introduced by subagent rows
+    /// (each parent renders extra rows beneath it), which is what the running
+    /// `row_idx` accounting exists for.
+    #[test]
+    fn highlight_accounts_for_subagent_rows_above_the_selection() {
+        let mut parent = sandbox_session(100, "aaaa", "has-subagents", "ndr");
+        parent.subagent_count = 3;
+        let mut app = app_with(vec![
+            parent,
+            sandbox_session(200, "bbbb", "below-subagents", "ndr"),
+        ]);
+
+        app.table_state.select(Some(1));
+        let line = highlighted_line(&app).expect("a row must be highlighted");
+        assert!(
+            line.contains("below-subagents"),
+            "subagent rows must not shift the highlight off its session: {line}"
+        );
+    }
+
+    /// Grouped view reorders sessions by project, so navigation has to walk
+    /// that same order. It didn't: `visible_session_indices` returned snapshot
+    /// order while the render emitted group order, so the arrow keys moved
+    /// through the list in a sequence that didn't match what was on screen.
+    #[test]
+    fn grouped_view_highlight_matches_the_selected_index() {
+        // `project_groups` orders groups by total cost descending, so "beta"
+        // renders first even though it sits second in the snapshot — which is
+        // exactly the divergence this test pins down.
+        let costed = |pid, id, name, project, cost| {
+            let mut s = sandbox_session(pid, id, name, project);
+            s.cost_usd = cost;
+            s
+        };
+        let mut app = app_with(vec![
+            costed(1, "aaaa", "cheap-alpha", "alpha", 1.0),
+            costed(2, "bbbb", "pricey-beta", "beta", 100.0),
+            costed(3, "cccc", "cheap-alpha-two", "alpha", 1.0),
+        ]);
+        app.grouped_view = true;
+
+        // Index 0 is the first session in RENDER order — the beta group's.
+        app.table_state.select(Some(0));
+        let line = highlighted_line(&app).expect("a row must be highlighted");
+        assert!(
+            line.contains("pricey-beta"),
+            "grouped index 0 must be the first rendered session, got: {line}"
+        );
+
+        // And the session Tab would act on has to be that same one.
+        assert_eq!(
+            app.selected_session().map(|s| s.session_name),
+            Some("pricey-beta".to_string()),
+            "the highlighted row and the session Tab acts on must agree"
+        );
     }
 }

@@ -2098,10 +2098,14 @@ impl App {
     }
 
     pub fn selected_session(&self) -> Option<ClaudeSession> {
-        let visible = self.visible_session_indices();
+        // One snapshot for both the ordering and the lookup. Taking two (as
+        // this used to, via `visible_session_indices()` and then
+        // `data_snapshot()`) let a refresh land in between and resolve the
+        // index against a list it was never computed for.
+        let snap = self.data_snapshot();
         let selected = self.table_state.selected()?;
-        let session_idx = *visible.get(selected)?;
-        self.data_snapshot().sessions.get(session_idx).cloned()
+        let session_idx = *self.ordered_indices(&snap).get(selected)?;
+        snap.sessions.get(session_idx).cloned()
     }
 
     pub fn handle_kill(&mut self) {
@@ -2529,8 +2533,14 @@ impl App {
         }
     }
 
-    pub fn visible_session_indices(&self) -> Vec<usize> {
-        let snap = self.data_snapshot();
+    /// Sessions passing the current filters, as indices into `snap.sessions`,
+    /// in snapshot order and *before* any grouped-view reordering.
+    ///
+    /// Private on purpose: everything that navigates or renders must go
+    /// through [`Self::ordered_indices`], which additionally applies the
+    /// render order. This one exists only so [`Self::project_groups`] can
+    /// aggregate without recursing back through the ordering it feeds.
+    fn filtered_indices(&self, snap: &AppData) -> Vec<usize> {
         snap.sessions
             .iter()
             .enumerate()
@@ -2538,18 +2548,55 @@ impl App {
             .collect()
     }
 
-    /// Owned snapshot of the sessions matching the current filters.
-    /// Returns `Vec<ClaudeSession>` (cloned) instead of references because
-    /// the underlying `AppData` lives behind an `Arc<RwLock<...>>` — we
-    /// can't hand out references whose lifetime is tied to `&self` once
-    /// the snapshot Arc is dropped at end of call. Callers that just
-    /// need to iterate immutably can take `.iter()` on the result.
+    /// The visible sessions as snapshot indices, **in the exact order the
+    /// table renders them**.
+    ///
+    /// This is the single source of visible ordering, and that is load-bearing:
+    /// `table_state.selected()` is an index into this list, and the table
+    /// highlights the row at that position. When the render walked a different
+    /// order than navigation did — which grouped view always did, since it
+    /// emits sessions grouped by project while navigation ran in snapshot
+    /// order — the highlighted row and the session that Tab/kill/approve
+    /// actually acted on were two different sessions.
+    fn ordered_indices(&self, snap: &AppData) -> Vec<usize> {
+        let mut indices = self.filtered_indices(snap);
+        if self.grouped_view {
+            // Rank each project by its position in `project_groups()` (the
+            // order the grouped render emits them in), then sort by that rank.
+            // `sort_by_key` is stable, so sessions keep snapshot order within
+            // a group — which is what the grouped render produces too.
+            let groups = self.project_groups_in(snap);
+            let ranks: HashMap<&str, usize> = groups
+                .iter()
+                .enumerate()
+                .map(|(rank, group)| (group.name.as_str(), rank))
+                .collect();
+            indices.sort_by_key(|idx| {
+                ranks
+                    .get(snap.sessions[*idx].project_name.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        indices
+    }
+
+    pub fn visible_session_indices(&self) -> Vec<usize> {
+        let snap = self.data_snapshot();
+        self.ordered_indices(&snap)
+    }
+
+    /// Owned snapshot of the sessions matching the current filters, in render
+    /// order. Returns `Vec<ClaudeSession>` (cloned) instead of references
+    /// because the underlying `AppData` lives behind an `Arc<RwLock<...>>` —
+    /// we can't hand out references whose lifetime is tied to `&self` once
+    /// the snapshot Arc is dropped at end of call. Callers that just need to
+    /// iterate immutably can take `.iter()` on the result.
     pub fn visible_sessions(&self) -> Vec<ClaudeSession> {
         let snap = self.data_snapshot();
-        snap.sessions
-            .iter()
-            .filter(|s| self.matches_filters(s))
-            .cloned()
+        self.ordered_indices(&snap)
+            .into_iter()
+            .filter_map(|idx| snap.sessions.get(idx).cloned())
             .collect()
     }
 
@@ -2814,7 +2861,23 @@ pub struct ProjectGroup {
 
 impl App {
     pub fn project_groups(&self) -> Vec<ProjectGroup> {
-        let visible = self.visible_sessions();
+        self.project_groups_in(&self.data_snapshot())
+    }
+
+    /// Groups computed against a caller-supplied snapshot, so
+    /// [`Self::ordered_indices`] can rank projects using the very same data it
+    /// is ordering — two `data_snapshot()` calls can straddle a refresh and
+    /// rank an ordering against a list it was not built from.
+    fn project_groups_in(&self, snap: &AppData) -> Vec<ProjectGroup> {
+        // Deliberately built from the *unordered* filtered set: `ordered_indices`
+        // asks this function for the group order, so going through
+        // `visible_sessions()` here would recurse. Group stats don't depend on
+        // the order sessions arrive in, so nothing is lost.
+        let visible: Vec<&ClaudeSession> = self
+            .filtered_indices(snap)
+            .into_iter()
+            .filter_map(|idx| snap.sessions.get(idx))
+            .collect();
         let mut groups: HashMap<String, Vec<&ClaudeSession>> = HashMap::new();
         for s in &visible {
             groups.entry(s.project_name.clone()).or_default().push(s);
