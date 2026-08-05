@@ -1360,12 +1360,29 @@ pub fn switch_to_terminal(session: &ClaudeSession) -> Result<(), String> {
     if needs_tty && session.tty.is_empty() {
         return Err("No TTY associated with this session".into());
     }
+    // Log the inputs that pick the matching branch, not just the outcome: a
+    // "Tab did nothing" report is only diagnosable if we can see WHICH key the
+    // matcher had. `surface_id` present means an exact match; absent with an
+    // empty tty means the run fell through to matching by cwd, where an
+    // unnamed session has nothing left to disambiguate with.
     crate::logger::log(
         "DEBUG",
         &format!(
-            "terminal switch: {} (tty={}) via {:?}",
+            "terminal switch: {} (origin={} pid={} surface_id={} tty={} cwd={}) via {:?}",
             session.display_name(),
-            session.tty,
+            session.origin.label(None),
+            session.pid,
+            session.terminal_id.as_deref().unwrap_or("-"),
+            if session.tty.is_empty() {
+                "-"
+            } else {
+                &session.tty
+            },
+            if session.cwd.is_empty() {
+                "-"
+            } else {
+                &session.cwd
+            },
             terminal_name(&terminal)
         ),
     );

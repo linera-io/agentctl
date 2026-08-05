@@ -611,6 +611,14 @@ impl ClaudeSession {
         if !entry.transcript.is_empty() {
             session.jsonl_path = Some(PathBuf::from(&entry.transcript));
         }
+        // The only host-meaningful routing this entry carries. `pid` is the
+        // sandbox's own namespace and `cwd` is a path inside it, so without
+        // these the terminal matchers have nothing to key on and fall through
+        // to matching every surface sitting in `$HOME`.
+        session.terminal_id = entry.host_terminal_id.clone();
+        if let Some(tty) = &entry.host_tty {
+            session.tty = tty.clone();
+        }
         Some(session)
     }
 
@@ -1015,6 +1023,7 @@ mod origin_tests {
             pid: Some(4242),
             owner_pid: None,
             owner_started_at: None,
+            ..Default::default()
         }
     }
 
@@ -1078,6 +1087,35 @@ mod origin_tests {
         let session = ClaudeSession::from_registry_entry("sbx", &registry_entry("abc-123", None))
             .expect("well-formed entry");
         assert!(session.jsonl_path.is_none());
+    }
+
+    /// The host routing keys are the one thing in the entry that means anything
+    /// outside the sandbox that wrote it — `pid` is a container pid and `cwd` a
+    /// container path. Dropping them here left the Ghostty matcher with nothing
+    /// to key on, so Tab fell through to "every surface sitting in $HOME".
+    #[test]
+    fn registry_entry_carries_host_terminal_routing_onto_the_session() {
+        let mut entry = registry_entry("abc-123", None);
+        entry.host_terminal_id = Some("8161D3F2-17C1-40CA-814F-4D714DB8F7BC".to_string());
+        entry.host_tty = Some("/dev/ttys031".to_string());
+
+        let session = ClaudeSession::from_registry_entry("sbx", &entry).expect("well-formed entry");
+        assert_eq!(
+            session.terminal_id.as_deref(),
+            Some("8161D3F2-17C1-40CA-814F-4D714DB8F7BC")
+        );
+        assert_eq!(session.tty, "/dev/ttys031");
+    }
+
+    /// An entry written by an older sandbox has neither field. It must not
+    /// invent a tty — an empty one falls through to the cwd chain, while a
+    /// fabricated one would match the wrong surface (or none).
+    #[test]
+    fn registry_entry_without_routing_leaves_the_session_unrouted() {
+        let session = ClaudeSession::from_registry_entry("sbx", &registry_entry("abc-123", None))
+            .expect("well-formed entry");
+        assert!(session.terminal_id.is_none());
+        assert!(session.tty.is_empty());
     }
 
     #[test]

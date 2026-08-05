@@ -66,7 +66,12 @@ fn current_version() -> u32 {
 }
 
 /// One resumable session recorded in the registry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` exists for test fixtures, which build entries caring about two or
+/// three fields at a time. Production code constructs this literally, in one
+/// place ([`crate::hook_state::record_live_sessions`]), so a field added here
+/// still has to be answered for where it actually matters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEntry {
     /// Claude Code session id — the argument to `sc --resume <id>`.
     pub session_id: String,
@@ -108,6 +113,24 @@ pub struct SessionEntry {
     /// terminal that is actually gone.
     #[serde(default)]
     pub owner_started_at: Option<String>,
+    /// Host-side terminal-surface id for a session running inside a sandbox,
+    /// copied from the per-pid `terminal.json` sidecar the agent-sandbox
+    /// wrapper writes at launch.
+    ///
+    /// Load-bearing for cross-sandbox Tab. Everything else this entry carries
+    /// is *container*-scoped: `pid` belongs to the sandbox's own pid namespace
+    /// and `cwd` is a path inside it, so a host reading this slice has nothing
+    /// it can route on. Without this field the Ghostty matcher fell all the way
+    /// through to "every surface whose working directory is `$HOME`" and took
+    /// the first one — a coin flip that only looked like it worked because
+    /// *named* sessions got rescued by the title disambiguator further down.
+    #[serde(default)]
+    pub host_terminal_id: Option<String>,
+    /// Host-side tty for the same session, from the same sidecar. The fallback
+    /// for terminals that match by tty rather than a surface id (iTerm2,
+    /// Terminal.app, tmux, WezTerm).
+    #[serde(default)]
+    pub host_tty: Option<String>,
 }
 
 impl SessionEntry {
@@ -721,6 +744,7 @@ pub(crate) mod tests {
             pid: None,
             owner_pid: None,
             owner_started_at: None,
+            ..Default::default()
         }
     }
 

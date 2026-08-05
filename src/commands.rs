@@ -1453,6 +1453,7 @@ root  --resume\n";
             pid: None,
             owner_pid: None,
             owner_started_at: None,
+            ..Default::default()
         };
         assert_eq!(entry_label(&entry), "mimir-timeouts (c3df00ed)");
         entry.name = None;
