@@ -176,6 +176,15 @@ pub(crate) fn foreign_sessions_from(
             continue;
         }
         for entry in entries {
+            // A stamped entry is a session whose `SessionEnd` has fired. It
+            // stays on disk as `--restore-sbx-sessions` material and stops
+            // rendering here, which is the whole point of stamping rather than
+            // deleting: before this, a closed terminal left its row on screen
+            // until an unrelated session in the same sandbox happened to fire
+            // a hook and trigger the wholesale reconcile.
+            if entry.departed_at_ms.is_some() {
+                continue;
+            }
             let Some(mut session) = ClaudeSession::from_registry_entry(name, entry) else {
                 continue;
             };
@@ -3021,6 +3030,80 @@ mod foreign_session_tests {
             INTERVAL,
         );
         assert_eq!(ids(&rows), ["f5bb6dba"]);
+    }
+
+    #[test]
+    fn a_departed_session_stops_rendering_immediately() {
+        // The reported bug: closing a terminal window left the row on screen
+        // for close to a minute. `SessionEnd` fires at once, but for a
+        // non-deliberate reason the entry is deliberately KEPT as
+        // `--restore-sbx-sessions` material, so nothing removed it until an
+        // unrelated session in the same sandbox happened to fire a hook and
+        // trigger the wholesale reconcile.
+        let mut departed = entry("f5bb6dba", "closed-terminal", 9302);
+        departed.departed_at_ms = Some(1_785_814_692_000);
+        let registry = registry_of(&[(
+            "linera-agent-live",
+            vec![departed, entry("250a74d3", "still-here", 386)],
+        )]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+        );
+        assert_eq!(ids(&rows), ["250a74d3"]);
+    }
+
+    #[test]
+    fn negative_control_the_same_entry_renders_before_it_departs() {
+        // Proves the test above keys on the stamp and not on something
+        // incidental to the fixture: identical registry, stamp removed.
+        let registry = registry_of(&[(
+            "linera-agent-live",
+            vec![
+                entry("f5bb6dba", "closed-terminal", 9302),
+                entry("250a74d3", "still-here", 386),
+            ],
+        )]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+        );
+        assert_eq!(ids(&rows), ["f5bb6dba", "250a74d3"]);
+    }
+
+    #[test]
+    fn a_departed_entry_is_still_restore_material() {
+        // The stamp hides the row; it must not remove the data. Deleting it
+        // would break restore-after-`sbx rm`, which is the reason these entries
+        // are retained in the first place.
+        let mut departed = entry("f5bb6dba", "closed-terminal", 9302);
+        departed.departed_at_ms = Some(1_785_814_692_000);
+        let registry = registry_of(&[("linera-agent-live", vec![departed])]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+        );
+        assert!(rows.is_empty(), "hidden from the view");
+        assert_eq!(
+            registry.sandboxes["linera-agent-live"].len(),
+            1,
+            "but still on disk for --restore-sbx-sessions"
+        );
     }
 
     #[test]
