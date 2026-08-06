@@ -53,6 +53,39 @@ fn sandbox_name() -> String {
     resolve_sandbox_name(env.as_deref(), auto.as_deref(), DEFAULT_SANDBOX_NAME)
 }
 
+/// The sandbox to `sbx exec` into, or `None` when there is no unambiguous one.
+///
+/// [`sandbox_name`] always answers, falling back to [`DEFAULT_SANDBOX_NAME`]
+/// when it has nothing better. That default is a *convention*, not an
+/// observation, and `detect_running_sandbox_name` deliberately declines to
+/// guess whenever `sbx ls` shows anything other than exactly one running
+/// sandbox. On a host running three, every `sbx exec` built from the fallback
+/// therefore addressed a sandbox that does not exist:
+///
+/// ```text
+/// reaper: sandbox sidecar scan failed: sbx exec sidecar-scan failed:
+///   ERROR: no sandbox named 'linera-agent'
+/// ```
+///
+/// and `reap` returned `Ok(())` on that error, so the entire sidecar and
+/// orphan pass silently did nothing on every run — a feature that is off,
+/// reporting success. A name we have not confirmed is worse than no name:
+/// skipping is visible, and executing against a fabricated target is not.
+fn target_sandbox() -> Option<String> {
+    let env = std::env::var("CLAUDECTL_SANDBOX_NAME").ok();
+    let auto = AUTO_SANDBOX_NAME.get_or_init(detect_running_sandbox_name);
+    exec_target(env.as_deref(), auto.as_deref())
+}
+
+/// Pure resolver for [`target_sandbox`], so the "never invent a name" rule is
+/// testable without mutating process-global env state.
+fn exec_target(env_override: Option<&str>, auto_detected: Option<&str>) -> Option<String> {
+    env_override
+        .filter(|name| !name.is_empty())
+        .or(auto_detected.filter(|name| !name.is_empty()))
+        .map(str::to_string)
+}
+
 /// Pure resolver. Picks the first non-empty source: explicit env override
 /// → auto-detected name → default. Tests target this directly so they
 /// don't have to mutate process-global env state (which races other tests
@@ -440,6 +473,10 @@ fn collect_and_write_snapshot(out: &mut impl Write) -> io::Result<()> {
     // ordering is deliberate everywhere this pattern appears: `sbx` consumes
     // the stdin it inherits, so an exec driven straight off a streaming
     // enumeration eats the rest of its own input and collects one sandbox.
+    // The previous snapshot, kept so a failed probe can carry its last known
+    // answer forward instead of asserting a new one. See below.
+    let previous = sandbox_registry::load_snapshot();
+
     let mut tally: Vec<String> = Vec::with_capacity(running.len());
     for name in &running {
         let slice = registry.sandboxes.get(name).unwrap_or(&no_entries);
@@ -450,7 +487,28 @@ fn collect_and_write_snapshot(out: &mut impl Write) -> io::Result<()> {
                 // partial — a snapshot silently missing an origin looks
                 // identical to a sandbox with no sessions.
                 writeln!(out, "reaper: collect from '{name}' failed: {e}")?;
-                Vec::new()
+                // **Carry the last known session list forward. Do not write an
+                // empty one.** A failed probe means "we could not look", and
+                // an empty list means "we looked and this sandbox is empty" —
+                // the renderer cannot tell them apart, and reads the second.
+                //
+                // On 2026-08-06 an `sbx exec` probe timed out on a loaded host
+                // and this arm published 0 sessions for a sandbox whose
+                // registry held 18 live ones. All 18 vanished from the
+                // dashboard at once. The registry was never touched, so the
+                // very next successful pass restored them — a failure that
+                // presents as catastrophic data loss and is not.
+                //
+                // Stale rows are the strictly better error: they carry the
+                // snapshot's own `collected_at_ms`, which `snapshot_vitals_at`
+                // already expires, so a sandbox that stays unreachable ages out
+                // on the existing freshness rule instead of blinking out on the
+                // first dropped probe.
+                previous
+                    .sandboxes
+                    .get(name)
+                    .map(|origin| origin.sessions.clone())
+                    .unwrap_or_default()
             }
         };
         // Both numbers, not just the result: "0 sessions" is the shape every
@@ -1031,8 +1089,17 @@ fn scan_sandbox_sidecars() -> io::Result<Vec<SandboxSidecar>> {
     // line is `<pid>\t<host_tty>\t<alive>\t<name>` where alive is 0 or 1.
     let script = sidecar_scan_script(&sandbox_sessions_dir());
 
+    // Refuse to guess. With no unambiguous running sandbox this used to fall
+    // back to a conventional name and `sbx exec` a target that does not exist,
+    // failing every run on any host with more than one sandbox.
+    let Some(name) = target_sandbox() else {
+        return Err(io::Error::other(
+            "no unambiguous sandbox to scan: `sbx ls` shows zero or several \
+             running, and CLAUDECTL_SANDBOX_NAME is unset",
+        ));
+    };
     let output = Command::new("sbx")
-        .args(["exec", &sandbox_name(), "bash", "-c", &script])
+        .args(["exec", &name, "bash", "-c", &script])
         .output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
@@ -1148,7 +1215,13 @@ fi
     all_args.extend(dead_pids.iter().map(u32::to_string));
     all_args.extend(alive_pids.iter().map(u32::to_string));
 
-    let name = sandbox_name();
+    let Some(name) = target_sandbox() else {
+        writeln!(
+            io::stderr(),
+            "reaper: apply_plan skipped: no unambiguous sandbox to exec into"
+        )?;
+        return Ok(());
+    };
     let mut cmd = Command::new("sbx");
     cmd.args(["exec", &name, "bash", "-c", &script, "--"]);
     cmd.args(&all_args);
@@ -2991,5 +3064,54 @@ WantedBy=timers.target\n";
         assert_eq!(parse_timer_interval("[Timer]\nPersistent=true\n"), None);
         assert_eq!(parse_timer_interval(""), None);
         assert_eq!(parse_timer_interval("OnUnitActiveSec=abcs\n"), None);
+    }
+}
+
+#[cfg(test)]
+mod target_sandbox_tests {
+    use super::*;
+
+    #[test]
+    fn a_sandbox_name_is_never_invented_for_an_exec() {
+        // `sandbox_name` answers unconditionally, falling back to the
+        // conventional DEFAULT_SANDBOX_NAME. That default is fine for naming
+        // and fatal for `sbx exec`: `detect_running_sandbox_name` returns None
+        // whenever `sbx ls` shows anything but exactly one running sandbox, so
+        // on a host running three every exec addressed a sandbox that does not
+        // exist —
+        //
+        //   reaper: sandbox sidecar scan failed: sbx exec sidecar-scan failed:
+        //     ERROR: no sandbox named 'linera-agent'
+        //
+        // — and `reap` swallowed that into Ok(()), so the sidecar and orphan
+        // pass silently did nothing on every run while reporting success.
+        assert_eq!(
+            resolve_sandbox_name(None, None, DEFAULT_SANDBOX_NAME),
+            DEFAULT_SANDBOX_NAME,
+            "the naming resolver still answers — this test is about exec targets"
+        );
+
+        // The exec target must be empty-handed in exactly the case the naming
+        // resolver papers over: nothing detected and no explicit override.
+        assert_eq!(
+            exec_target(None, None),
+            None,
+            "with nothing detected and no override there is no target to exec into"
+        );
+        assert_eq!(
+            exec_target(Some("linera-agent-4f0a"), None).as_deref(),
+            Some("linera-agent-4f0a"),
+            "an explicit override is an observation, not a guess"
+        );
+        assert_eq!(
+            exec_target(None, Some("linera-agent-9cb6")).as_deref(),
+            Some("linera-agent-9cb6"),
+            "and so is a name `sbx ls` actually resolved"
+        );
+        assert_eq!(
+            exec_target(Some(""), Some("linera-agent-9cb6")).as_deref(),
+            Some("linera-agent-9cb6"),
+            "an empty override is not an override"
+        );
     }
 }

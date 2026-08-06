@@ -2254,3 +2254,114 @@ fn degradation_matrix() {
         );
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Session identity survival
+//
+// A session that loses its cwd loses everything downstream: `transcript` is
+// derived from it, `cwd_to_slug("")` is `-`, and the row then points at
+// `projects/-/<id>.jsonl` — a path that does not exist. The row renders with no
+// title, no project, and `Unreadable`, showing a bare pid.
+//
+// This is not hypothetical. Claude Code deletes pointer files mid-session, and
+// discovery then falls back to the process table, which knows only the pid and
+// the `--resume` uuid. On 2026-08-06 eighteen sessions rendered that way at
+// once. Two independent defects had to hold for that:
+//
+//   1. the registry writer let a blank overwrite stored identity, and
+//   2. nothing re-resolved a transcript path that was present but wrong,
+//      so the damage was permanent rather than repaired on the next tick.
+//
+// Both are covered here. The second matters most: preventing the next clobber
+// does nothing for rows already broken on disk.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_transcript_is_findable_by_session_id_alone() {
+    // The primitive the repair path needs: every other lookup derives the
+    // project directory from the cwd, which is exactly the field that is gone.
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join(".claude/projects/-Users-ndr-work");
+    std::fs::create_dir_all(&project).unwrap();
+    let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    std::fs::write(
+        project.join(format!("{id}.jsonl")),
+        r#"{"type":"user","cwd":"/Users/ndr/work","message":{"role":"user","content":"hi"}}"#,
+    )
+    .unwrap();
+
+    let _guard = EnvGuard::set("HOME", home.path());
+    let found = discovery::find_transcript_by_session_id(id).expect("must find it without a cwd");
+    assert!(found.ends_with(format!("-Users-ndr-work/{id}.jsonl")));
+    assert_eq!(
+        discovery::recover_cwd_from_transcript(&found).as_deref(),
+        Some("/Users/ndr/work"),
+        "the transcript is the durable copy of the cwd the process table cannot supply"
+    );
+    assert_eq!(discovery::find_transcript_by_session_id("no-such-id"), None);
+    assert_eq!(discovery::find_transcript_by_session_id(""), None);
+}
+
+#[test]
+fn regression_a_blank_cwd_recovers_its_project_and_transcript() {
+    // The whole repair, through the real resolver: a session with no cwd and a
+    // recorded transcript path that does not exist must come back with both.
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join(".claude/projects/-Users-ndr-work");
+    std::fs::create_dir_all(&project).unwrap();
+    let id = "11111111-2222-3333-4444-555555555555";
+    std::fs::write(
+        project.join(format!("{id}.jsonl")),
+        r#"{"type":"user","cwd":"/Users/ndr/work","message":{"role":"user","content":"hi"}}"#,
+    )
+    .unwrap();
+
+    let _guard = EnvGuard::set("HOME", home.path());
+    let mut session = ClaudeSession::from_raw(RawSession {
+        pid: 4242,
+        session_id: id.into(),
+        cwd: String::new(), // blanked by the process-table fallback
+        started_at: 0,
+        name: None,
+        name_source: None,
+    });
+    // Present, wrong, and pointing at nothing — what the registry stores once
+    // cwd is blank. Treating this as "already resolved" is what made the
+    // breakage permanent.
+    session.jsonl_path = Some(home.path().join(format!(".claude/projects/-/{id}.jsonl")));
+
+    discovery::resolve_jsonl_paths(std::slice::from_mut(&mut session));
+
+    assert_eq!(session.cwd, "/Users/ndr/work", "cwd recovered");
+    assert_eq!(session.project_name, "work", "project column recovered");
+    assert_eq!(
+        session.jsonl_path.as_deref(),
+        Some(project.join(format!("{id}.jsonl")).as_path()),
+        "and it points at the transcript that actually exists"
+    );
+}
+
+/// Scoped `HOME` override. Restores the previous value on drop so a panicking
+/// assertion cannot leak a temp path into the rest of the suite — the failure
+/// mode that let a test write to the real `~/.claude` in the first place.
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &std::path::Path) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}

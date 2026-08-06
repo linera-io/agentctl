@@ -39,6 +39,21 @@ pub struct RefreshIoOutput {
 /// Side effects: shells out via `discovery`, `process`, `monitor` —
 /// each does its own `std::fs` / `std::process::Command` calls. Total
 /// cost on a typical box (~38 sessions): ~30 ms steady-state.
+/// Whether this session still needs its transcript located.
+///
+/// Not just "has no path": a registry entry can carry a path that does not
+/// exist. `transcript` is stored as `projects/<cwd-slug>/<id>.jsonl`, so an
+/// entry whose cwd was blanked carries `projects/-/<id>.jsonl` — present,
+/// wrong, and pointing at nothing. Treating that as resolved is what left
+/// those rows reading `Unreadable` forever: the recovery path was never
+/// reached because a value was already there.
+fn needs_transcript_resolution(session: &ClaudeSession) -> bool {
+    match session.jsonl_path.as_ref() {
+        None => true,
+        Some(path) => !path.exists(),
+    }
+}
+
 pub fn do_refresh_io(prev_sessions: Vec<ClaudeSession>) -> RefreshIoOutput {
     let scan_start = std::time::Instant::now();
     let discovered = discovery::scan_sessions();
@@ -60,7 +75,7 @@ pub fn do_refresh_io(prev_sessions: Vec<ClaudeSession>) -> RefreshIoOutput {
     let ps_elapsed = ps_start.elapsed();
 
     for session in &mut sessions {
-        if session.jsonl_path.is_none() {
+        if needs_transcript_resolution(session) {
             discovery::resolve_jsonl_paths(std::slice::from_mut(session));
         }
     }
@@ -94,7 +109,7 @@ pub fn do_refresh_io(prev_sessions: Vec<ClaudeSession>) -> RefreshIoOutput {
     // cpu, mem) still comes from the snapshot.
     let mut foreign = foreign_sessions(&sessions, &prev_cpu_samples);
     for session in &mut foreign {
-        if session.jsonl_path.is_none() {
+        if needs_transcript_resolution(session) {
             discovery::resolve_jsonl_paths(std::slice::from_mut(session));
         }
         monitor::update_tokens(session);
