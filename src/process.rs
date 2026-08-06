@@ -32,13 +32,80 @@ fn apply_sidecar_probe(session: &mut ClaudeSession, sidecar: Option<TerminalSide
     }
 }
 
-/// Check which PIDs are alive and fetch TTY, CPU%, MEM, command args — all via `ps`.
+/// How long to wait before re-sampling CPU for sessions that have no baseline
+/// yet. Long enough that `ps`'s whole-second `cputime` resolution yields a
+/// usable delta for a busy process, short enough to be imperceptible in a
+/// human-invoked command.
+const CPU_BASELINE_GAP: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Check which PIDs are alive and fetch TTY, CPU, MEM, command args — all via `ps`.
 /// No sysinfo dependency needed.
 pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
     if sessions.is_empty() {
         return;
     }
+    enrich_from_ps(sessions);
 
+    // A CPU *rate* needs two samples, and a session being seen for the first
+    // time has only a baseline. The TUI would fill that in on its next tick,
+    // but one-shot commands (`--json`, `--list`, `--summary`) never get one —
+    // their CPU column would read "not known yet" forever. Take a second
+    // reading for exactly those sessions.
+    //
+    // Costs one extra `ps` and `CPU_BASELINE_GAP` on the tick a session first
+    // appears, and nothing at all once every session has a rate.
+    if sessions
+        .iter()
+        .any(|s| s.cpu_rate_percent.is_none() && s.cpu_sample.is_some())
+    {
+        std::thread::sleep(CPU_BASELINE_GAP);
+        resample_cpu(sessions);
+    }
+}
+
+/// Re-read cumulative CPU time only, and difference it against the baseline
+/// each session already carries.
+///
+/// Deliberately *not* a second `enrich_from_ps`: that pass also probes terminal
+/// sidecars and consumes the bounded `sidecar_attempts` retry budget, so running
+/// it twice per tick would halve the number of ticks a session gets to resolve
+/// its terminal.
+fn resample_cpu(sessions: &mut [ClaudeSession]) {
+    let pids: Vec<String> = sessions.iter().map(|s| s.pid.to_string()).collect();
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-o", "pid=,cputime=", "-p", &pids.join(",")])
+        .env_clear()
+        .output()
+    else {
+        return;
+    };
+    let sampled_at_ms = now_ms();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let cputimes: HashMap<u32, f64> = stdout
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            Some((pid, crate::cpu::parse_cputime_secs(fields.next()?)?))
+        })
+        .collect();
+
+    for session in sessions.iter_mut() {
+        let (Some(prev), Some(&cputime_secs)) = (session.cpu_sample, cputimes.get(&session.pid))
+        else {
+            continue;
+        };
+        let cur = crate::cpu::CpuSample {
+            cputime_secs,
+            sampled_at_ms,
+        };
+        session.cpu_rate_percent = crate::cpu::cpu_rate_percent(prev, cur);
+        session.cpu_sample = Some(cur);
+    }
+}
+
+fn enrich_from_ps(sessions: &mut [ClaudeSession]) {
     let pids: Vec<String> = sessions.iter().map(|s| s.pid.to_string()).collect();
     let pid_arg = pids.join(",");
 
