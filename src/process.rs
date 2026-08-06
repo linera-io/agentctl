@@ -42,10 +42,16 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
     let pids: Vec<String> = sessions.iter().map(|s| s.pid.to_string()).collect();
     let pid_arg = pids.join(",");
 
+    // `cputime` (cumulative CPU seconds), not `%cpu`: differencing two of these
+    // across ticks is the only way to learn what a process is doing *now*.
+    // See `crate::cpu` for the measurement, and why `%cpu` reported an idle
+    // session as busy for hours.
     let output = std::process::Command::new("ps")
-        .args(["-o", "pid=,tty=,%cpu=,rss=,command=", "-p", &pid_arg])
+        .args(["-o", "pid=,tty=,cputime=,rss=,command=", "-p", &pid_arg])
         .env_clear()
         .output();
+
+    let sampled_at_ms = now_ms();
 
     let output = match output {
         Ok(o) => o,
@@ -54,7 +60,7 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
             // ps failed — mark all as Finished (will show tombstone for 30s)
             for s in sessions.iter_mut() {
                 s.status = SessionStatus::Finished;
-                s.cpu_percent = 0.0;
+                s.cpu_rate_percent = None;
             }
             return;
         }
@@ -81,7 +87,7 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
             continue;
         };
         let tty = fields[1].to_string();
-        let cpu = fields[2].parse::<f32>().unwrap_or(0.0);
+        let cputime_secs = crate::cpu::parse_cputime_secs(fields[2]);
         let rss_kb = fields[3].parse::<f64>().unwrap_or(0.0);
         let mem_mb = rss_kb / 1024.0;
         let command = fields[4..].join(" ");
@@ -138,13 +144,20 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
         }
         session.mem_mb = mem_mb;
 
-        // CPU smoothing: track last 3 readings, use average
-        session.cpu_history.push(cpu);
-        if session.cpu_history.len() > 3 {
-            session.cpu_history.remove(0);
+        // Difference this cumulative reading against the previous tick's. The
+        // first tick for a pid has nothing to difference and leaves the rate
+        // `None` — unknown, which status inference refuses to read as "busy".
+        let sample = cputime_secs.map(|cputime_secs| crate::cpu::CpuSample {
+            cputime_secs,
+            sampled_at_ms,
+        });
+        session.cpu_rate_percent = match (session.cpu_sample, sample) {
+            (Some(prev), Some(cur)) => crate::cpu::cpu_rate_percent(prev, cur),
+            _ => None,
+        };
+        if sample.is_some() {
+            session.cpu_sample = sample;
         }
-        session.cpu_percent =
-            session.cpu_history.iter().sum::<f32>() / session.cpu_history.len() as f32;
 
         // Extract args (everything after "claude")
         if let Some(idx) = command.find("claude") {
@@ -162,9 +175,21 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
     for session in sessions.iter_mut() {
         if !alive_pids.contains(&session.pid) {
             session.status = crate::session::SessionStatus::Finished;
-            session.cpu_percent = 0.0;
+            // A dead process consumes nothing. This is a measurement, not an
+            // absence of one, so it is 0.0 rather than None — and the stale
+            // sample goes with it, so a recycled pid cannot be differenced
+            // against its predecessor's counter.
+            session.cpu_rate_percent = Some(0.0);
+            session.cpu_sample = None;
         }
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// True iff `command`'s argv0, after stripping any leading path, is exactly

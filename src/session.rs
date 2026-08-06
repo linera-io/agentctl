@@ -223,8 +223,15 @@ pub struct ClaudeSession {
     /// (one `ps eww` per pid); avoids repeating the probe every refresh tick.
     pub terminal_resolved: bool,
     pub status: SessionStatus,
-    pub cpu_percent: f32,
-    pub cpu_history: Vec<f32>, // Last N CPU readings for smoothing
+    /// CPU used since the previous sample, as a percentage of one core.
+    /// `None` until two samples exist — see [`crate::cpu`] for why `ps`'s
+    /// `%cpu` column cannot answer this question. Renamed from `cpu_percent`
+    /// deliberately: the quantity changed, and every reader had to be revisited.
+    pub cpu_rate_percent: Option<f32>,
+    /// Previous cumulative CPU-time sample, carried across refresh ticks by
+    /// `app::merge_discovered_sessions`. Without that hand-off there is never a
+    /// pair to difference and the rate stays permanently unknown.
+    pub cpu_sample: Option<crate::cpu::CpuSample>,
     pub mem_mb: f64,
     pub own_input_tokens: u64,
     pub own_output_tokens: u64,
@@ -456,8 +463,8 @@ impl ClaudeSession {
             terminal: None,
             terminal_resolved: false,
             status: SessionStatus::Idle,
-            cpu_percent: 0.0,
-            cpu_history: Vec::new(),
+            cpu_rate_percent: None,
+            cpu_sample: None,
             mem_mb: 0.0,
             own_input_tokens: 0,
             own_output_tokens: 0,
@@ -741,6 +748,19 @@ impl ClaudeSession {
         format!("{:.0}M", self.mem_mb)
     }
 
+    /// CPU used since the previous sample, as a percentage of one core.
+    ///
+    /// `-` when no rate has been measured yet — one refresh tick after a
+    /// session appears, and for a sandbox session until two collector passes
+    /// have run. Rendering an unmeasured session as `0.0` would be a claim
+    /// nothing supports.
+    pub fn format_cpu(&self) -> String {
+        match self.cpu_rate_percent {
+            Some(rate) => format!("{rate:.1}"),
+            None => String::from("-"),
+        }
+    }
+
     pub fn format_cost(&self) -> String {
         if !self.usage_metrics_available {
             return "n/a".to_string();
@@ -878,7 +898,9 @@ impl ClaudeSession {
             "cost_usd": cost_usd,
             "burn_rate_per_hr": burn_rate,
             "elapsed_secs": self.elapsed.as_secs(),
-            "cpu": self.cpu_percent,
+            // null rather than 0 when the rate has not been measured yet:
+            // consumers must be able to tell "idle" from "not known".
+            "cpu": self.cpu_rate_percent,
             "mem_mb": (self.mem_mb * 100.0).round() / 100.0,
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,

@@ -34,6 +34,7 @@ pub fn update_tokens(session: &mut ClaudeSession) {
     let mut saw_non_empty_line = false;
     let mut recognized_events = 0usize;
     let mut saw_parent_usage = false;
+    let mut newest_message_ts = 0u64;
     let jsonl_path = session.jsonl_path.clone();
 
     match jsonl_path.as_ref() {
@@ -133,6 +134,9 @@ pub fn update_tokens(session: &mut ClaudeSession) {
                                     TranscriptRole::Assistant => "assistant".to_string(),
                                     TranscriptRole::User => "user".to_string(),
                                 };
+                                if let Some(ts) = message.timestamp_ms {
+                                    newest_message_ts = newest_message_ts.max(ts);
+                                }
 
                                 // Track the most recent user-originated text
                                 // message. Tool results also arrive with the
@@ -304,13 +308,28 @@ pub fn update_tokens(session: &mut ClaudeSession) {
                 session.jsonl_offset = file_len;
             }
 
-            if let Ok(meta) = std::fs::metadata(path) {
-                if let Ok(modified) = meta.modified() {
-                    let mtime_ms = modified
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    session.last_message_ts = mtime_ms;
+            // `last_message_ts` is the newest *conversation* message, taken
+            // from the record's own timestamp and accumulated across ticks
+            // (this parse is incremental, so a tick with no new messages must
+            // keep what earlier ticks learned).
+            //
+            // The file's mtime is only a fallback for transcripts that carry
+            // no parsable timestamp at all. It is not the same quantity:
+            // Claude Code appends bookkeeping records — `system`, `ai-title`,
+            // `bridge-session`, `attachment` — after a turn ends, and each one
+            // bumps mtime without any conversational progress. Reading mtime as
+            // "last message" makes the quiet-session age-outs under-trigger and
+            // would let those records masquerade as the user answering a
+            // permission prompt.
+            session.last_message_ts = session.last_message_ts.max(newest_message_ts);
+            if session.last_message_ts == 0 {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if let Ok(modified) = meta.modified() {
+                        session.last_message_ts = modified
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                    }
                 }
             }
         }
@@ -375,97 +394,236 @@ fn finalize_usage(
     session.last_stop_reason = last_stop_reason.to_string();
     session.is_waiting_for_task = is_waiting_for_task;
 
-    infer_status(session, last_type, last_stop_reason, is_waiting_for_task);
+    infer_status(session, last_type, last_stop_reason);
 }
 
-pub fn infer_status(
-    session: &mut ClaudeSession,
-    last_msg_type: &str,
-    last_stop_reason: &str,
-    is_waiting_for_task: bool,
-) {
-    // Deterministic path: if Claude Code's hooks have fired for this session,
-    // they tell us exactly what state it's in — no CPU/age guessing needed.
-    if !session.session_id.is_empty() {
-        if let Some(state) = HookState::load(&session.session_id) {
-            if let Some(status) =
-                status_from_hook_state(&state, session, last_msg_type, last_stop_reason)
-            {
-                session.status = status;
-                return;
-            }
+/// Load this session's hook state, stamp the clock, and record the verdict.
+///
+/// The thin IO shell around [`decide_status`]: every filesystem read and every
+/// call to the system clock lives here, so the decision itself stays a pure
+/// function of its inputs and can be replayed at any age from fixtures. That
+/// separation is not cosmetic — status defects have repeatedly shipped because
+/// the age-dependent branches were only reachable by waiting in real time.
+pub fn infer_status(session: &mut ClaudeSession, last_msg_type: &str, last_stop_reason: &str) {
+    let hook_state = if session.session_id.is_empty() {
+        None
+    } else {
+        HookState::load(&session.session_id)
+    };
+
+    let verdict = decide_status(&StatusInputs {
+        hook_state: hook_state.as_ref(),
+        now_ms: now_ms(),
+        last_msg_type,
+        last_stop_reason,
+        last_message_ts: session.last_message_ts,
+        cpu_rate_percent: session.cpu_rate_percent,
+        telemetry_available: session.telemetry_status.is_available(),
+    });
+
+    // Log the *evidence*, not just the ruling. Diagnosing a wrong status
+    // otherwise means reconstructing it by hand from raw state files, `ps`,
+    // and /proc sampling — which is exactly how the three defects this
+    // function was rewritten for had to be found.
+    if verdict.status != session.status {
+        crate::logger::log(
+            "DEBUG",
+            &format!(
+                "status: {} {} -> {} ({}) [msg={last_msg_type}/{last_stop_reason} cpu_rate={:?} hook={}]",
+                session.pid,
+                session.status,
+                verdict.status,
+                verdict.reason,
+                session.cpu_rate_percent,
+                hook_state.as_ref().map_or("none".into(), |s| format!(
+                    "notif={:?} turn_age_ms={} stop_age_ms={} tool={:?}",
+                    s.notification_kind,
+                    now_ms().saturating_sub(hook_state::newest_turn_event_ms(s)),
+                    now_ms().saturating_sub(s.last_stop_ts_ms),
+                    s.current_tool_name,
+                )),
+            ),
+        );
+    }
+
+    session.status = verdict.status;
+}
+
+/// Everything [`decide_status`] is allowed to look at. No clock, no filesystem.
+pub struct StatusInputs<'a> {
+    pub hook_state: Option<&'a HookState>,
+    pub now_ms: u64,
+    /// Role of the newest conversation message: `"assistant"`, `"user"`, or
+    /// empty when the transcript yielded none.
+    pub last_msg_type: &'a str,
+    pub last_stop_reason: &'a str,
+    /// Timestamp of the newest conversation message — never the transcript
+    /// file's mtime, which bookkeeping records bump without any conversational
+    /// progress.
+    pub last_message_ts: u64,
+    /// CPU used since the previous sample, as a percentage of one core.
+    /// `None` means "not measured yet" and must never license a claim that the
+    /// session is working.
+    pub cpu_rate_percent: Option<f32>,
+    pub telemetry_available: bool,
+}
+
+/// A status plus the branch that produced it, for the diagnostic log.
+pub struct StatusVerdict {
+    pub status: SessionStatus,
+    pub reason: &'static str,
+}
+
+/// How long a turn may go with no hook event *and* no transcript growth before
+/// we stop believing it is live.
+///
+/// Only applies when no tool is in flight — a single tool call can legitimately
+/// run for hours in silence, and `hook_state::tool_in_flight` licenses exactly
+/// that. What remains is a turn that is neither calling tools nor writing
+/// messages, which is not a turn: its `Stop` was dropped. 15 minutes is well
+/// past the longest tool-free stretch observed in practice (a session was seen
+/// thinking for 15 minutes between its last tool result and `end_turn`), and
+/// crossing it only ever moves a session to a *weaker* claim.
+const TURN_SILENCE_MAX_MS: u64 = 15 * 60 * 1000;
+
+/// A session waiting on the user this long reads as `Idle` instead — the user
+/// has clearly walked away, and surfacing it as `Waiting` forever crowds the
+/// bucket that means "ready for you right now".
+const WAITING_TO_IDLE_MS: u64 = 10 * 60 * 1000;
+
+/// CPU rate, as a percentage of one core, above which a session with no other
+/// evidence is taken to be working. Compared against a *rate* measured between
+/// two samples — never `ps`'s `%cpu`, which is a lifetime average on Linux and
+/// a ~1-minute decaying average on macOS.
+const BUSY_CPU_RATE_PERCENT: f32 = 5.0;
+
+/// Decide a session's status from its evidence. Pure: same inputs, same answer,
+/// on any machine at any time.
+///
+/// The branches are ordered by how strong a claim they make, and the ordering
+/// is the whole point. A status is a claim: `NeedsInput` and `Processing` are
+/// strong ("this session is definitely in this state"), `Waiting` is weaker,
+/// `Unknown` is an admission of ignorance, `Idle` says only that nothing has
+/// happened. **When the evidence for a claim expires or goes missing, the
+/// fall-through must land on a weaker claim, never a stronger one.**
+///
+/// Every status defect fixed here was a violation of that rule: an expiring
+/// permission-prompt marker fell through to `Processing` (a session blocked on
+/// the user, reported as busy); a dropped `Stop` left `Processing` latched
+/// forever; and a lifetime-average CPU number promoted finished sessions to
+/// `Processing` ahead of a transcript that said the turn had ended. `Processing`
+/// is the worst possible default — it means "it's working, leave it alone".
+///
+/// Two properties are asserted over this function in the test suite and are
+/// the reason it is shaped this way:
+///   * **time alone never promotes** — advancing the clock with all other
+///     inputs fixed can never move a session *into* `Processing` or
+///     `NeedsInput`;
+///   * **eventual release** — with no tool in flight, no new events, and no CPU
+///     to show for it, a `Processing` verdict must expire.
+pub fn decide_status(inputs: &StatusInputs) -> StatusVerdict {
+    let transcript_ended = transcript_ended_the_turn(inputs);
+
+    if let Some(state) = inputs.hook_state {
+        // A pending permission prompt outranks everything, including
+        // Compacting and Processing: such a session is technically mid-turn,
+        // but the state that matters to the user is "blocked on me".
+        if hook_state::is_at_permission_prompt(state, inputs.now_ms, inputs.last_message_ts) {
+            return verdict(SessionStatus::NeedsInput, "hook: permission prompt open");
+        }
+        if hook_state::is_compacting(state, inputs.now_ms) {
+            return verdict(SessionStatus::Compacting, "hook: compacting");
+        }
+        if hook_state::is_responding(state) && !transcript_ended && !turn_went_silent(state, inputs)
+        {
+            return verdict(SessionStatus::Processing, "hook: turn in flight");
+        }
+        if hook_state::is_waiting_for_user(state) {
+            return waiting_or_idle(state.last_stop_ts_ms, inputs, "hook: stop is newest event");
         }
     }
 
-    // Heuristic fallback for sessions whose hooks haven't fired yet (started
-    // before claudectl auto-init ran, or never received a tracked event).
-    infer_status_heuristic(
-        session,
-        last_msg_type,
-        last_stop_reason,
-        is_waiting_for_task,
-    );
+    // Transcript evidence outranks CPU. A turn that ended is over however busy
+    // the process still looks — Claude Code's node process routinely burns CPU
+    // on renders and watchers while sitting at an empty prompt.
+    if transcript_ended {
+        return waiting_or_idle(inputs.last_message_ts, inputs, "transcript: turn ended");
+    }
+
+    if inputs
+        .cpu_rate_percent
+        .is_some_and(|rate| rate > BUSY_CPU_RATE_PERCENT)
+    {
+        return verdict(SessionStatus::Processing, "cpu: burning a core");
+    }
+
+    if !inputs.telemetry_available && inputs.last_msg_type.is_empty() {
+        return verdict(SessionStatus::Unknown, "no telemetry");
+    }
+
+    // Hook markers still say mid-turn, but the transcript did not corroborate
+    // it and the session is not burning CPU. We genuinely do not know what
+    // this session is doing — say so, rather than claiming it is working.
+    if inputs.hook_state.is_some_and(hook_state::is_responding) {
+        return verdict(
+            SessionStatus::Unknown,
+            "turn markers dangling, no corroboration",
+        );
+    }
+
+    // Transcript-only fallbacks, for sessions whose hooks have never fired
+    // (started before claudectl's auto-init ran). **Never produces
+    // `NeedsInput`**: every attempt to guess "needs the user's attention" from
+    // JSONL alone was wrong in some common case, and the deterministic
+    // `Notification` hook owns that claim.
+    if matches!(inputs.last_msg_type, "assistant" | "user") {
+        // An `assistant` + `tool_use` tail or a `user` tail (prompt or tool
+        // result) means work was under way as of that message. Recent ⇒
+        // Processing; long quiet ⇒ Idle.
+        return if inputs.now_ms.saturating_sub(inputs.last_message_ts) > WAITING_TO_IDLE_MS {
+            verdict(SessionStatus::Idle, "transcript: mid-turn tail, long quiet")
+        } else {
+            verdict(
+                SessionStatus::Processing,
+                "transcript: mid-turn tail, recent",
+            )
+        };
+    }
+
+    verdict(SessionStatus::Idle, "no evidence of activity")
 }
 
-/// Map a populated hook state to the appropriate status, or `None` when the
-/// state is empty / inconclusive (in which case we fall back to heuristics).
-///
-/// Deterministic status from hook timestamps — no CPU, no age guessing. The
-/// hook helpers in `hook_state` already handle staleness via "most-recent-event"
-/// comparisons, with one exception the transcript has to settle: see
-/// [`transcript_ended_the_turn`].
-///
-/// Precedence (highest to lowest): NeedsInput > Compacting > Processing >
-/// WaitingInput. NeedsInput wins over everything because a pending
-/// permission prompt is always the most actionable state for the user —
-/// we've seen Compacting get stuck when Stop never fires, and without this
-/// ordering it would silently mask every real prompt. NeedsInput beats
-/// Processing for the same reason: a session with a pending permission
-/// prompt is technically "responding" but the relevant state for the user
-/// is "blocked on me." Idle is never produced from hook state — a session
-/// that has fired any hook recently is by definition not idle, and a
-/// session that hasn't fired any hook is handled by the heuristic fallback.
-fn status_from_hook_state(
-    state: &HookState,
-    session: &ClaudeSession,
-    last_msg_type: &str,
-    last_stop_reason: &str,
-) -> Option<SessionStatus> {
-    if hook_state::is_at_permission_prompt(state) {
-        return Some(SessionStatus::NeedsInput);
+fn verdict(status: SessionStatus, reason: &'static str) -> StatusVerdict {
+    StatusVerdict { status, reason }
+}
+
+/// `WaitingInput`, decaying to `Idle` once the user has been away long enough.
+fn waiting_or_idle(since_ms: u64, inputs: &StatusInputs, reason: &'static str) -> StatusVerdict {
+    if inputs.now_ms.saturating_sub(since_ms) > WAITING_TO_IDLE_MS {
+        verdict(SessionStatus::Idle, reason)
+    } else {
+        verdict(SessionStatus::WaitingInput, reason)
     }
-    if hook_state::is_compacting(state) {
-        return Some(SessionStatus::Compacting);
+}
+
+/// Whether a turn that the hook stream still calls live has gone silent on
+/// *both* channels — no hook event and no new message — for longer than a real
+/// turn ever does. See [`TURN_SILENCE_MAX_MS`].
+fn turn_went_silent(state: &HookState, inputs: &StatusInputs) -> bool {
+    if hook_state::tool_in_flight(state) {
+        return false;
     }
-    if hook_state::is_responding(state)
-        && !transcript_ended_the_turn(state, session, last_msg_type, last_stop_reason)
-    {
-        return Some(SessionStatus::Processing);
-    }
-    if hook_state::is_waiting_for_user(state) {
-        // Age out long-quiet WaitingInput → Idle. The user has clearly
-        // walked away; surfacing it as Waiting forever crowds the bucket.
-        // Compacting / NeedsInput / Processing never age out — those are
-        // real "needs attention" or "actively doing something" states.
-        let age_secs = age_secs_since(state.last_stop_ts_ms);
-        return Some(if age_secs > 10 * 60 {
-            SessionStatus::Idle
-        } else {
-            SessionStatus::WaitingInput
-        });
-    }
-    None
+    let newest = hook_state::newest_turn_event_ms(state).max(inputs.last_message_ts);
+    inputs.now_ms.saturating_sub(newest) > TURN_SILENCE_MAX_MS
 }
 
 /// Whether the transcript proves the turn is over even though the hook stream
-/// still looks mid-turn — the one place the JSONL overrules a hook marker.
+/// still looks mid-turn — the place the JSONL overrules a hook marker.
 ///
-/// `is_responding` is the only marker with no expiry (a turn may legitimately
-/// run for hours), so a `Stop` that never reaches claudectl pins the session to
-/// `Processing` for the rest of its life. Hook events are lossy: each one is a
-/// separate `claudectl` process Claude Code spawns with a 5 s timeout, and any
-/// invocation can be dropped. The transcript is not — Claude Code writes it
-/// itself — so when it says the assistant finished its turn we believe it.
+/// Hook events are lossy: each one is a separate `claudectl` process Claude
+/// Code spawns with a 5 s timeout, and any invocation can be dropped. The
+/// transcript is not — Claude Code writes it itself — so when it says the
+/// assistant finished its turn we believe it.
 ///
 /// Two conditions, both required:
 ///   1. the tail is an assistant message that *ended* (`end_turn` /
@@ -475,92 +633,23 @@ fn status_from_hook_state(
 ///      otherwise it describes the *previous* turn and vetoing on it would
 ///      report a live turn as finished. This is what keeps the fix from
 ///      trading one wrong status for its mirror image.
-fn transcript_ended_the_turn(
-    state: &HookState,
-    session: &ClaudeSession,
-    last_msg_type: &str,
-    last_stop_reason: &str,
-) -> bool {
-    if last_msg_type != "assistant" || !matches!(last_stop_reason, "end_turn" | "stop_sequence") {
+fn transcript_ended_the_turn(inputs: &StatusInputs) -> bool {
+    if inputs.last_msg_type != "assistant"
+        || !matches!(inputs.last_stop_reason, "end_turn" | "stop_sequence")
+    {
         return false;
     }
-    session.last_message_ts >= hook_state::newest_turn_event_ms(state)
+    match inputs.hook_state {
+        Some(state) => inputs.last_message_ts >= hook_state::newest_turn_event_ms(state),
+        None => true,
+    }
 }
 
-/// Heuristic fallback when the deterministic hook state path returned None.
-///
-/// **The heuristic NEVER produces `NeedsInput`.** Every previous attempt to
-/// guess "this session needs the user's attention" from JSONL + CPU + age
-/// was wrong in at least one common case (parked sessions, auto-compacting
-/// sessions, fast-tool sessions, transient JSONL states). NeedsInput is the
-/// exclusive domain of the deterministic `Notification` hook; if the marker
-/// isn't set, we don't claim it. Fall back to Processing / WaitingInput /
-/// Idle / Unknown only.
-fn infer_status_heuristic(
-    session: &mut ClaudeSession,
-    last_msg_type: &str,
-    last_stop_reason: &str,
-    _is_waiting_for_task: bool,
-) {
-    if session.cpu_percent > 5.0 {
-        session.status = SessionStatus::Processing;
-        return;
-    }
-
-    if !session.telemetry_status.is_available() && last_msg_type.is_empty() {
-        session.status = SessionStatus::Unknown;
-        return;
-    }
-
-    if last_msg_type == "assistant"
-        && (last_stop_reason == "end_turn" || last_stop_reason == "stop_sequence")
-    {
-        // Stop-equivalent state from JSONL alone (for sessions whose Stop
-        // hook hasn't fired). Age out to Idle after 10 quiet minutes.
-        session.status = if age_secs_since(session.last_message_ts) > 10 * 60 {
-            SessionStatus::Idle
-        } else {
-            SessionStatus::WaitingInput
-        };
-        return;
-    }
-
-    if last_msg_type == "assistant" && last_stop_reason == "tool_use" {
-        // Claude emitted a tool_use. Without a deterministic permission-prompt
-        // signal we cannot tell if this is "running" or "waiting on the
-        // human", so default to Processing while recent and Idle once long
-        // quiet. The deterministic path catches the real waiting-on-human
-        // case via the Notification hook.
-        session.status = if age_secs_since(session.last_message_ts) > 10 * 60 {
-            SessionStatus::Idle
-        } else {
-            SessionStatus::Processing
-        };
-        return;
-    }
-
-    if last_msg_type == "user" {
-        // User message tail (genuine prompt or tool_result). Same shape as
-        // the assistant + tool_use branch — recent ⇒ Processing, long
-        // quiet ⇒ Idle. NeedsInput only if the deterministic Notification
-        // hook says so.
-        session.status = if age_secs_since(session.last_message_ts) > 10 * 60 {
-            SessionStatus::Idle
-        } else {
-            SessionStatus::Processing
-        };
-        return;
-    }
-
-    session.status = SessionStatus::Idle;
-}
-
-fn age_secs_since(ts_ms: u64) -> u64 {
-    let now_ms = std::time::SystemTime::now()
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64;
-    now_ms.saturating_sub(ts_ms) / 1000
+        .as_millis() as u64
 }
 
 /// Estimate USD cost based on token usage and model.

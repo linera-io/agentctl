@@ -44,6 +44,15 @@ pub fn do_refresh_io(prev_sessions: Vec<ClaudeSession>) -> RefreshIoOutput {
     let discovered = discovery::scan_sessions();
     let scan_elapsed = scan_start.elapsed();
 
+    // Captured before the merge consumes `prev_sessions`. Native rows carry
+    // their own previous sample through the merge; foreign rows are rebuilt
+    // from scratch every tick and would otherwise never have a pair to
+    // difference, leaving every sandbox session's CPU permanently unknown.
+    let prev_cpu_samples: std::collections::HashMap<String, crate::cpu::CpuSample> = prev_sessions
+        .iter()
+        .filter_map(|session| Some((session.session_id.clone(), session.cpu_sample?)))
+        .collect();
+
     let (mut sessions, new_pids) = merge_discovered_sessions(prev_sessions, discovered);
 
     let ps_start = std::time::Instant::now();
@@ -83,7 +92,7 @@ pub fn do_refresh_io(prev_sessions: Vec<ClaudeSession>) -> RefreshIoOutput {
     // already had, and pinned it to whatever claudectl version happens to be
     // baked into that sandbox's image. Only what is genuinely per-VM (pid,
     // cpu, mem) still comes from the snapshot.
-    let mut foreign = foreign_sessions(&sessions);
+    let mut foreign = foreign_sessions(&sessions, &prev_cpu_samples);
     for session in &mut foreign {
         if session.jsonl_path.is_none() {
             discovery::resolve_jsonl_paths(std::slice::from_mut(session));
@@ -123,7 +132,10 @@ pub fn do_refresh_io(prev_sessions: Vec<ClaudeSession>) -> RefreshIoOutput {
 /// and de-dupes on `session_id`, which now matters for more than mislabelling:
 /// one session id legitimately appears under two sandbox keys once a session
 /// has been resumed in a newer sandbox, and only one row should render.
-fn foreign_sessions(local: &[ClaudeSession]) -> Vec<ClaudeSession> {
+fn foreign_sessions(
+    local: &[ClaudeSession],
+    prev_cpu_samples: &std::collections::HashMap<String, crate::cpu::CpuSample>,
+) -> Vec<ClaudeSession> {
     let here = crate::sandbox_registry::current_sandbox();
     let registry = crate::sandbox_registry::load();
     let snapshot = crate::sandbox_registry::load_snapshot();
@@ -141,6 +153,7 @@ fn foreign_sessions(local: &[ClaudeSession]) -> Vec<ClaudeSession> {
         now_ms(),
         collector_interval(),
         open_ttys.as_ref(),
+        prev_cpu_samples,
     )
 }
 
@@ -164,6 +177,7 @@ pub(crate) fn foreign_sessions_from(
     now_ms: u64,
     collector_interval: std::time::Duration,
     open_ttys: Option<&std::collections::HashMap<String, std::collections::HashSet<String>>>,
+    prev_cpu_samples: &std::collections::HashMap<String, crate::cpu::CpuSample>,
 ) -> Vec<ClaudeSession> {
     let vitals = snapshot_vitals_at(snapshot, now_ms, collector_interval);
 
@@ -206,7 +220,17 @@ pub(crate) fn foreign_sessions_from(
                 continue;
             }
             if let Some(vitals) = vitals.get(session.session_id.as_str()) {
-                session.cpu_percent = vitals.cpu_percent;
+                // Foreign rows are rebuilt from the registry every tick — they
+                // never pass through `merge_discovered_sessions`, which is what
+                // carries a native session's previous sample forward. So the
+                // previous sample is threaded in explicitly, keyed by session
+                // id (pids are not unique across sandbox namespaces).
+                session.cpu_rate_percent = prev_cpu_samples
+                    .get(session.session_id.as_str())
+                    .copied()
+                    .zip(vitals.cpu_sample)
+                    .and_then(|(prev, cur)| crate::cpu::cpu_rate_percent(prev, cur));
+                session.cpu_sample = vitals.cpu_sample;
                 session.mem_mb = vitals.mem_mb;
             }
             out.push(session);
@@ -306,7 +330,11 @@ fn collector_interval() -> std::time::Duration {
 
 /// The per-VM measurements the host cannot take itself.
 pub(crate) struct SnapshotVitals {
-    pub cpu_percent: f32,
+    /// Cumulative CPU seconds as of the snapshot's `collected_at_ms`, not a
+    /// percentage: the host differences consecutive snapshots into a rate, the
+    /// same way it does for native pids. `None` when the collector predates
+    /// this field, which leaves the rate unknown rather than inventing one.
+    pub cpu_sample: Option<crate::cpu::CpuSample>,
     pub mem_mb: f64,
 }
 
@@ -342,10 +370,13 @@ pub(crate) fn snapshot_vitals_at(
             out.insert(
                 id.to_string(),
                 SnapshotVitals {
-                    cpu_percent: value
-                        .get("cpu")
+                    cpu_sample: value
+                        .get("cputime_secs")
                         .and_then(serde_json::Value::as_f64)
-                        .unwrap_or(0.0) as f32,
+                        .map(|cputime_secs| crate::cpu::CpuSample {
+                            cputime_secs,
+                            sampled_at_ms: snapshot.collected_at_ms,
+                        }),
                     mem_mb: value
                         .get("mem_mb")
                         .and_then(serde_json::Value::as_f64)
@@ -3020,6 +3051,12 @@ mod foreign_session_tests {
         sessions.iter().map(|s| s.session_id.as_str()).collect()
     }
 
+    /// No previous CPU sample — the first tick after startup. Rows still
+    /// render; their CPU rate is simply not known yet.
+    fn no_prev_cpu() -> std::collections::HashMap<String, crate::cpu::CpuSample> {
+        std::collections::HashMap::new()
+    }
+
     #[test]
     fn a_session_renders_from_the_registry_alone() {
         // The reported bug's second half: a session started in a sandbox the
@@ -3036,6 +3073,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["250a74d3"]);
         assert_eq!(rows[0].display_name(), "new");
@@ -3060,6 +3098,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["250a74d3"]);
         assert_eq!(
@@ -3084,6 +3123,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["f5bb6dba"]);
     }
@@ -3111,6 +3151,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["250a74d3"]);
     }
@@ -3135,6 +3176,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["f5bb6dba", "250a74d3"]);
     }
@@ -3156,6 +3198,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert!(rows.is_empty(), "hidden from the view");
         assert_eq!(
@@ -3207,6 +3250,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             Some(&open),
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["here-1"]);
     }
@@ -3230,6 +3274,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             Some(&open),
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["gone-1", "here-1"]);
     }
@@ -3251,6 +3296,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["gone-1"]);
     }
@@ -3275,6 +3321,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             Some(&open),
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["gone-1"]);
     }
@@ -3300,6 +3347,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             Some(&open),
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["no-tty", "here-1"]);
     }
@@ -3332,6 +3380,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             Some(&open),
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["a-1"], "b-1's window is closed; a-1's is not");
     }
@@ -3351,6 +3400,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["remote-1"]);
     }
@@ -3373,6 +3423,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["a02a0bcd"]);
     }
@@ -3398,6 +3449,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert!(rows.is_empty());
     }
@@ -3418,9 +3470,53 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
-        assert_eq!(rows[0].cpu_percent, 7.5);
         assert_eq!(rows[0].mem_mb, 256.0);
+        assert_eq!(
+            rows[0].cpu_rate_percent, None,
+            "one snapshot is one sample; a rate needs two"
+        );
+        assert_eq!(
+            rows[0]
+                .cpu_sample
+                .expect("the sample is carried forward")
+                .cputime_secs,
+            7.5,
+            "and it must be retained, or the next tick has nothing to difference"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_sessions_cpu_rate_comes_from_two_consecutive_snapshots() {
+        // Foreign rows are rebuilt from the registry every tick and never pass
+        // through `merge_discovered_sessions`, so the previous sample reaches
+        // them only through the explicit hand-off. Without it every sandbox
+        // session's CPU stays unknown forever — and `Processing` would never be
+        // claimed for one that genuinely is working.
+        let registry = registry_of(&[("linera-agent-live", vec![entry("abc-123", "row", 11036)])]);
+        let snapshot = snapshot_collected_at(NOW);
+        // 2.5 CPU-seconds consumed over the 5 s between collector passes.
+        let prev = std::collections::HashMap::from([(
+            "abc-123".to_string(),
+            crate::cpu::CpuSample {
+                cputime_secs: 5.0,
+                sampled_at_ms: NOW - 5_000,
+            },
+        )]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &snapshot,
+            &running(&["linera-agent-live"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+            None,
+            &prev,
+        );
+        let rate = rows[0].cpu_rate_percent.expect("two samples make a rate");
+        assert!((rate - 50.0).abs() < 0.01, "got {rate}");
     }
 
     #[test]
@@ -3438,9 +3534,13 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["fresh-1"]);
-        assert_eq!(rows[0].cpu_percent, 0.0);
+        assert_eq!(
+            rows[0].cpu_rate_percent, None,
+            "unmeasured reads as unknown, not as an idle 0"
+        );
         assert_eq!(rows[0].mem_mb, 0.0);
     }
 
@@ -3471,6 +3571,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["seen-1"]);
     }
@@ -3488,7 +3589,7 @@ mod foreign_session_tests {
             SandboxOrigin {
                 is_current: true,
                 sessions: vec![serde_json::json!({
-                    "session_id": "abc-123", "cpu": 7.5, "mem_mb": 256.0,
+                    "session_id": "abc-123", "cputime_secs": 7.5, "mem_mb": 256.0,
                 })],
             },
         );
@@ -3499,7 +3600,7 @@ mod foreign_session_tests {
     fn a_fresh_snapshot_supplies_vitals() {
         let snapshot = snapshot_collected_at(NOW - 60_000);
         let vitals = snapshot_vitals_at(&snapshot, NOW, INTERVAL);
-        assert_eq!(vitals["abc-123"].cpu_percent, 7.5);
+        assert_eq!(vitals["abc-123"].cpu_sample.unwrap().cputime_secs, 7.5);
     }
 
     #[test]
@@ -3573,9 +3674,13 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["abc-123"]);
-        assert_eq!(rows[0].cpu_percent, 0.0, "stale vitals must not be shown");
+        assert_eq!(
+            rows[0].cpu_rate_percent, None,
+            "stale vitals must not be shown"
+        );
     }
 
     /// `running_sandbox_filter` with the `sbx` call's result injected.

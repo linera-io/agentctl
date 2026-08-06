@@ -934,7 +934,7 @@ pub(crate) fn print_list(demo: bool, filters: &ViewFilters) -> io::Result<()> {
             s.status.to_string()
         };
         println!(
-            "{:<7} {:<16} {:<12} {:<8} {:<8} {:<9} {:<10} {:<6.1} {:<6} {}",
+            "{:<7} {:<16} {:<12} {:<8} {:<8} {:<9} {:<10} {:<6} {:<6} {}",
             s.pid,
             s.display_name(),
             status_text,
@@ -942,7 +942,7 @@ pub(crate) fn print_list(demo: bool, filters: &ViewFilters) -> io::Result<()> {
             s.format_cost(),
             s.format_burn_rate(),
             s.format_elapsed(),
-            s.cpu_percent,
+            s.format_cpu(),
             s.format_mem(),
             s.format_tokens(),
         );

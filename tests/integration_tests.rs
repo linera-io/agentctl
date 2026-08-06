@@ -35,7 +35,7 @@ fn make_session(cpu: f32, last_message_age_secs: u64) -> ClaudeSession {
         name_source: None,
     };
     let mut s = ClaudeSession::from_raw(raw);
-    s.cpu_percent = cpu;
+    s.cpu_rate_percent = Some(cpu);
     s.telemetry_status = TelemetryStatus::Available;
     s.usage_metrics_available = true;
 
@@ -87,7 +87,7 @@ fn a_session_blocked_on_a_permission_prompt_reads_as_needs_input() {
     )
     .unwrap();
 
-    monitor::infer_status(&mut session, "user", "", false);
+    monitor::infer_status(&mut session, "user", "");
 
     assert_eq!(
         session.status,
@@ -101,7 +101,7 @@ fn a_session_blocked_on_a_permission_prompt_reads_as_needs_input() {
     // and not by something incidental to the session fixture.
     std::fs::remove_file(std::path::Path::new(&dir).join(format!("{}.json", session.session_id)))
         .unwrap();
-    monitor::infer_status(&mut session, "user", "", false);
+    monitor::infer_status(&mut session, "user", "");
     assert_eq!(
         session.status,
         SessionStatus::Processing,
@@ -112,22 +112,32 @@ fn a_session_blocked_on_a_permission_prompt_reads_as_needs_input() {
 #[test]
 fn status_high_cpu_always_processing() {
     let mut s = make_session(50.0, 0);
-    monitor::infer_status(&mut s, "", "", false);
+    monitor::infer_status(&mut s, "", "");
     assert_eq!(s.status, SessionStatus::Processing);
 }
 
 #[test]
-fn status_high_cpu_overrides_waiting_for_task() {
-    let mut s = make_session(10.0, 0);
-    monitor::infer_status(&mut s, "assistant", "end_turn", true);
-    assert_eq!(s.status, SessionStatus::Processing);
-}
-
-#[test]
-fn status_high_cpu_overrides_end_turn() {
-    let mut s = make_session(20.0, 60);
-    monitor::infer_status(&mut s, "assistant", "end_turn", false);
-    assert_eq!(s.status, SessionStatus::Processing);
+fn status_a_finished_turn_outranks_high_cpu() {
+    // **This assertion is deliberately the reverse of what it used to be.**
+    // `status_high_cpu_overrides_waiting_for_task` and
+    // `status_high_cpu_overrides_end_turn` asserted `Processing` here, which
+    // encoded defect D3 as intended behaviour: CPU was checked before any
+    // transcript evidence, so a session whose turn had demonstrably ended
+    // rendered as busy. Claude Code's node process burns CPU on renders and
+    // watchers while sitting at an empty prompt, and the number being compared
+    // was `ps %cpu` — a lifetime average on Linux — so this branch latched.
+    //
+    // A turn that ended is over. CPU cannot un-end it; it only speaks for
+    // sessions with no transcript evidence at all.
+    for cpu in [10.0, 20.0, 95.0] {
+        let mut s = make_session(cpu, 0);
+        monitor::infer_status(&mut s, "assistant", "end_turn");
+        assert_eq!(
+            s.status,
+            SessionStatus::WaitingInput,
+            "end_turn with cpu={cpu} is a finished turn, not a busy one"
+        );
+    }
 }
 
 #[test]
@@ -137,7 +147,7 @@ fn status_waiting_for_task_no_longer_promotes_needs_input() {
     // exclusively driven by the deterministic Notification hook now.
     // Heuristic still falls back to a sensible non-attention-grabbing state.
     let mut s = make_session(0.5, 10);
-    monitor::infer_status(&mut s, "", "", true);
+    monitor::infer_status(&mut s, "", "");
     assert_ne!(s.status, SessionStatus::NeedsInput);
 }
 
@@ -145,7 +155,7 @@ fn status_waiting_for_task_no_longer_promotes_needs_input() {
 fn status_end_turn_recent_waiting_input() {
     // Assistant said end_turn, 2 minutes ago, low CPU
     let mut s = make_session(0.5, 120);
-    monitor::infer_status(&mut s, "assistant", "end_turn", false);
+    monitor::infer_status(&mut s, "assistant", "end_turn");
     assert_eq!(s.status, SessionStatus::WaitingInput);
 }
 
@@ -156,14 +166,14 @@ fn status_end_turn_old_idle_in_heuristic_path() {
     // can sort/filter past it. The deterministic Stop hook handles still-active
     // post-turn sessions before we reach this branch.
     let mut s = make_session(0.5, 15 * 60);
-    monitor::infer_status(&mut s, "assistant", "end_turn", false);
+    monitor::infer_status(&mut s, "assistant", "end_turn");
     assert_eq!(s.status, SessionStatus::Idle);
 }
 
 #[test]
 fn status_end_turn_recent_waiting_input_still_works() {
     let mut s = make_session(0.5, 10 * 60);
-    monitor::infer_status(&mut s, "assistant", "end_turn", false);
+    monitor::infer_status(&mut s, "assistant", "end_turn");
     assert_eq!(s.status, SessionStatus::WaitingInput);
 }
 
@@ -174,7 +184,7 @@ fn status_tool_use_low_cpu_no_longer_promotes_needs_input() {
     // (parked sessions, sessions with stale tool_use tail, etc.). NeedsInput
     // is now exclusively the Notification hook's call.
     let mut s = make_session(0.5, 30);
-    monitor::infer_status(&mut s, "assistant", "tool_use", false);
+    monitor::infer_status(&mut s, "assistant", "tool_use");
     assert_ne!(s.status, SessionStatus::NeedsInput);
 }
 
@@ -182,7 +192,7 @@ fn status_tool_use_low_cpu_no_longer_promotes_needs_input() {
 fn status_tool_use_low_cpu_recent_processing() {
     // tool_use + low CPU + <5s ago = still processing (tool just fired)
     let mut s = make_session(0.5, 2);
-    monitor::infer_status(&mut s, "assistant", "tool_use", false);
+    monitor::infer_status(&mut s, "assistant", "tool_use");
     assert_eq!(s.status, SessionStatus::Processing);
 }
 
@@ -190,7 +200,7 @@ fn status_tool_use_low_cpu_recent_processing() {
 fn status_tool_use_high_cpu_processing() {
     // tool_use + high CPU = still crunching
     let mut s = make_session(15.0, 30);
-    monitor::infer_status(&mut s, "assistant", "tool_use", false);
+    monitor::infer_status(&mut s, "assistant", "tool_use");
     assert_eq!(s.status, SessionStatus::Processing);
 }
 
@@ -198,7 +208,7 @@ fn status_tool_use_high_cpu_processing() {
 fn status_user_message_active_cpu_processing() {
     // CPU > 2.0 → Claude is actually thinking, regardless of age.
     let mut s = make_session(3.0, 30);
-    monitor::infer_status(&mut s, "user", "", false);
+    monitor::infer_status(&mut s, "user", "");
     assert_eq!(s.status, SessionStatus::Processing);
 }
 
@@ -206,7 +216,7 @@ fn status_user_message_active_cpu_processing() {
 fn status_user_message_recent_low_cpu_processing() {
     // Fresh user message + low CPU = still warming up; stay Processing.
     let mut s = make_session(0.5, 1);
-    monitor::infer_status(&mut s, "user", "", false);
+    monitor::infer_status(&mut s, "user", "");
     assert_eq!(s.status, SessionStatus::Processing);
 }
 
@@ -217,7 +227,7 @@ fn status_user_message_quiet_low_cpu_stays_processing() {
     // same. Stay Processing while still recent so we don't bury an actually-
     // active session, but age out to Idle eventually (covered separately).
     let mut s = make_session(0.5, 30);
-    monitor::infer_status(&mut s, "user", "", false);
+    monitor::infer_status(&mut s, "user", "");
     assert_eq!(s.status, SessionStatus::Processing);
 }
 
@@ -228,7 +238,7 @@ fn status_user_message_long_quiet_idle_in_heuristic_path() {
     // already flipped it to NeedsInput before reaching this branch if the
     // session was actually waiting on a permission prompt.
     let mut s = make_session(0.5, 15 * 60);
-    monitor::infer_status(&mut s, "user", "", false);
+    monitor::infer_status(&mut s, "user", "");
     assert_eq!(s.status, SessionStatus::Idle);
 }
 
@@ -236,7 +246,7 @@ fn status_user_message_long_quiet_idle_in_heuristic_path() {
 fn status_no_signals_idle() {
     // No JSONL signals at all → Idle
     let mut s = make_session(0.0, 0);
-    monitor::infer_status(&mut s, "", "", false);
+    monitor::infer_status(&mut s, "", "");
     assert_eq!(s.status, SessionStatus::Idle);
 }
 
@@ -252,7 +262,7 @@ fn status_no_telemetry_unknown() {
         name_source: None,
     };
     let mut s = ClaudeSession::from_raw(raw);
-    monitor::infer_status(&mut s, "", "", false);
+    monitor::infer_status(&mut s, "", "");
     assert_eq!(s.status, SessionStatus::Unknown);
 }
 
@@ -273,7 +283,7 @@ fn session_with_id(id: &str, cpu: f32) -> ClaudeSession {
         name_source: None,
     };
     let mut s = ClaudeSession::from_raw(raw);
-    s.cpu_percent = cpu;
+    s.cpu_rate_percent = Some(cpu);
     s.telemetry_status = TelemetryStatus::Available;
     s.usage_metrics_available = true;
     s.last_message_ts = std::time::SystemTime::now()
@@ -305,7 +315,7 @@ fn hook_permission_prompt_marks_needs_input() {
     // NOT grown past the notification → NeedsInput (deterministic path).
     let mut s = session_with_id(sid, 0.5);
     s.last_message_ts = state.last_notification_ts_ms.saturating_sub(1000);
-    monitor::infer_status(&mut s, "user", "", false);
+    monitor::infer_status(&mut s, "user", "");
     assert_eq!(s.status, SessionStatus::NeedsInput);
 }
 
@@ -329,7 +339,7 @@ fn hook_pretooluse_clears_permission_prompt() {
     // Approval flipped the marker; we should now report Processing (a tool
     // is actively running, no PostToolUse yet).
     let mut s = session_with_id(sid, 0.5);
-    monitor::infer_status(&mut s, "assistant", "tool_use", false);
+    monitor::infer_status(&mut s, "assistant", "tool_use");
     assert_eq!(s.status, SessionStatus::Processing);
 }
 
@@ -344,7 +354,7 @@ fn hook_precompact_marks_compacting() {
     .unwrap();
 
     let mut s = session_with_id(sid, 0.5);
-    monitor::infer_status(&mut s, "user", "", false);
+    monitor::infer_status(&mut s, "user", "");
     assert_eq!(s.status, SessionStatus::Compacting);
 }
 
@@ -359,7 +369,7 @@ fn hook_stop_marks_waiting_input() {
     .unwrap();
 
     let mut s = session_with_id(sid, 0.5);
-    monitor::infer_status(&mut s, "assistant", "end_turn", false);
+    monitor::infer_status(&mut s, "assistant", "end_turn");
     assert_eq!(s.status, SessionStatus::WaitingInput);
 }
 
@@ -380,7 +390,7 @@ fn hook_userpromptsubmit_after_stop_marks_responding() {
     .unwrap();
 
     let mut s = session_with_id(sid, 0.5);
-    monitor::infer_status(&mut s, "user", "", false);
+    monitor::infer_status(&mut s, "user", "");
     assert_eq!(s.status, SessionStatus::Processing);
 }
 
@@ -401,7 +411,7 @@ fn hook_waiting_input_ages_out_to_idle() {
     std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
 
     let mut s = session_with_id(sid, 0.5);
-    monitor::infer_status(&mut s, "assistant", "end_turn", false);
+    monitor::infer_status(&mut s, "assistant", "end_turn");
     assert_eq!(s.status, SessionStatus::Idle);
 }
 
@@ -416,7 +426,7 @@ fn hook_waiting_input_recent_stays_waiting() {
     .unwrap();
 
     let mut s = session_with_id(sid, 0.5);
-    monitor::infer_status(&mut s, "assistant", "end_turn", false);
+    monitor::infer_status(&mut s, "assistant", "end_turn");
     assert_eq!(s.status, SessionStatus::WaitingInput);
 }
 
@@ -443,7 +453,7 @@ fn hook_responding_stable_across_tool_boundaries() {
     }
 
     let mut s = session_with_id(sid, 0.5);
-    monitor::infer_status(&mut s, "assistant", "tool_use", false);
+    monitor::infer_status(&mut s, "assistant", "tool_use");
     assert_eq!(s.status, SessionStatus::Processing);
 
     // Stop fires → flips to WaitingInput, also stable.
@@ -453,7 +463,7 @@ fn hook_responding_stable_across_tool_boundaries() {
     }))
     .unwrap();
     let mut s = session_with_id(sid, 0.5);
-    monitor::infer_status(&mut s, "assistant", "end_turn", false);
+    monitor::infer_status(&mut s, "assistant", "end_turn");
     assert_eq!(s.status, SessionStatus::WaitingInput);
 }
 
@@ -480,7 +490,7 @@ fn hook_permission_prompt_cleared_by_subsequent_event() {
     .unwrap();
 
     let mut s = session_with_id(sid, 0.5);
-    monitor::infer_status(&mut s, "assistant", "tool_use", false);
+    monitor::infer_status(&mut s, "assistant", "tool_use");
     assert_ne!(s.status, SessionStatus::NeedsInput);
 }
 
@@ -506,7 +516,7 @@ fn hook_worker_permission_prompt_marks_needs_input() {
 
     let mut s = session_with_id(sid, 0.5);
     s.last_message_ts = state.last_notification_ts_ms.saturating_sub(1000);
-    monitor::infer_status(&mut s, "user", "", false);
+    monitor::infer_status(&mut s, "user", "");
     assert_eq!(s.status, SessionStatus::NeedsInput);
 }
 
@@ -530,7 +540,7 @@ fn hook_worker_pretooluse_clears_permission_prompt() {
     .unwrap();
 
     let mut s = session_with_id(sid, 0.5);
-    monitor::infer_status(&mut s, "assistant", "tool_use", false);
+    monitor::infer_status(&mut s, "assistant", "tool_use");
     assert_ne!(s.status, SessionStatus::NeedsInput);
 }
 
@@ -561,7 +571,7 @@ fn hook_permission_prompt_outranks_compacting() {
     std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
 
     let mut s = session_with_id(sid, 0.5);
-    monitor::infer_status(&mut s, "user", "", false);
+    monitor::infer_status(&mut s, "user", "");
     assert_eq!(s.status, SessionStatus::NeedsInput);
 }
 
@@ -580,7 +590,7 @@ fn hook_postcompact_clears_compacting_without_stop() {
 
     // Mid-compact: Compacting is the correct status.
     let mut s = session_with_id(sid, 0.5);
-    monitor::infer_status(&mut s, "user", "", false);
+    monitor::infer_status(&mut s, "user", "");
     assert_eq!(s.status, SessionStatus::Compacting);
 
     // PostCompact arrives. Stop never fires.
@@ -590,7 +600,7 @@ fn hook_postcompact_clears_compacting_without_stop() {
     }))
     .unwrap();
     let mut s = session_with_id(sid, 0.5);
-    monitor::infer_status(&mut s, "user", "", false);
+    monitor::infer_status(&mut s, "user", "");
     assert_ne!(s.status, SessionStatus::Compacting);
 }
 
@@ -636,7 +646,7 @@ fn regression_lost_stop_does_not_pin_finished_turn_to_processing() {
     // Transcript ended the turn AFTER the last recorded hook event.
     let mut s = session_with_id(sid, 0.5);
     s.last_message_ts = state.last_posttooluse_ts_ms + 1_000;
-    monitor::infer_status(&mut s, "assistant", "end_turn", false);
+    monitor::infer_status(&mut s, "assistant", "end_turn");
     assert_eq!(s.status, SessionStatus::WaitingInput);
 }
 
@@ -649,7 +659,7 @@ fn regression_lost_stop_long_quiet_session_ages_to_idle() {
 
     let mut s = session_with_id(sid, 0.5);
     s.last_message_ts = state.last_posttooluse_ts_ms + 1_000;
-    monitor::infer_status(&mut s, "assistant", "end_turn", false);
+    monitor::infer_status(&mut s, "assistant", "end_turn");
     assert_eq!(s.status, SessionStatus::Idle);
 }
 
@@ -663,7 +673,7 @@ fn regression_lost_stop_veto_needs_a_finished_transcript_tail() {
 
     let mut s = session_with_id(sid, 0.5);
     s.last_message_ts = state.last_posttooluse_ts_ms + 1_000;
-    monitor::infer_status(&mut s, "assistant", "tool_use", false);
+    monitor::infer_status(&mut s, "assistant", "tool_use");
     assert_eq!(s.status, SessionStatus::Processing);
 }
 
@@ -689,7 +699,7 @@ fn regression_transcript_veto_never_masks_a_live_turn() {
     let state = claudectl::hook_state::HookState::load(sid).unwrap();
     let mut s = session_with_id(sid, 0.5);
     s.last_message_ts = state.last_promptsubmit_ts_ms.saturating_sub(1_000);
-    monitor::infer_status(&mut s, "assistant", "end_turn", false);
+    monitor::infer_status(&mut s, "assistant", "end_turn");
     assert_eq!(s.status, SessionStatus::Processing);
 }
 
@@ -710,7 +720,7 @@ fn regression_transcript_veto_never_masks_an_in_flight_tool() {
     let state = claudectl::hook_state::HookState::load(sid).unwrap();
     let mut s = session_with_id(sid, 0.5);
     s.last_message_ts = state.last_pretooluse_ts_ms.saturating_sub(1_000);
-    monitor::infer_status(&mut s, "assistant", "end_turn", false);
+    monitor::infer_status(&mut s, "assistant", "end_turn");
     assert_eq!(s.status, SessionStatus::Processing);
 }
 
@@ -718,12 +728,12 @@ fn regression_transcript_veto_never_masks_an_in_flight_tool() {
 fn status_cpu_threshold_boundary() {
     // CPU exactly 5.0 — should NOT trigger Processing (threshold is >5.0)
     let mut s = make_session(5.0, 0);
-    monitor::infer_status(&mut s, "", "", false);
+    monitor::infer_status(&mut s, "", "");
     assert_eq!(s.status, SessionStatus::Idle);
 
     // CPU 5.1 — should trigger Processing
     let mut s2 = make_session(5.1, 0);
-    monitor::infer_status(&mut s2, "", "", false);
+    monitor::infer_status(&mut s2, "", "");
     assert_eq!(s2.status, SessionStatus::Processing);
 }
 
@@ -736,7 +746,7 @@ fn status_persisted_tool_use_survives_empty_tick() {
     // stops growing.
     let mut s = make_session(0.5, 30);
 
-    monitor::infer_status(&mut s, "assistant", "tool_use", false);
+    monitor::infer_status(&mut s, "assistant", "tool_use");
     let first_tick = s.status;
     assert_ne!(first_tick, SessionStatus::Idle);
 
@@ -746,8 +756,7 @@ fn status_persisted_tool_use_survives_empty_tick() {
 
     let msg_type = s.last_msg_type.clone();
     let stop_reason = s.last_stop_reason.clone();
-    let waiting = s.is_waiting_for_task;
-    monitor::infer_status(&mut s, &msg_type, &stop_reason, waiting);
+    monitor::infer_status(&mut s, &msg_type, &stop_reason);
     assert_eq!(s.status, first_tick);
 }
 
@@ -760,7 +769,7 @@ fn status_null_stop_reason_with_tool_use_inferred_from_content() {
     let jsonl = r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-4-6","stop_reason":null,"content":[{"type":"tool_use","id":"toolu_01X","name":"Bash","input":{"command":"echo hi"}}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
 
     let (mut s, _file) = make_session_with_jsonl(jsonl);
-    s.cpu_percent = 0.5;
+    s.cpu_rate_percent = Some(0.5);
     monitor::update_tokens(&mut s);
 
     assert_eq!(s.last_stop_reason, "tool_use");
@@ -1183,7 +1192,7 @@ fn jsonl_waiting_for_task_no_longer_promotes_needs_input() {
     );
 
     let (mut s, _file) = make_session_with_jsonl(jsonl);
-    s.cpu_percent = 0.5;
+    s.cpu_rate_percent = Some(0.5);
     monitor::update_tokens(&mut s);
 
     assert_ne!(s.status, SessionStatus::NeedsInput);
@@ -1796,4 +1805,452 @@ fn a_foreign_session_derives_the_same_transcript_values_as_a_local_one() {
     // we may signal the pid.
     assert!(!foreign.origin.is_addressable());
     assert!(local.origin.is_addressable());
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Status degradation
+//
+// `decide_status` is a pure function of its inputs, which is what makes this
+// section possible: every scenario below is replayed at an arbitrary age
+// without sleeping, setting an env var, or touching a real session. The three
+// defects these tests pin were all *reachable only by waiting in real time*
+// under the previous shape, which is why they shipped.
+//
+// The rule under test, in one sentence: **when the evidence for a status
+// expires or goes missing, the fall-through must land on a weaker claim, never
+// a stronger one.** `Processing` is the strongest and most misleading default —
+// it tells the user "working, leave it alone" about a session that may be
+// blocked on them.
+// ────────────────────────────────────────────────────────────────────────────
+
+use claudectl::hook_state::HookState;
+use claudectl::monitor::{StatusInputs, decide_status};
+
+/// Fixed epoch for every fixture. Any value works — the point is that the
+/// tests choose it rather than reading a clock.
+const T0: u64 = 1_785_814_692_000;
+const MIN: u64 = 60_000;
+const HOUR: u64 = 60 * MIN;
+
+/// How strong a claim each status makes about the session. Aging a fixed set
+/// of evidence must never move *up* this scale — that is the invariant the
+/// three defects violated, stated once so a property test can check it.
+/// Note that `NeedsInput` and `Processing` share a rank: both assert a
+/// specific live state, and neither is a weaker claim than the other. The move
+/// *between* them is therefore invisible to this scale — which is why
+/// `property_time_alone_never_silences_a_session_that_needs_you` exists as a
+/// separate property. That transition, `NeedsInput` -> `Processing`, is the
+/// exact bug André reported, and a strength ordering alone does not catch it
+/// (verified by reintroducing the old 30-minute bound: this property still
+/// passed, that one fails).
+fn claim_strength(status: SessionStatus) -> u8 {
+    match status {
+        // "This session is definitely in this specific state right now."
+        SessionStatus::NeedsInput | SessionStatus::Processing | SessionStatus::Compacting => 4,
+        // "It finished and is waiting for you."
+        SessionStatus::WaitingInput => 3,
+        // "It is alive and we cannot tell." An admission, not a claim.
+        SessionStatus::Unknown => 2,
+        SessionStatus::Idle => 1,
+        SessionStatus::Finished => 0,
+    }
+}
+
+struct Scenario {
+    name: &'static str,
+    state: Option<HookState>,
+    last_msg_type: &'static str,
+    last_stop_reason: &'static str,
+    last_message_ts: u64,
+}
+
+fn hook_state() -> HookState {
+    HookState {
+        session_id: "test-session".into(),
+        ..Default::default()
+    }
+}
+
+fn status_at(scenario: &Scenario, now_ms: u64, cpu_rate_percent: Option<f32>) -> SessionStatus {
+    decide_status(&StatusInputs {
+        hook_state: scenario.state.as_ref(),
+        now_ms,
+        last_msg_type: scenario.last_msg_type,
+        last_stop_reason: scenario.last_stop_reason,
+        last_message_ts: scenario.last_message_ts,
+        cpu_rate_percent,
+        telemetry_available: true,
+    })
+    .status
+}
+
+/// Every distinct shape of evidence a live session can present, at T0.
+///
+/// Deliberately includes the shapes that only arise when a hook is *lost* —
+/// they are not exotic. Hook events are separate processes spawned with a 5 s
+/// timeout, and one was caught being dropped live on 2026-08-06 (a transcript
+/// carried a `stop_hook_summary` record 27 minutes newer than the `Stop` the
+/// state file had recorded).
+fn scenarios() -> Vec<Scenario> {
+    vec![
+        Scenario {
+            name: "permission prompt open, nothing has resolved it",
+            state: Some(HookState {
+                notification_kind: Some("permission_prompt".into()),
+                last_notification_ts_ms: T0,
+                last_promptsubmit_ts_ms: T0 - MIN,
+                last_pretooluse_ts_ms: T0 - MIN,
+                ..hook_state()
+            }),
+            last_msg_type: "user",
+            last_stop_reason: "",
+            last_message_ts: T0 - MIN,
+        },
+        Scenario {
+            name: "tool in flight",
+            state: Some(HookState {
+                current_tool_name: Some("Bash".into()),
+                last_promptsubmit_ts_ms: T0 - MIN,
+                last_pretooluse_ts_ms: T0,
+                ..hook_state()
+            }),
+            last_msg_type: "assistant",
+            last_stop_reason: "tool_use",
+            last_message_ts: T0,
+        },
+        Scenario {
+            name: "turn under way, no tool in flight",
+            state: Some(HookState {
+                last_promptsubmit_ts_ms: T0 - MIN,
+                last_pretooluse_ts_ms: T0 - MIN,
+                last_posttooluse_ts_ms: T0,
+                ..hook_state()
+            }),
+            last_msg_type: "user",
+            last_stop_reason: "",
+            last_message_ts: T0,
+        },
+        Scenario {
+            name: "stop fired, waiting for the user",
+            state: Some(HookState {
+                last_promptsubmit_ts_ms: T0 - 2 * MIN,
+                last_pretooluse_ts_ms: T0 - 2 * MIN,
+                last_posttooluse_ts_ms: T0 - MIN,
+                last_stop_ts_ms: T0,
+                ..hook_state()
+            }),
+            last_msg_type: "assistant",
+            last_stop_reason: "end_turn",
+            last_message_ts: T0,
+        },
+        Scenario {
+            name: "compacting",
+            state: Some(HookState {
+                last_promptsubmit_ts_ms: T0 - MIN,
+                last_precompact_ts_ms: T0,
+                ..hook_state()
+            }),
+            last_msg_type: "assistant",
+            last_stop_reason: "tool_use",
+            last_message_ts: T0 - MIN,
+        },
+        Scenario {
+            name: "stop was dropped; user interrupted, so the tail is a user message",
+            state: Some(HookState {
+                last_promptsubmit_ts_ms: T0 - 2 * MIN,
+                last_pretooluse_ts_ms: T0,
+                last_posttooluse_ts_ms: T0 - MIN,
+                ..hook_state()
+            }),
+            last_msg_type: "user",
+            last_stop_reason: "",
+            last_message_ts: T0,
+        },
+        Scenario {
+            name: "stop was dropped; transcript ended the turn cleanly",
+            state: Some(HookState {
+                last_promptsubmit_ts_ms: T0 - 2 * MIN,
+                last_pretooluse_ts_ms: T0 - 2 * MIN,
+                last_posttooluse_ts_ms: T0 - MIN,
+                ..hook_state()
+            }),
+            last_msg_type: "assistant",
+            last_stop_reason: "end_turn",
+            last_message_ts: T0,
+        },
+        Scenario {
+            name: "no hooks have ever fired, transcript mid-turn",
+            state: None,
+            last_msg_type: "assistant",
+            last_stop_reason: "tool_use",
+            last_message_ts: T0,
+        },
+        Scenario {
+            name: "no hooks have ever fired, transcript ended the turn",
+            state: None,
+            last_msg_type: "assistant",
+            last_stop_reason: "end_turn",
+            last_message_ts: T0,
+        },
+    ]
+}
+
+#[test]
+fn regression_a_permission_prompt_stays_needs_input_however_long_it_is_open() {
+    // Captured live on 2026-08-06 at 30 s resolution. Session 95b83ac9 sat on a
+    // permission prompt from 17:42 with `notification_kind` still
+    // `permission_prompt` and not one resolution event ever recorded:
+    //
+    //   17:54:04  prompt_age=721s   rendered=Needs Input
+    //   18:12:22  prompt_age=1819s  rendered=Processing   <- crossed 1800 s
+    //   18:24:22  prompt_age=2539s  rendered=Idle
+    //   18:34:18  prompt_age=3135s  rendered=Waiting
+    //
+    // "Needs Input changes to Processing by itself", exactly at the old
+    // 30-minute bound, and then flapping. The prompt was still open the whole
+    // time; nothing about the session had changed but the clock.
+    let scenario = &scenarios()[0];
+    for age in [MIN, 29 * MIN, 31 * MIN, 12 * HOUR, 48 * HOUR] {
+        assert_eq!(
+            status_at(scenario, T0 + age, Some(0.1)),
+            SessionStatus::NeedsInput,
+            "a prompt open for {} minutes with nothing to resolve it is still open",
+            age / MIN
+        );
+    }
+}
+
+#[test]
+fn regression_a_finished_turn_is_not_processing_however_busy_the_process_looks() {
+    // Session ed1014c3 (pid 243), 2026-08-06: its transcript's last assistant
+    // message was `end_turn` at 17:48:21, and claudectl rendered `Processing`.
+    // `ps %cpu` said 5.7 — just over the 5.0 threshold — while the process was
+    // using 0.20% measured over 5 s. `%cpu` is a lifetime average on Linux
+    // (cputime 141.12 s / elapsed 2470 s = 5.71%), so the number never falls
+    // back below the threshold for as long as the session lives.
+    //
+    // Two things had to be true for that render, and both are asserted here:
+    // the CPU branch must sit *below* the transcript evidence, and the CPU
+    // number itself must be a rate.
+    let ended = &scenarios()[6];
+    for cpu in [None, Some(0.0), Some(5.7), Some(90.0)] {
+        assert_eq!(
+            status_at(ended, T0 + MIN, cpu),
+            SessionStatus::WaitingInput,
+            "the turn ended; cpu_rate={cpu:?} cannot make it Processing"
+        );
+    }
+}
+
+#[test]
+fn regression_a_dropped_stop_does_not_latch_processing_forever() {
+    // `is_responding` stays true until a `Stop` arrives, and its transcript
+    // veto only fires for an `assistant` + `end_turn` tail. Interrupt a turn
+    // with ESC and the tail is a *user* message, so the veto cannot fire and
+    // the session was pinned to `Processing` for the rest of its life — state
+    // files were found on 2026-08-06 with turn markers 21 to 28 hours newer
+    // than their last `Stop`.
+    let interrupted = &scenarios()[5];
+    assert_eq!(
+        status_at(interrupted, T0 + MIN, None),
+        SessionStatus::Processing,
+        "a minute in, a turn with no Stop yet is genuinely still plausible"
+    );
+    for age in [16 * MIN, 2 * HOUR, 28 * HOUR] {
+        let status = status_at(interrupted, T0 + age, None);
+        assert_ne!(
+            status,
+            SessionStatus::Processing,
+            "after {} minutes of silence on both channels the turn is not running",
+            age / MIN
+        );
+        assert_eq!(
+            status,
+            SessionStatus::Unknown,
+            "and we do not know what it is"
+        );
+    }
+}
+
+#[test]
+fn a_tool_may_run_for_hours_without_being_declared_dead() {
+    // The other half of the rule above: silence with a tool in flight is a
+    // build, a test suite, or a subagent — not a dropped hook. Bounding this
+    // one would trade a false `Processing` for a false `Unknown` on every
+    // long-running command.
+    let tool = &scenarios()[1];
+    for age in [MIN, 16 * MIN, 3 * HOUR] {
+        assert_eq!(
+            status_at(tool, T0 + age, None),
+            SessionStatus::Processing,
+            "a tool in flight for {} minutes is still a tool in flight",
+            age / MIN
+        );
+    }
+}
+
+#[test]
+fn property_time_alone_never_promotes_a_session_to_a_stronger_claim() {
+    // The property that would have caught the permission-prompt defect the day
+    // it was written. Nothing here knows *which* statuses are right — only that
+    // letting the clock run, with every other input frozen, can never make
+    // claudectl more confident than it already was.
+    //
+    // The sweep starts 1 s in on purpose: `is_at_permission_prompt` suppresses
+    // the marker for its first 750 ms so auto-approved prompts (which fire a
+    // Notification and an instant PreToolUse) never flash on screen. That
+    // debounce is the one legitimate upward step, and it is over by then.
+    for scenario in &scenarios() {
+        for cpu in [None, Some(0.0), Some(50.0)] {
+            let mut previous = status_at(scenario, T0 + 1_000, cpu);
+            for age in [2_000, 30_000, 5 * MIN, 16 * MIN, HOUR, 12 * HOUR, 72 * HOUR] {
+                let current = status_at(scenario, T0 + age, cpu);
+                assert!(
+                    claim_strength(current) <= claim_strength(previous),
+                    "{}: at cpu={cpu:?}, aging to {} min moved {previous} -> {current}, \
+                     which is a STRONGER claim than before",
+                    scenario.name,
+                    age / MIN
+                );
+                previous = current;
+            }
+        }
+    }
+}
+
+#[test]
+fn property_time_alone_never_silences_a_session_that_needs_you() {
+    // `NeedsInput` is the one status the user must act on, and the only thing
+    // that can end it is *evidence*: a resolution hook, or the conversation
+    // moving on in the transcript. The clock is not evidence. A session that
+    // quietly stops asking for you is worse than one that never asked — you
+    // stop looking at the bucket you were told is empty.
+    //
+    // This is the property that pins the reported bug. `claim_strength` cannot:
+    // `NeedsInput` and `Processing` are equally strong claims, so the move
+    // between them is invisible to a strength ordering.
+    for scenario in &scenarios() {
+        for cpu in [None, Some(0.0), Some(50.0)] {
+            if status_at(scenario, T0 + 1_000, cpu) != SessionStatus::NeedsInput {
+                continue;
+            }
+            for age in [
+                2_000,
+                5 * MIN,
+                29 * MIN,
+                31 * MIN,
+                HOUR,
+                12 * HOUR,
+                72 * HOUR,
+            ] {
+                assert_eq!(
+                    status_at(scenario, T0 + age, cpu),
+                    SessionStatus::NeedsInput,
+                    "{}: at cpu={cpu:?}, waiting {} minutes made the session stop asking \
+                     for the user, with nothing having resolved it",
+                    scenario.name,
+                    age / MIN
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn property_processing_is_eventually_released_without_corroboration() {
+    // The mirror of the property above, and the one that catches a latched
+    // `Processing`: with no tool in flight, no new events on either channel and
+    // no CPU to show for it, the claim must expire on its own. Without this a
+    // single dropped `Stop` is permanent.
+    for scenario in &scenarios() {
+        let tool_in_flight = scenario
+            .state
+            .as_ref()
+            .is_some_and(claudectl::hook_state::tool_in_flight);
+        if tool_in_flight {
+            continue; // Licensed to run indefinitely — asserted above.
+        }
+        for cpu in [None, Some(0.0)] {
+            assert_ne!(
+                status_at(scenario, T0 + 24 * HOUR, cpu),
+                SessionStatus::Processing,
+                "{}: still Processing a day later with cpu={cpu:?} and nothing to show for it",
+                scenario.name
+            );
+        }
+    }
+}
+
+#[test]
+fn degradation_matrix() {
+    // The readable form: what each shape of evidence renders as, fresh and
+    // stale. Read the two columns as "what it says now" and "what it says once
+    // the evidence has gone quiet".
+    let expected: &[(&str, SessionStatus, SessionStatus)] = &[
+        (
+            "permission prompt open, nothing has resolved it",
+            SessionStatus::NeedsInput,
+            SessionStatus::NeedsInput,
+        ),
+        (
+            "tool in flight",
+            SessionStatus::Processing,
+            SessionStatus::Processing,
+        ),
+        (
+            "turn under way, no tool in flight",
+            SessionStatus::Processing,
+            SessionStatus::Unknown,
+        ),
+        (
+            "stop fired, waiting for the user",
+            SessionStatus::WaitingInput,
+            SessionStatus::Idle,
+        ),
+        (
+            "compacting",
+            SessionStatus::Compacting,
+            SessionStatus::Unknown,
+        ),
+        (
+            "stop was dropped; user interrupted, so the tail is a user message",
+            SessionStatus::Processing,
+            SessionStatus::Unknown,
+        ),
+        (
+            "stop was dropped; transcript ended the turn cleanly",
+            SessionStatus::WaitingInput,
+            SessionStatus::Idle,
+        ),
+        (
+            "no hooks have ever fired, transcript mid-turn",
+            SessionStatus::Processing,
+            SessionStatus::Idle,
+        ),
+        (
+            "no hooks have ever fired, transcript ended the turn",
+            SessionStatus::WaitingInput,
+            SessionStatus::Idle,
+        ),
+    ];
+
+    let scenarios = scenarios();
+    assert_eq!(
+        scenarios.len(),
+        expected.len(),
+        "every scenario needs a row here — a new one must not silently skip the matrix"
+    );
+    for (scenario, (name, fresh, stale)) in scenarios.iter().zip(expected) {
+        assert_eq!(&scenario.name, name, "matrix rows must stay aligned");
+        assert_eq!(
+            status_at(scenario, T0 + MIN, Some(0.1)),
+            *fresh,
+            "{name}: one minute in"
+        );
+        assert_eq!(
+            status_at(scenario, T0 + 24 * HOUR, Some(0.1)),
+            *stale,
+            "{name}: a day later"
+        );
+    }
 }

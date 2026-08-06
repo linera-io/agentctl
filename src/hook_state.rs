@@ -596,33 +596,47 @@ pub fn is_permission_prompt_kind(kind: Option<&str>) -> bool {
     matches!(kind, Some("permission_prompt" | "worker_permission_prompt"))
 }
 
-/// Maximum age for a permission prompt with no resolution events. If Stop,
-/// PreToolUse, PostToolUse, and UserPromptSubmit have all been silent since
-/// the notification fired, the prompt is almost certainly stale — the hook
-/// configuration changed mid-session and resolution events stopped reaching
-/// claudectl. Real permission prompts are resolved in seconds to minutes;
-/// 30 minutes is a conservative upper bound.
-const PERMISSION_PROMPT_MAX_SILENCE_MS: u64 = 30 * 60 * 1000;
+/// Minimum age before an open permission prompt is reported. Auto-approved
+/// prompts (acceptEdits, allowlisted) fire Notification + near-instant
+/// PreToolUse and the dialog never opens visibly; suppressing the marker for
+/// the first 750ms filters those out. Real prompts sit far longer, so this
+/// costs them nothing.
+const PERMISSION_PROMPT_MIN_AGE_MS: u64 = 750;
+
+/// How far past the notification the transcript must advance before we treat
+/// the prompt as resolved-with-a-lost-hook. Claude Code writes the assistant
+/// message that *precedes* the dialog moments before the Notification fires,
+/// so a small margin keeps ordinary jitter between the transcript writer and
+/// the hook process from reading as "the session moved on".
+const PROMPT_RESOLUTION_GRACE_MS: u64 = 5_000;
 
 /// Whether the session is currently sitting on a permission prompt.
 ///
-/// Pure deterministic check: the `Notification (permission_prompt)` or
+/// Deterministic check: the `Notification (permission_prompt)` or
 /// `Notification (worker_permission_prompt)` event must be the most recent
 /// state-changing event for this session. Any later PreToolUse / PostToolUse
 /// / Stop / UserPromptSubmit ⇒ the prompt was resolved (approved, denied, or
-/// pivoted to a new prompt). No CPU or JSONL second-guessing — those
-/// introduced the false-negatives we just had.
+/// pivoted to a new prompt).
 ///
-/// 750ms lower bound: auto-approved prompts (acceptEdits, allowlisted)
-/// fire Notification + near-instant PreToolUse; the dialog never opens
-/// visibly. Suppressing the marker for the first 750ms filters those out.
-/// Real prompts sit far longer, so this costs them nothing.
+/// `last_message_ts` is the timestamp of the newest *conversation message* in
+/// the transcript (never the file's mtime — bookkeeping records like `system`
+/// and `ai-title` bump mtime without any conversational progress). It is the
+/// backstop for a resolution event that never reached claudectl: hook events
+/// are lossy — each is a separate process spawned with a 5 s timeout — but the
+/// transcript is written by Claude Code itself. If the conversation advanced
+/// past the notification, the prompt was answered and we simply missed it.
 ///
-/// 30 min upper bound: if no resolution event has reached claudectl in
-/// 30 minutes, the hook configuration is almost certainly incomplete (e.g.
-/// Stop lost its claudectl call mid-session) and the marker is stale. Without
-/// this bound, a single missed Stop permanently locks the status to NeedsInput.
-pub fn is_at_permission_prompt(state: &HookState) -> bool {
+/// **There is deliberately no time limit.** This used to expire the marker
+/// after 30 minutes of silence, on the theory that a prompt open that long
+/// meant a broken hook configuration. It cannot tell that case apart from "the
+/// user hasn't answered yet", and the fall-through landed on `Processing` —
+/// the one status that says "working, leave it alone" about a session that is
+/// blocked on the user. Captured live on 2026-08-06: a prompt open since
+/// 17:42 read `Needs Input` until 18:12:22 (age 1819 s) and then flipped to
+/// `Processing`, with `notification_kind` still `permission_prompt` and not one
+/// resolution event ever recorded. Transcript progress answers the same
+/// question with evidence instead of a timer.
+pub fn is_at_permission_prompt(state: &HookState, now_ms: u64, last_message_ts: u64) -> bool {
     if !is_permission_prompt_kind(state.notification_kind.as_deref()) {
         return false;
     }
@@ -637,8 +651,10 @@ pub fn is_at_permission_prompt(state: &HookState) -> bool {
     if !still_latest {
         return false;
     }
-    let age = now_ms().saturating_sub(notif);
-    age > 750 && age < PERMISSION_PROMPT_MAX_SILENCE_MS
+    if now_ms.saturating_sub(notif) <= PERMISSION_PROMPT_MIN_AGE_MS {
+        return false;
+    }
+    last_message_ts <= notif.saturating_add(PROMPT_RESOLUTION_GRACE_MS)
 }
 
 /// How long a session is allowed to sit in "compacting" before we give up and
@@ -655,7 +671,7 @@ const COMPACTING_MAX_AGE_MS: u64 = 5 * 60 * 1000;
 /// the fallback signal for the post-compact assistant turn) has come in
 /// since, AND the PreCompact is recent enough that compaction could
 /// plausibly still be running.
-pub fn is_compacting(state: &HookState) -> bool {
+pub fn is_compacting(state: &HookState, now_ms: u64) -> bool {
     let pre = state.last_precompact_ts_ms;
     if pre == 0 {
         return false;
@@ -664,7 +680,18 @@ pub fn is_compacting(state: &HookState) -> bool {
     if ended >= pre {
         return false;
     }
-    now_ms().saturating_sub(pre) < COMPACTING_MAX_AGE_MS
+    now_ms.saturating_sub(pre) < COMPACTING_MAX_AGE_MS
+}
+
+/// Whether a tool started and has not reported back.
+///
+/// `PreToolUse` sets `current_tool_name`, `PostToolUse` and `Stop` clear it.
+/// This is what licenses an unbounded `Processing`: a single tool call — a
+/// build, a test suite, a subagent — can legitimately run for hours with no
+/// other event on either channel. With no tool in flight, that same silence
+/// means the turn is over and its `Stop` was lost.
+pub fn tool_in_flight(state: &HookState) -> bool {
+    state.current_tool_name.is_some() && state.last_pretooluse_ts_ms > state.last_posttooluse_ts_ms
 }
 
 /// Timestamp of the newest event that means "a turn is under way": the user's
@@ -688,15 +715,18 @@ pub fn newest_turn_event_ms(state: &HookState) -> u64 {
 /// what makes the status stable instead of flickering with each tool call.
 ///
 /// Note the asymmetry this creates, and why callers must not treat a `true`
-/// here as the final word: every other marker in this module expires
-/// (`is_at_permission_prompt` after 30 min, `is_compacting` after 5), but a
-/// turn has no honest upper bound — an agent can legitimately grind for hours.
-/// So if the `Stop` that ends the turn never arrives, this stays true forever.
-/// That is exactly what happened on 2026-07-28: sessions whose `Stop` hook
-/// never reached claudectl were reported `Processing` for up to 15 hours while
-/// their transcripts had long since ended in `end_turn`. The transcript — which
-/// Claude Code writes itself, and which therefore cannot be lost the way a hook
-/// invocation can — is the tie-breaker, applied in `monitor`.
+/// here as the final word: a turn has no honest upper bound in *elapsed* time —
+/// an agent can legitimately grind for hours — so if the `Stop` that ends the
+/// turn never arrives, this stays true forever. That is exactly what happened
+/// on 2026-07-28: sessions whose `Stop` hook never reached claudectl were
+/// reported `Processing` for up to 15 hours while their transcripts had long
+/// since ended in `end_turn`.
+///
+/// Two things in `monitor` bound it, and both are evidence rather than a timer:
+/// the transcript — which Claude Code writes itself, and which therefore cannot
+/// be lost the way a hook invocation can — overrules this when it shows the turn
+/// ended (`transcript_ended_the_turn`); and a turn that emits nothing on *either*
+/// channel while no tool is in flight is not running (`turn_went_silent`).
 pub fn is_responding(state: &HookState) -> bool {
     newest_turn_event_ms(state) > state.last_stop_ts_ms
 }
@@ -813,12 +843,12 @@ mod tests {
         let reloaded: HookState =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(
-            is_at_permission_prompt(&reloaded),
+            is_at_permission_prompt(&reloaded, now_ms(), 0),
             "a prompt recorded by another machine must survive the round trip"
         );
         // `is_responding` is *also* true here, and that is correct: a session
         // blocked on a prompt is mid-turn. `NeedsInput` wins on precedence,
-        // not because the turn looks finished — see `status_from_hook_state`.
+        // not because the turn looks finished — see `monitor::decide_status`.
         assert!(is_responding(&reloaded));
     }
 
@@ -891,26 +921,77 @@ mod tests {
         let mut s = fresh_state("sid");
         s.notification_kind = Some("permission_prompt".into());
         s.last_notification_ts_ms = now_ms().saturating_sub(2_000);
-        assert!(is_at_permission_prompt(&s));
+        assert!(is_at_permission_prompt(&s, now_ms(), 0));
 
         // Simulate PreToolUse arriving (manually, mirroring record_hook_event)
         s.last_pretooluse_ts_ms = now_ms();
         s.notification_kind = None;
-        assert!(!is_at_permission_prompt(&s));
+        assert!(!is_at_permission_prompt(&s, now_ms(), 0));
     }
 
     #[test]
-    fn permission_prompt_ages_out_after_30_minutes() {
-        // Repro for the "stuck NeedsInput" failure mode: Stop hook loses its
-        // claudectl call mid-session, so the notification fires and sets
-        // notification_kind but no resolution event ever clears it. Without
-        // the upper-bound timeout, the session stays NeedsInput forever.
+    fn an_unanswered_permission_prompt_never_ages_out() {
+        // Replaces `permission_prompt_ages_out_after_30_minutes`, which
+        // asserted the opposite. That bound could not tell "the hook
+        // configuration broke" from "the user hasn't answered yet", and the
+        // fall-through reported the session as Processing. Captured live on
+        // 2026-08-06: a prompt open since 17:42 read Needs Input until
+        // 18:12:22 — age 1819 s — and then flipped to Processing with
+        // `notification_kind` still `permission_prompt`.
         let mut s = fresh_state("sid");
         s.notification_kind = Some("permission_prompt".into());
-        s.last_notification_ts_ms =
-            now_ms().saturating_sub(PERMISSION_PROMPT_MAX_SILENCE_MS + 1_000);
-        // All resolution timestamps are zero — no hook event ever fired.
-        assert!(!is_at_permission_prompt(&s));
+        s.last_notification_ts_ms = 1_000_000;
+        // No resolution event ever fired, and the transcript never advanced.
+        for age_ms in [2_000, 30 * 60 * 1000, 48 * 60 * 60 * 1000] {
+            assert!(
+                is_at_permission_prompt(&s, 1_000_000 + age_ms, 0),
+                "a prompt with no resolution evidence is still open after {age_ms} ms"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_progress_resolves_a_prompt_whose_hook_was_lost() {
+        // The backstop for the case the 30-minute timer was reaching for: the
+        // user answered, but every resolution hook was dropped. Hook events are
+        // lossy; the transcript is not, so conversation past the notification
+        // is proof the session moved on.
+        let mut s = fresh_state("sid");
+        s.notification_kind = Some("permission_prompt".into());
+        s.last_notification_ts_ms = 1_000_000;
+        let now = 1_000_000 + 60 * 60 * 1000;
+
+        assert!(
+            is_at_permission_prompt(&s, now, 999_000),
+            "a message written BEFORE the prompt opened is the turn that led to it"
+        );
+        assert!(
+            is_at_permission_prompt(&s, now, 1_000_000 + PROMPT_RESOLUTION_GRACE_MS),
+            "a message inside the grace window is ordinary writer/hook jitter"
+        );
+        assert!(
+            !is_at_permission_prompt(&s, now, 1_000_000 + PROMPT_RESOLUTION_GRACE_MS + 1),
+            "conversation past the notification means the prompt was answered"
+        );
+    }
+
+    #[test]
+    fn tool_in_flight_tracks_the_open_pretooluse() {
+        let mut s = fresh_state("sid");
+        assert!(!tool_in_flight(&s), "no tool has started");
+
+        s.current_tool_name = Some("Bash".into());
+        s.last_pretooluse_ts_ms = 2_000;
+        assert!(tool_in_flight(&s));
+
+        // PostToolUse both clears the name and lands newer than the PreToolUse;
+        // either alone must be enough to close the tool, since a dropped hook
+        // can leave the pair inconsistent.
+        s.last_posttooluse_ts_ms = 3_000;
+        assert!(!tool_in_flight(&s));
+        s.last_posttooluse_ts_ms = 0;
+        s.current_tool_name = None;
+        assert!(!tool_in_flight(&s));
     }
 
     #[test]
@@ -919,7 +1000,7 @@ mod tests {
         // Backdate past the 750ms grace so the helper considers it open.
         s.last_notification_ts_ms = now_ms().saturating_sub(2_000);
         s.notification_kind = Some("worker_permission_prompt".into());
-        assert!(is_at_permission_prompt(&s));
+        assert!(is_at_permission_prompt(&s, now_ms(), 0));
 
         // PreToolUse from a sibling or the approved tool clears the marker
         // via record_hook_event — verify the helper treats both kinds
@@ -936,18 +1017,18 @@ mod tests {
         // Use recent timestamps so the age-out check doesn't short-circuit.
         let now = now_ms();
         s.last_precompact_ts_ms = now.saturating_sub(1_000);
-        assert!(is_compacting(&s));
+        assert!(is_compacting(&s, now_ms()));
 
         // `Stop` clears it (legacy signal).
         s.last_stop_ts_ms = now;
-        assert!(!is_compacting(&s));
+        assert!(!is_compacting(&s, now_ms()));
 
         // Reset Stop, confirm `PostCompact` ALSO clears it (direct signal,
         // the reliable one — doesn't depend on Stop firing).
         s.last_stop_ts_ms = 0;
-        assert!(is_compacting(&s));
+        assert!(is_compacting(&s, now_ms()));
         s.last_postcompact_ts_ms = now;
-        assert!(!is_compacting(&s));
+        assert!(!is_compacting(&s, now_ms()));
     }
 
     #[test]
@@ -958,7 +1039,7 @@ mod tests {
         // `NeedsInput` that follows.
         let mut s = fresh_state("sid");
         s.last_precompact_ts_ms = now_ms().saturating_sub(COMPACTING_MAX_AGE_MS + 1_000);
-        assert!(!is_compacting(&s));
+        assert!(!is_compacting(&s, now_ms()));
     }
 
     #[test]
