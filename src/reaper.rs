@@ -53,6 +53,39 @@ fn sandbox_name() -> String {
     resolve_sandbox_name(env.as_deref(), auto.as_deref(), DEFAULT_SANDBOX_NAME)
 }
 
+/// The sandbox to `sbx exec` into, or `None` when there is no unambiguous one.
+///
+/// [`sandbox_name`] always answers, falling back to [`DEFAULT_SANDBOX_NAME`]
+/// when it has nothing better. That default is a *convention*, not an
+/// observation, and `detect_running_sandbox_name` deliberately declines to
+/// guess whenever `sbx ls` shows anything other than exactly one running
+/// sandbox. On a host running three, every `sbx exec` built from the fallback
+/// therefore addressed a sandbox that does not exist:
+///
+/// ```text
+/// reaper: sandbox sidecar scan failed: sbx exec sidecar-scan failed:
+///   ERROR: no sandbox named 'linera-agent'
+/// ```
+///
+/// and `reap` returned `Ok(())` on that error, so the entire sidecar and
+/// orphan pass silently did nothing on every run — a feature that is off,
+/// reporting success. A name we have not confirmed is worse than no name:
+/// skipping is visible, and executing against a fabricated target is not.
+fn target_sandbox() -> Option<String> {
+    let env = std::env::var("CLAUDECTL_SANDBOX_NAME").ok();
+    let auto = AUTO_SANDBOX_NAME.get_or_init(detect_running_sandbox_name);
+    exec_target(env.as_deref(), auto.as_deref())
+}
+
+/// Pure resolver for [`target_sandbox`], so the "never invent a name" rule is
+/// testable without mutating process-global env state.
+fn exec_target(env_override: Option<&str>, auto_detected: Option<&str>) -> Option<String> {
+    env_override
+        .filter(|name| !name.is_empty())
+        .or(auto_detected.filter(|name| !name.is_empty()))
+        .map(str::to_string)
+}
+
 /// Pure resolver. Picks the first non-empty source: explicit env override
 /// → auto-detected name → default. Tests target this directly so they
 /// don't have to mutate process-global env state (which races other tests
@@ -246,7 +279,12 @@ pub(crate) fn resolve_current_sandbox(pointer: Option<&str>, running: &[String])
 #[derive(Debug, Clone, PartialEq)]
 struct SandboxProc {
     pid: u32,
-    cpu_percent: f32,
+    /// Cumulative CPU seconds, not a percentage. The host differences two of
+    /// these across collector passes to get a real rate — a percentage read
+    /// straight out of `ps` inside the VM is a Linux *lifetime average*
+    /// (`crate::cpu`), and shipping it to a macOS host to be compared against a
+    /// "busy" threshold reported long-finished sessions as working.
+    cputime_secs: f64,
     mem_mb: f64,
 }
 
@@ -305,7 +343,7 @@ fn probe_sandbox_procs(name: &str, pids: &[u32]) -> io::Result<HashMap<u32, Sand
 /// against live pids with a plain `bash -c`, no `sbx` involved.
 ///
 /// Pids arrive as positional arguments and one `ps` row is printed per live
-/// one: `pid %cpu rss command`. `ps` is the entire dependency — no jq, no
+/// one: `pid cputime rss command`. `ps` is the entire dependency — no jq, no
 /// in-sandbox claudectl — which is precisely what makes the collector immune
 /// to image-vs-host version skew.
 ///
@@ -320,7 +358,7 @@ if [ "$#" -eq 0 ]; then exit 0; fi
 IFS=,
 pids="$*"
 unset IFS
-ps -o pid=,%cpu=,rss=,command= -p "$pids" 2>/dev/null || true
+ps -o pid=,cputime=,rss=,command= -p "$pids" 2>/dev/null || true
 exit 0
 "#;
 
@@ -340,7 +378,7 @@ fn parse_sandbox_procs(text: &str) -> HashMap<u32, SandboxProc> {
         let Some(pid) = fields.next().and_then(|f| f.parse::<u32>().ok()) else {
             continue;
         };
-        let Some(cpu_percent) = fields.next().and_then(|f| f.parse::<f32>().ok()) else {
+        let Some(cputime_secs) = fields.next().and_then(crate::cpu::parse_cputime_secs) else {
             continue;
         };
         let Some(rss_kb) = fields.next().and_then(|f| f.parse::<f64>().ok()) else {
@@ -354,7 +392,7 @@ fn parse_sandbox_procs(text: &str) -> HashMap<u32, SandboxProc> {
             pid,
             SandboxProc {
                 pid,
-                cpu_percent,
+                cputime_secs,
                 mem_mb: rss_kb / 1024.0,
             },
         );
@@ -392,12 +430,18 @@ fn sessions_from_registry(
                 "session_name": entry.name.clone().unwrap_or_default(),
                 "started_at": entry.started_at_ms,
                 "pid": sample.pid,
-                // Both rounded to two decimals, for the reason `to_json_value`
-                // rounds memory: the snapshot is rewritten in full on every
-                // collector pass, nothing renders more than two decimals of
-                // either, and widening an f32 to JSON otherwise writes its
-                // binary error out in full (`3.4` becomes 3.4000000953674316).
-                "cpu": (f64::from(sample.cpu_percent) * 100.0).round() / 100.0,
+                // Cumulative CPU seconds, paired with the snapshot's
+                // `collected_at_ms`. The *host* differences consecutive
+                // snapshots into a rate, using the same per-session carry-over
+                // as native sessions — a percentage computed in here would be
+                // the VM's Linux lifetime average, which is not what the
+                // threshold on the other side means.
+                "cputime_secs": (sample.cputime_secs * 100.0).round() / 100.0,
+                // Rounded to two decimals for the reason `to_json_value` rounds
+                // memory: the snapshot is rewritten in full on every collector
+                // pass, nothing renders more than two decimals, and widening an
+                // f32 to JSON otherwise writes its binary error out in full
+                // (`3.4` becomes 3.4000000953674316).
                 "mem_mb": (sample.mem_mb * 100.0).round() / 100.0,
             }))
         })
@@ -429,6 +473,10 @@ fn collect_and_write_snapshot(out: &mut impl Write) -> io::Result<()> {
     // ordering is deliberate everywhere this pattern appears: `sbx` consumes
     // the stdin it inherits, so an exec driven straight off a streaming
     // enumeration eats the rest of its own input and collects one sandbox.
+    // The previous snapshot, kept so a failed probe can carry its last known
+    // answer forward instead of asserting a new one. See below.
+    let previous = sandbox_registry::load_snapshot();
+
     let mut tally: Vec<String> = Vec::with_capacity(running.len());
     for name in &running {
         let slice = registry.sandboxes.get(name).unwrap_or(&no_entries);
@@ -439,7 +487,28 @@ fn collect_and_write_snapshot(out: &mut impl Write) -> io::Result<()> {
                 // partial — a snapshot silently missing an origin looks
                 // identical to a sandbox with no sessions.
                 writeln!(out, "reaper: collect from '{name}' failed: {e}")?;
-                Vec::new()
+                // **Carry the last known session list forward. Do not write an
+                // empty one.** A failed probe means "we could not look", and
+                // an empty list means "we looked and this sandbox is empty" —
+                // the renderer cannot tell them apart, and reads the second.
+                //
+                // On 2026-08-06 an `sbx exec` probe timed out on a loaded host
+                // and this arm published 0 sessions for a sandbox whose
+                // registry held 18 live ones. All 18 vanished from the
+                // dashboard at once. The registry was never touched, so the
+                // very next successful pass restored them — a failure that
+                // presents as catastrophic data loss and is not.
+                //
+                // Stale rows are the strictly better error: they carry the
+                // snapshot's own `collected_at_ms`, which `snapshot_vitals_at`
+                // already expires, so a sandbox that stays unreachable ages out
+                // on the existing freshness rule instead of blinking out on the
+                // first dropped probe.
+                previous
+                    .sandboxes
+                    .get(name)
+                    .map(|origin| origin.sessions.clone())
+                    .unwrap_or_default()
             }
         };
         // Both numbers, not just the result: "0 sessions" is the shape every
@@ -1020,8 +1089,17 @@ fn scan_sandbox_sidecars() -> io::Result<Vec<SandboxSidecar>> {
     // line is `<pid>\t<host_tty>\t<alive>\t<name>` where alive is 0 or 1.
     let script = sidecar_scan_script(&sandbox_sessions_dir());
 
+    // Refuse to guess. With no unambiguous running sandbox this used to fall
+    // back to a conventional name and `sbx exec` a target that does not exist,
+    // failing every run on any host with more than one sandbox.
+    let Some(name) = target_sandbox() else {
+        return Err(io::Error::other(
+            "no unambiguous sandbox to scan: `sbx ls` shows zero or several \
+             running, and CLAUDECTL_SANDBOX_NAME is unset",
+        ));
+    };
     let output = Command::new("sbx")
-        .args(["exec", &sandbox_name(), "bash", "-c", &script])
+        .args(["exec", &name, "bash", "-c", &script])
         .output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
@@ -1137,7 +1215,13 @@ fi
     all_args.extend(dead_pids.iter().map(u32::to_string));
     all_args.extend(alive_pids.iter().map(u32::to_string));
 
-    let name = sandbox_name();
+    let Some(name) = target_sandbox() else {
+        writeln!(
+            io::stderr(),
+            "reaper: apply_plan skipped: no unambiguous sandbox to exec into"
+        )?;
+        return Ok(());
+    };
     let mut cmd = Command::new("sbx");
     cmd.args(["exec", &name, "bash", "-c", &script, "--"]);
     cmd.args(&all_args);
@@ -2349,10 +2433,10 @@ mod tests {
         }
     }
 
-    fn sample(pid: u32, cpu_percent: f32, mem_mb: f64) -> SandboxProc {
+    fn sample(pid: u32, cputime_secs: f64, mem_mb: f64) -> SandboxProc {
         SandboxProc {
             pid,
-            cpu_percent,
+            cputime_secs,
             mem_mb,
         }
     }
@@ -2365,9 +2449,9 @@ mod tests {
     /// right-aligned numeric columns, a full argv tail, and one non-claude
     /// process sharing the pid space.
     const PS_PROBE_OUTPUT: &str = "\
-  11036   3.4 1048576 claude --dangerously-skip-permissions
-  11200   0.0  524288 /usr/local/bin/claude --resume 9905252f-e0aa-43d0-b578-c3023b36b2fb
-  11311  91.2  262144 node /opt/claudectl/bin/claudectl --json
+  11036 00:02:21 1048576 claude --dangerously-skip-permissions
+  11200 00:00:00  524288 /usr/local/bin/claude --resume 9905252f-e0aa-43d0-b578-c3023b36b2fb
+  11311 01:30:00  262144 node /opt/claudectl/bin/claudectl --json
 ";
 
     #[test]
@@ -2378,11 +2462,22 @@ mod tests {
             pids.sort_unstable();
             pids
         });
-        assert_eq!(procs[&11036].cpu_percent, 3.4);
+        // Cumulative CPU seconds, not a percentage: the host turns consecutive
+        // readings into a rate.
+        assert_eq!(procs[&11036].cputime_secs, 141.0);
         // rss is KiB; the renderer wants MB.
         assert_eq!(procs[&11036].mem_mb, 1024.0);
-        assert_eq!(procs[&11200].cpu_percent, 0.0);
+        assert_eq!(procs[&11200].cputime_secs, 0.0);
         assert_eq!(procs[&11200].mem_mb, 512.0);
+    }
+
+    #[test]
+    fn probe_parser_drops_a_row_whose_cputime_is_unreadable() {
+        // A `ps` rendering the parser does not understand must drop the row
+        // rather than default it to zero: a fabricated 0 would difference into
+        // a plausible-looking rate on the next pass.
+        let procs = parse_sandbox_procs("  11036 not-a-time 1048576 claude\n");
+        assert!(procs.is_empty());
     }
 
     #[test]
@@ -2399,7 +2494,7 @@ mod tests {
             "claudectl --reap-orphans",
         ] {
             assert!(
-                parse_sandbox_procs(&format!("  4242   1.0  1024 {command}")).is_empty(),
+                parse_sandbox_procs(&format!("  4242 00:00:01  1024 {command}")).is_empty(),
                 "{command} must not count as a live claude session"
             );
         }
@@ -2408,9 +2503,9 @@ mod tests {
     #[test]
     fn probe_parser_skips_malformed_rows_without_losing_the_good_ones() {
         let text = "\
-notapid   1.0  1024 claude
+notapid 00:00:01  1024 claude
 7777 only-three fields
-8888   2.5  2048 claude --resume x
+8888 00:00:02  2048 claude --resume x
    \n";
         let procs = parse_sandbox_procs(text);
         assert_eq!(procs.keys().copied().collect::<Vec<u32>>(), vec![8888]);
@@ -2439,7 +2534,7 @@ notapid   1.0  1024 claude
         assert_eq!(rows[0]["cwd"], "/Users/ndr/repos/linera-infra");
         assert_eq!(rows[0]["pid"], 11036);
         assert_eq!(rows[0]["started_at"], 1_754_150_400_000u64);
-        assert_eq!(rows[0]["cpu"], 3.4);
+        assert_eq!(rows[0]["cputime_secs"], 3.4);
         assert_eq!(rows[0]["mem_mb"], 1024.0);
     }
 
@@ -2482,18 +2577,25 @@ notapid   1.0  1024 claude
         let seen = vitals
             .get("abc-123")
             .expect("the renderer must find the collected row by session id");
-        assert_eq!(seen.cpu_percent, 7.5);
+        let cpu = seen
+            .cpu_sample
+            .expect("the CPU sample must survive the trip");
+        assert_eq!(cpu.cputime_secs, 7.5);
+        assert_eq!(
+            cpu.sampled_at_ms, COLLECTED_AT_MS,
+            "the sample is only differenceable if it carries when it was taken"
+        );
         assert_eq!(seen.mem_mb, 256.0);
     }
 
     #[test]
     fn negative_control_dropping_the_vitals_keeps_them_out_of_the_renderer() {
         // Proves the test above discriminates: strip exactly the two keys and
-        // the reader reports zeroes, which is what a blank CPU/MEM column is.
+        // the reader finds nothing to read.
         let entries = vec![registry_entry(11036, "abc-123", Some("my-title"))];
         let mut rows = sessions_from_registry(&entries, &live_map(vec![sample(11036, 7.5, 256.0)]));
         let map = rows[0].as_object_mut().expect("collected rows are objects");
-        map.remove("cpu");
+        map.remove("cputime_secs");
         map.remove("mem_mb");
         let vitals = crate::app::snapshot_vitals_at(
             &snapshot_of("linera-agent", rows),
@@ -2501,7 +2603,10 @@ notapid   1.0  1024 claude
             Duration::from_secs(DEFAULT_INTERVAL_SECONDS),
         );
         let seen = vitals.get("abc-123").expect("row is still identifiable");
-        assert_eq!(seen.cpu_percent, 0.0);
+        assert!(
+            seen.cpu_sample.is_none(),
+            "an absent measurement must read as unknown, never as an idle 0"
+        );
         assert_eq!(seen.mem_mb, 0.0);
     }
 
@@ -2594,7 +2699,15 @@ notapid   1.0  1024 claude
         assert_eq!(rows.len(), 1, "exactly the live pid, got {stdout:?}");
         let fields: Vec<&str> = rows[0].split_whitespace().collect();
         assert_eq!(fields[0].parse::<u32>().ok(), Some(pid), "column 1 is pid");
-        assert!(fields[1].parse::<f32>().is_ok(), "column 2 is %cpu");
+        // Column 2 is cumulative CPU time, and the assertion is that *this*
+        // platform's `ps` renders it in a shape the parser accepts — the one
+        // thing neither man page pins down. A rendering we cannot read would
+        // otherwise silently disable the CPU signal for every sandbox session.
+        assert!(
+            crate::cpu::parse_cputime_secs(fields[1]).is_some(),
+            "column 2 must be a cputime this platform's parser reads, got {:?}",
+            fields[1]
+        );
         assert!(fields[2].parse::<f64>().is_ok(), "column 3 is rss");
         assert!(
             fields[3..].join(" ").contains("sleep"),
@@ -2951,5 +3064,54 @@ WantedBy=timers.target\n";
         assert_eq!(parse_timer_interval("[Timer]\nPersistent=true\n"), None);
         assert_eq!(parse_timer_interval(""), None);
         assert_eq!(parse_timer_interval("OnUnitActiveSec=abcs\n"), None);
+    }
+}
+
+#[cfg(test)]
+mod target_sandbox_tests {
+    use super::*;
+
+    #[test]
+    fn a_sandbox_name_is_never_invented_for_an_exec() {
+        // `sandbox_name` answers unconditionally, falling back to the
+        // conventional DEFAULT_SANDBOX_NAME. That default is fine for naming
+        // and fatal for `sbx exec`: `detect_running_sandbox_name` returns None
+        // whenever `sbx ls` shows anything but exactly one running sandbox, so
+        // on a host running three every exec addressed a sandbox that does not
+        // exist —
+        //
+        //   reaper: sandbox sidecar scan failed: sbx exec sidecar-scan failed:
+        //     ERROR: no sandbox named 'linera-agent'
+        //
+        // — and `reap` swallowed that into Ok(()), so the sidecar and orphan
+        // pass silently did nothing on every run while reporting success.
+        assert_eq!(
+            resolve_sandbox_name(None, None, DEFAULT_SANDBOX_NAME),
+            DEFAULT_SANDBOX_NAME,
+            "the naming resolver still answers — this test is about exec targets"
+        );
+
+        // The exec target must be empty-handed in exactly the case the naming
+        // resolver papers over: nothing detected and no explicit override.
+        assert_eq!(
+            exec_target(None, None),
+            None,
+            "with nothing detected and no override there is no target to exec into"
+        );
+        assert_eq!(
+            exec_target(Some("linera-agent-4f0a"), None).as_deref(),
+            Some("linera-agent-4f0a"),
+            "an explicit override is an observation, not a guess"
+        );
+        assert_eq!(
+            exec_target(None, Some("linera-agent-9cb6")).as_deref(),
+            Some("linera-agent-9cb6"),
+            "and so is a name `sbx ls` actually resolved"
+        );
+        assert_eq!(
+            exec_target(Some(""), Some("linera-agent-9cb6")).as_deref(),
+            Some("linera-agent-9cb6"),
+            "an empty override is not an override"
+        );
     }
 }

@@ -604,7 +604,7 @@ fn session_row(s: &ClaudeSession, app: &App) -> Row<'static> {
         Cell::from(s.format_elapsed()),
         Cell::from(format_last_user_age(s.last_user_message_ts))
             .style(Style::default().fg(t.text_muted)),
-        Cell::from(format!("{:.1}", s.cpu_percent)),
+        Cell::from(s.format_cpu()),
         Cell::from(s.format_mem()),
         Cell::from(s.format_tokens()),
         Cell::from(s.format_sparkline()).style(Style::default().fg(t.sparkline)),

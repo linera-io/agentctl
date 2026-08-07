@@ -177,11 +177,11 @@ pub fn generate_sessions(tick: u32) -> Vec<ClaudeSession> {
             s.elapsed = Duration::from_secs(base_elapsed);
 
             // CPU/MEM
-            s.cpu_percent = match s.status {
+            s.cpu_rate_percent = Some(match s.status {
                 SessionStatus::Processing => 15.0 + (i as f32 * 3.0),
                 SessionStatus::NeedsInput => 0.3,
                 _ => 0.8,
-            };
+            });
             s.mem_mb = 200.0 + (i as f64 * 50.0);
 
             // Subagents for some sessions

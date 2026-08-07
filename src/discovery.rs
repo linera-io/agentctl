@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::io::BufRead;
+use std::path::{Path, PathBuf};
 
 use crate::session::{ClaudeSession, RawSession};
 
@@ -452,8 +453,73 @@ fn proc_cwd(pid: u32) -> Option<String> {
 
 /// Resolve JSONL paths for sessions. Must be called AFTER command_args are populated
 /// (i.e., after fetch_ps_data), so we can use --resume UUIDs for correct mapping.
+/// Find a session's transcript without knowing its cwd, by scanning every
+/// project directory for `<session_id>.jsonl`.
+///
+/// Every other lookup here derives the project directory from the cwd, so a
+/// session whose cwd is blank has no path to its own transcript at all — and a
+/// blank cwd is not hypothetical. Claude Code deletes pointer files mid-session,
+/// after which discovery falls back to the process table, which knows the pid
+/// and the `--resume` uuid and nothing else. `cwd_to_slug("")` is `-`, so those
+/// sessions look for `projects/-/<id>.jsonl`, which never exists: the row loses
+/// its title and its project and reads `Unreadable`, showing a bare pid.
+///
+/// The session id is globally unique and is the transcript's filename, so the
+/// file is always findable — one directory listing per project, only for the
+/// sessions that need it.
+pub fn find_transcript_by_session_id(session_id: &str) -> Option<PathBuf> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let filename = format!("{session_id}.jsonl");
+    fs::read_dir(projects_dir())
+        .ok()?
+        .flatten()
+        .map(|project| project.path().join(&filename))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Recover a session's working directory from its own transcript.
+///
+/// Claude Code stamps `"cwd"` on every record it writes, which makes the
+/// transcript a durable copy of the one field the process-table fallback cannot
+/// supply. This is the repair path for an entry that has already been written
+/// blank: preventing the next clobber does nothing for the rows that are
+/// already broken on disk.
+pub fn recover_cwd_from_transcript(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = value.get("cwd").and_then(|v| v.as_str()) {
+            if !cwd.is_empty() {
+                return Some(cwd.to_string());
+            }
+        }
+    }
+    None
+}
+
 pub fn resolve_jsonl_paths(sessions: &mut [ClaudeSession]) {
     for session in sessions.iter_mut() {
+        // A session that lost its cwd cannot name its own project directory,
+        // so recover both from the transcript before the slug-based lookups
+        // below get a `-` and fail. Doing it here fixes the rendered row on the
+        // next tick, with no registry rewrite and nothing for the user to run.
+        if session.cwd.is_empty() {
+            if let Some(path) = find_transcript_by_session_id(&session.session_id) {
+                if let Some(cwd) = recover_cwd_from_transcript(&path) {
+                    // Same derivation `ClaudeSession::from_raw` uses, so a
+                    // recovered row is indistinguishable from one that never
+                    // lost its cwd.
+                    session.project_name = cwd.rsplit('/').next().unwrap_or("unknown").to_string();
+                    session.cwd = cwd;
+                }
+                session.jsonl_path = Some(path);
+                continue;
+            }
+        }
         let slug = cwd_to_slug(&session.cwd);
         let project_dir = projects_dir().join(&slug);
 

@@ -53,6 +53,8 @@ fn visible_session_ids() -> Vec<String> {
         NOW,
         INTERVAL,
         None,
+        // This seam asserts which rows render, not what their CPU reads.
+        &std::collections::HashMap::new(),
     )
     .into_iter()
     .map(|session| session.session_id)

@@ -190,21 +190,42 @@ impl SessionEntry {
     }
 }
 
-/// Carry a stored display name forward into incoming entries that lost
-/// theirs. An incoming `name: None` does not mean "the session was un-named" —
-/// it means the discovery pass had no name source (the pointer file is gone
-/// and the session was rediscovered from the process table, which only knows
-/// the `--resume` uuid). The registry copy is the durable one; letting `None`
-/// overwrite it is how the 2026-07-28 title-blanking happened. An incoming
-/// `Some` always wins — that is a genuinely fresher name (pointer file or
-/// transcript recovery).
-fn backfill_missing_names(previous: &[SessionEntry], entries: &mut [SessionEntry]) {
-    for entry in entries.iter_mut().filter(|entry| entry.name.is_none()) {
-        if let Some(known) = previous
+/// Carry stored identity forward into incoming entries that lost theirs.
+///
+/// An incoming empty field does not mean "the session lost this property" — it
+/// means the discovery pass had no source for it. When Claude Code deletes a
+/// session's pointer file mid-session (it does, routinely), the next discovery
+/// falls back to the process table, which knows only the pid and the
+/// `--resume` uuid. Everything else comes back blank. The registry copy is the
+/// durable one, so a blank must never overwrite it; a non-empty incoming value
+/// always wins, being genuinely fresher.
+///
+/// **`name` alone was covered here until 2026-08-06, and the other two fields
+/// have exactly the same failure.** With `cwd` blanked, `transcript` is
+/// recomputed as `~/.claude/projects/-/<id>.jsonl` — the `-` being what an
+/// empty cwd renders as — which does not exist. Every affected row then loses
+/// its title *and* reads `Unreadable`, showing nothing but a pid. Observed on
+/// 18 sessions at once: `cwd: ""`, `name: null`, and a transcript path under
+/// `projects/-/` while the real transcript sat in `projects/-Users-ndr/`.
+fn backfill_missing_identity(previous: &[SessionEntry], entries: &mut [SessionEntry]) {
+    for entry in entries.iter_mut() {
+        let Some(known) = previous
             .iter()
             .find(|prev| prev.session_id == entry.session_id)
-        {
+        else {
+            continue;
+        };
+        if entry.name.is_none() {
             entry.name = known.name.clone();
+        }
+        // `cwd` and `transcript` move together: `transcript` is derived from
+        // `cwd`, so a rediscovered entry that lost the first has a wrong,
+        // non-existent value for the second rather than an empty one. Restoring
+        // the stored cwd without the stored transcript would leave the row
+        // pointing at a file that is not there.
+        if entry.cwd.is_empty() && !known.cwd.is_empty() {
+            entry.cwd = known.cwd.clone();
+            entry.transcript = known.transcript.clone();
         }
     }
 }
@@ -213,7 +234,7 @@ fn backfill_missing_names(previous: &[SessionEntry], entries: &mut [SessionEntry
 ///
 /// Live sessions win — they carry fresh names, transcripts and owners (an
 /// incoming entry that lost its *name* is the one exception; see
-/// [`backfill_missing_names`]). Every
+/// [`backfill_missing_identity`]). Every
 /// departed session's entry is kept verbatim; hooks never forget. A hook fires
 /// from one session while a *different* terminal may be mid-quit, and one
 /// unconfirmed look then could delete exactly the restore set that quit needs,
@@ -223,7 +244,7 @@ pub fn merge_live_keep_all(
     live: Vec<SessionEntry>,
 ) -> Vec<SessionEntry> {
     let mut entries = live;
-    backfill_missing_names(previous, &mut entries);
+    backfill_missing_identity(previous, &mut entries);
     let live_ids: std::collections::HashSet<&str> = entries
         .iter()
         .map(|entry| entry.session_id.as_str())
@@ -669,7 +690,7 @@ pub fn replace_sandbox_slice(sandbox: &str, mut entries: Vec<SessionEntry>) -> i
         // sandbox at once. Backfill before the unchanged-comparison so a
         // no-op-after-backfill write is still skipped.
         if let Some(existing) = registry.sandboxes.get(sandbox) {
-            backfill_missing_names(existing, &mut entries);
+            backfill_missing_identity(existing, &mut entries);
         }
         let unchanged = match (registry.sandboxes.get(sandbox), entries.is_empty()) {
             (None, true) => true,
@@ -1678,5 +1699,71 @@ pub(crate) mod tests {
             }
         }
         let _ = fs::remove_dir_all(&marker);
+    }
+}
+
+#[cfg(test)]
+mod identity_backfill_tests {
+    use super::*;
+
+    fn entry(session_id: &str, cwd: &str, name: Option<&str>) -> SessionEntry {
+        SessionEntry {
+            session_id: session_id.to_string(),
+            cwd: cwd.to_string(),
+            transcript: if cwd.is_empty() {
+                format!("/home/u/.claude/projects/-/{session_id}.jsonl")
+            } else {
+                format!("/home/u/.claude/projects/-Users-ndr-work/{session_id}.jsonl")
+            },
+            name: name.map(str::to_string),
+            pid: Some(1),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn regression_a_blank_rediscovery_never_overwrites_stored_identity() {
+        // The write that broke 18 sessions at once. Claude Code deleted their
+        // pointer files, discovery fell back to the process table, and the
+        // resulting entries carried a pid and a uuid and nothing else. The
+        // wholesale slice replace then persisted those blanks over good data,
+        // so every row lost its title and pointed at `projects/-/<id>.jsonl`.
+        //
+        // `name` alone was guarded here before 2026-08-06; `cwd` and the
+        // `transcript` derived from it were not.
+        let stored = vec![entry("abc", "/Users/ndr/work", Some("my-title"))];
+        let mut rediscovered = vec![entry("abc", "", None)];
+
+        backfill_missing_identity(&stored, &mut rediscovered);
+
+        assert_eq!(rediscovered[0].name.as_deref(), Some("my-title"));
+        assert_eq!(rediscovered[0].cwd, "/Users/ndr/work");
+        assert_eq!(
+            rediscovered[0].transcript, stored[0].transcript,
+            "transcript is derived from cwd, so restoring one without the \
+             other leaves the row pointing at a file that is not there"
+        );
+    }
+
+    #[test]
+    fn a_fresher_value_still_wins() {
+        // The guard must not freeze identity: a session that genuinely moved,
+        // or was renamed, has to be able to say so. Only *blanks* are refused.
+        let stored = vec![entry("abc", "/Users/ndr/old", Some("old-title"))];
+        let mut fresh = vec![entry("abc", "/Users/ndr/work", Some("new-title"))];
+
+        backfill_missing_identity(&stored, &mut fresh);
+
+        assert_eq!(fresh[0].name.as_deref(), Some("new-title"));
+        assert_eq!(fresh[0].cwd, "/Users/ndr/work");
+    }
+
+    #[test]
+    fn an_unknown_session_is_left_alone() {
+        let stored = vec![entry("abc", "/Users/ndr/work", Some("t"))];
+        let mut incoming = vec![entry("zzz", "", None)];
+        backfill_missing_identity(&stored, &mut incoming);
+        assert_eq!(incoming[0].cwd, "", "nothing stored to recover from");
+        assert!(incoming[0].name.is_none());
     }
 }

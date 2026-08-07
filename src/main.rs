@@ -9,6 +9,7 @@ mod app;
 mod brain;
 mod commands;
 mod config;
+mod cpu;
 mod demo;
 mod discovery;
 mod health;

@@ -8,6 +8,7 @@
 pub mod app;
 pub mod brain;
 pub mod config;
+pub mod cpu;
 pub mod demo;
 pub mod discovery;
 pub mod health;
