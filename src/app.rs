@@ -191,7 +191,7 @@ pub(crate) fn foreign_sessions_from(
     local: &[ClaudeSession],
     now_ms: u64,
     collector_interval: std::time::Duration,
-    open_ttys: Option<&std::collections::HashMap<String, std::collections::HashSet<String>>>,
+    terminals: Option<&crate::reaper::OpenTerminals>,
     prev_cpu_samples: &std::collections::HashMap<String, crate::cpu::CpuSample>,
 ) -> Vec<ClaudeSession> {
     let vitals = snapshot_vitals_at(snapshot, now_ms, collector_interval);
@@ -214,7 +214,7 @@ pub(crate) fn foreign_sessions_from(
         if !running.allows(name) {
             continue;
         }
-        let open_ttys = open_ttys.and_then(|by_sandbox| by_sandbox.get(name.as_str()));
+        let open_ttys = terminals.and_then(|sweep| sweep.by_sandbox.get(name.as_str()));
         let collector_saw = collector_live_ids(snapshot, name, now_ms, collector_interval);
         for entry in entries {
             // A stamped entry is a session whose `SessionEnd` has fired. It
@@ -229,7 +229,11 @@ pub(crate) fn foreign_sessions_from(
             if collector_says_gone(entry, collector_saw.as_ref(), snapshot.collected_at_ms) {
                 continue;
             }
-            if terminal_is_gone(entry, open_ttys) {
+            if terminal_is_gone(
+                entry,
+                open_ttys,
+                terminals.is_some_and(|sweep| sweep.wrapper_argv_parsed),
+            ) {
                 continue;
             }
             let Some(mut session) = ClaudeSession::from_registry_entry(name, entry) else {
@@ -342,21 +346,27 @@ fn collector_says_gone(
 /// - `ps` could not be run or failed ⇒ `open` is `None`.
 /// - The entry predates `host_tty`, or the session was not launched by the
 ///   wrapper ⇒ nothing to match on.
-/// - The sandbox has no open ttys at all ⇒ indistinguishable from a parsing or
-///   format mismatch, and hiding every row of a sandbox on a signal we cannot
-///   corroborate is far worse than the lag this removes. The departure stamp
-///   and the reconcile still cover that case.
+/// - The sweep parsed no `sbx exec … SANDBOX_HOST_TTY=` line *anywhere* on the
+///   host ⇒ "nothing attached" is indistinguishable from an argv format we no
+///   longer parse, and hiding rows on an uncorroborated signal is worse than
+///   the lag this removes.
 ///
-/// So a row is dropped only when the host positively observes *other* live
-/// terminals for the same sandbox and this session's is not among them.
+/// It deliberately does **not** fail open merely because *this* sandbox's set is
+/// empty, which is what the first version did. Closing the window of a sandbox
+/// holding one session is precisely what empties its set, so that guard turned
+/// the signal off for the common shape — one session per ephemeral sandbox — and
+/// left removal to the 300 s collector. Measured on 2026-08-10: a row outlived
+/// its session by ~96 s. `wrapper_argv_parsed` corroborates the parse instead,
+/// which is the thing the emptiness check was really standing in for.
 fn terminal_is_gone(
     entry: &crate::sandbox_registry::SessionEntry,
     open: Option<&std::collections::HashSet<String>>,
+    wrapper_argv_parsed: bool,
 ) -> bool {
     let Some(open) = open else {
         return false;
     };
-    if open.is_empty() {
+    if open.is_empty() && !wrapper_argv_parsed {
         return false;
     }
     let Some(tty) = entry.host_tty.as_deref().filter(|tty| !tty.is_empty()) else {
@@ -3295,15 +3305,17 @@ mod foreign_session_tests {
         );
     }
 
-    fn ttys(
-        sandbox: &str,
-        open: &[&str],
-    ) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
-        std::iter::once((
-            sandbox.to_string(),
-            open.iter().map(|t| (*t).to_string()).collect(),
-        ))
-        .collect()
+    /// A sweep in which `sandbox` has exactly `open` attached, taken on a host
+    /// where the wrapper's argv still parses — the ordinary case.
+    fn ttys(sandbox: &str, open: &[&str]) -> crate::reaper::OpenTerminals {
+        crate::reaper::OpenTerminals {
+            by_sandbox: std::iter::once((
+                sandbox.to_string(),
+                open.iter().map(|t| (*t).to_string()).collect(),
+            ))
+            .collect(),
+            wrapper_argv_parsed: true,
+        }
     }
 
     fn with_tty(session_id: &str, name: &str, pid: u32, tty: &str) -> SessionEntry {
@@ -3367,6 +3379,44 @@ mod foreign_session_tests {
     }
 
     #[test]
+    fn the_last_window_of_a_sandbox_closing_retires_its_row() {
+        // The topology this has to cover: one session per ephemeral sandbox.
+        // When its only window closes, the sandbox's tty set goes EMPTY — so a
+        // guard that fails open on emptiness never fires for the common case,
+        // and the row falls through to the 300 s collector. Measured on
+        // 2026-08-10: a row outlived its session by ~96 s, and only went when an
+        // unrelated launch happened to reap the drained sandbox.
+        //
+        // The sweep having parsed the wrapper's argv *somewhere* on the host is
+        // what makes the empty set an answer instead of a suspected mismatch.
+        let registry = registry_of(&[(
+            "linera-agent-alone",
+            vec![with_tty("only-1", "just-exited", 1, "/dev/ttys019")],
+        )]);
+        let open = ttys("linera-agent-alone", &[]);
+        let rows = foreign_sessions_from(
+            &registry,
+            &SandboxSnapshot::default(),
+            &running(&["linera-agent-alone"]),
+            None,
+            &[],
+            NOW,
+            INTERVAL,
+            Some(&open),
+            &no_prev_cpu(),
+        );
+        assert!(
+            rows.is_empty(),
+            "the sandbox's only terminal is gone; nothing should render"
+        );
+        assert_eq!(
+            registry.sandboxes["linera-agent-alone"].len(),
+            1,
+            "but the entry stays on disk as --restore-sbx-sessions material"
+        );
+    }
+
+    #[test]
     fn liveness_fails_open_when_the_host_cannot_be_asked() {
         // `None` means "no ps" — in-sandbox claudectl, or a failed call. It must
         // never read as "nothing is alive", which would blank the whole view.
@@ -3389,16 +3439,19 @@ mod foreign_session_tests {
     }
 
     #[test]
-    fn liveness_fails_open_when_the_sandbox_shows_no_open_ttys() {
-        // An empty set cannot be told apart from a parse or format mismatch,
-        // and hiding every row of a sandbox on an uncorroborated signal is far
-        // worse than the lag this removes. The stamp and the reconcile still
-        // cover the genuine "last window closed" case.
+    fn liveness_fails_open_when_the_sweep_parsed_no_wrapper_terminal_at_all() {
+        // `ps` ran and matched nothing anywhere on the host. That is what an
+        // argv format change looks like from here, so it must not be read as
+        // "every session is dead" — the guard the emptiness check was really
+        // standing in for, now stated directly.
         let registry = registry_of(&[(
             "linera-agent-live",
             vec![with_tty("gone-1", "closed-window", 1, "/dev/ttys055")],
         )]);
-        let open = ttys("linera-agent-live", &[]);
+        let unparsed = crate::reaper::OpenTerminals {
+            wrapper_argv_parsed: false,
+            ..ttys("linera-agent-live", &[])
+        };
         let rows = foreign_sessions_from(
             &registry,
             &SandboxSnapshot::default(),
@@ -3407,7 +3460,7 @@ mod foreign_session_tests {
             &[],
             NOW,
             INTERVAL,
-            Some(&open),
+            Some(&unparsed),
             &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["gone-1"]);
@@ -3454,7 +3507,7 @@ mod foreign_session_tests {
             ),
         ]);
         let mut open = ttys("linera-agent-a", &["/dev/ttys001"]);
-        open.insert(
+        open.by_sandbox.insert(
             "linera-agent-b".to_string(),
             std::iter::once("/dev/ttys009".to_string()).collect(),
         );
