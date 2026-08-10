@@ -15,8 +15,10 @@ use crate::brain;
 use crate::config;
 use crate::demo;
 use crate::discovery;
+use crate::hook_state;
 use crate::launch;
 use crate::process;
+use crate::reaper;
 use crate::rules;
 use crate::sandbox_registry;
 use crate::session;
@@ -437,6 +439,112 @@ fn print_doctor_transcripts() {
     }
 }
 
+fn file_mtime_ms(path: &str) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
+/// Report any session whose hook channel has stopped delivering.
+///
+/// Nothing else claudectl shows can tell "this session is quiet" apart from
+/// "this session's hooks stopped arriving", and the difference is expensive:
+/// every fast path for noticing a session start, block, or *end* is a hook, and
+/// the hook fails silently by construction — the command ends in
+/// `2>/dev/null || true`, `claudectl-hook` writes nothing to stdout by design,
+/// and its own log is opt-in behind `CLAUDECTL_HOOK_LOG`.
+///
+/// On 2026-08-10 one session's hooks had been silent for 12 h. Its `SessionEnd`
+/// never landed, so its row outlived it by ~96 s, and no surface anywhere said
+/// why. This is that surface.
+fn print_doctor_hook_liveness() {
+    println!();
+    println!("Hook Channel");
+
+    let running = reaper::running_sandboxes();
+    let mut scopes: Vec<(String, Vec<sandbox_registry::SessionEntry>)> =
+        sandbox_registry::load().sandboxes.into_iter().collect();
+    scopes.sort_by(|left, right| left.0.cmp(&right.0));
+    scopes.push((
+        HOST_SCOPE.to_string(),
+        sandbox_registry::load_local().sessions,
+    ));
+
+    let mut checked = 0_usize;
+    let mut silent = 0_usize;
+    for (scope, entries) in scopes {
+        // A stopped sandbox fires no hooks by definition; its slice is restore
+        // material, not evidence of anything. `None` means we could not ask
+        // (no `sbx`), in which case judge everything rather than nothing.
+        if scope != HOST_SCOPE
+            && running
+                .as_ref()
+                .is_some_and(|names| !names.contains(&scope))
+        {
+            println!("  [--] {scope}: not running — no hooks expected");
+            continue;
+        }
+        for entry in entries {
+            // Stamped means `SessionEnd` arrived and did its job. Nothing to say.
+            if entry.departed_at_ms.is_some() {
+                continue;
+            }
+            let newest_hook_ms = hook_state::HookState::load(&entry.session_id)
+                .as_ref()
+                .map_or(0, hook_state::newest_hook_event_ms);
+            let transcript_ms = file_mtime_ms(&entry.transcript);
+            checked += 1;
+            let label = entry.name.as_deref().unwrap_or("unnamed");
+            let short = &entry.session_id[..entry.session_id.len().min(8)];
+            if !hook_state::hook_channel_is_silent(transcript_ms, newest_hook_ms) {
+                println!("  [ok] {scope} {short} ({label})");
+                continue;
+            }
+            silent += 1;
+            let behind_secs = transcript_ms.saturating_sub(newest_hook_ms) / 1_000;
+            println!(
+                "  [!!] {scope} {short} ({label}): transcript is {} ahead of the last hook event",
+                crate::history::format_duration(behind_secs)
+            );
+            println!(
+                "      transcript: {} (mtime {transcript_ms})",
+                entry.transcript
+            );
+            if newest_hook_ms == 0 {
+                println!("      last hook:  none ever recorded for this session");
+            } else {
+                println!("      last hook:  {newest_hook_ms}");
+            }
+            println!(
+                "      reading: either the session is live and its hooks stopped arriving, or it \
+                 ended without a SessionEnd. Both mean this row is unverifiable — no departure \
+                 stamp will ever be written, so it is retired by the host tty sweep or the \
+                 collector rather than instantly."
+            );
+            println!(
+                "      next: `echo '{{\"session_id\":\"probe\",\"hook_event_name\":\"Stop\"}}' | \
+                 CLAUDECTL_HOOK_LOG=/tmp/hook.log claudectl-hook` in that scope. If that logs and \
+                 exits 0, the receiver is healthy and Claude Code is not invoking it — restart the \
+                 session; if it fails, the receiver is the problem."
+            );
+        }
+    }
+
+    if checked == 0 {
+        println!("  [--] no live registry sessions to check");
+    } else if silent == 0 {
+        println!("  {checked} session(s) delivering hooks");
+    } else {
+        println!("  {silent} of {checked} session(s) have a dead hook channel");
+    }
+}
+
+/// Scope label for the laptop's own (non-sandbox) sessions. Not a sandbox name,
+/// so it is never run through the running-sandbox filter.
+const HOST_SCOPE: &str = "host";
+
 pub(crate) fn print_doctor() -> io::Result<()> {
     use crate::terminals;
 
@@ -445,6 +553,9 @@ pub(crate) fn print_doctor() -> io::Result<()> {
 
     // Transcript discovery diagnostics
     print_doctor_transcripts();
+
+    // Is anything still delivering hooks?
+    print_doctor_hook_liveness();
 
     // Brain diagnostics
     let cfg = config::Config::load();

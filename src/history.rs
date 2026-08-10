@@ -337,7 +337,7 @@ pub fn parse_duration(s: &str) -> Option<u64> {
     }
 }
 
-fn format_duration(secs: u64) -> String {
+pub(crate) fn format_duration(secs: u64) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     let s = secs % 60;
