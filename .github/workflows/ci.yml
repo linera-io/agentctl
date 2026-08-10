@@ -3,8 +3,15 @@ name: CI
 on:
   push:
     branches: [main]
+  # Deliberately unfiltered. `branches: [main]` here meant a pull request based
+  # on anything other than main — any stacked PR — ran no checks at all and
+  # reported "no checks reported", which reads like success and is how #50 was
+  # nearly merged unverified. Retargeting such a PR onto main does not fix it
+  # either: `pull_request` fires on opened/synchronize/reopened, never `edited`.
+  #
+  # Duplicate runs are not a concern: `push` stays pinned to main, so a PR
+  # branch is built once by `pull_request` and again only when it lands.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
