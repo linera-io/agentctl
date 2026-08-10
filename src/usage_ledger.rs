@@ -1283,16 +1283,30 @@ mod tests {
     /// Regression: `load_summary` must stay fast on a warm cache.
     /// Before commit 0d6e2d3a it linear-scanned the full 105 MB CSV
     /// (~750 ms per call) every time and was called 3× per tick.
+    ///
+    /// Measured against a parse of the same rows on the same machine instead of
+    /// a millisecond ceiling — the ceiling was unreachable through a sandbox
+    /// mount and far too generous on a fast disk. Nine cached queries must cost
+    /// less than *half* one parse; the regression this guards made each of the
+    /// nine cost a whole parse, so the two are never close.
     #[test]
-    fn perf_summarize_cached_stays_fast_with_many_rows() {
+    fn perf_summarize_cached_costs_far_less_than_parsing() {
         let _g = cache_test_lock();
+        let paths = TestPaths::new("perf_cached_vs_parse");
         reset_cache_for_tests();
-        seed_cache_with_synthetic_rows(50_000);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
+        write_synthetic_ledger(&paths.ledger, 50_000);
+
+        // The baseline: one full parse of those 50k rows, which is exactly what
+        // every `summarize_cached` call used to do.
+        let parse_start = std::time::Instant::now();
+        refresh_cache_from(&paths.ledger);
+        let parse = parse_start.elapsed();
+
         let start = std::time::Instant::now();
         for _ in 0..3 {
             // Mimic a tick's day/week/month query trio.
@@ -1300,12 +1314,14 @@ mod tests {
             let _ = summarize_cached(now.saturating_sub(7 * 86_400_000));
             let _ = summarize_cached(now.saturating_sub(30 * 86_400_000));
         }
-        let elapsed = start.elapsed();
+        let cached = start.elapsed();
+
         assert!(
-            elapsed.as_millis() < 200,
-            "summarize_cached × 9 over 50k rows took {} ms (regression — \
-             expect <50 ms in release, <200 ms even in debug)",
-            elapsed.as_millis()
+            cached * 2 < parse,
+            "9 cached queries took {} ms against a {} ms parse of the same 50k \
+             rows — summarize_cached is re-reading the ledger",
+            cached.as_millis(),
+            parse.as_millis()
         );
         reset_cache_for_tests();
     }
@@ -1341,16 +1357,37 @@ mod tests {
             body.push_str(&format!("{ts},sess,claude-opus-4-7,1,0,0,1\n"));
         }
         std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
-        std::fs::write(&ledger, body).unwrap();
+        std::fs::write(&ledger, &body).unwrap();
 
+        // Half the work, on the same machine, as the control: linear eviction
+        // doubles with the row count, quadratic quadruples. A 3× ceiling
+        // separates the two with room for scheduler noise, and unlike a
+        // millisecond bound it means the same thing on a laptop, a CI runner and
+        // through a sandbox mount.
+        let half = p.ledger.with_extension("half.csv");
+        let mut half_body = String::from(HEADER);
+        half_body.push('\n');
+        for line in body.lines().skip(1).take(25_000) {
+            half_body.push_str(line);
+            half_body.push('\n');
+        }
+        std::fs::write(&half, half_body).unwrap();
+
+        reset_cache_for_tests();
+        let half_start = std::time::Instant::now();
+        refresh_cache_from(&half);
+        let half_elapsed = half_start.elapsed();
+
+        reset_cache_for_tests();
         let start = std::time::Instant::now();
         refresh_cache_from(&ledger);
         let elapsed = start.elapsed();
         assert!(
-            elapsed.as_millis() < 500,
-            "refresh_cache_from with 50k rows took {} ms (regression — \
-             expect <100 ms in release, <500 ms even in debug)",
-            elapsed.as_millis()
+            elapsed < half_elapsed.max(std::time::Duration::from_millis(1)) * 3,
+            "50k rows took {} ms against {} ms for 25k — eviction is scaling \
+             worse than linearly",
+            elapsed.as_millis(),
+            half_elapsed.as_millis()
         );
 
         // Sanity: roughly half the rows survive eviction (the recent
@@ -1365,9 +1402,16 @@ mod tests {
         reset_cache_for_tests();
     }
 
-    fn seed_cache_with_synthetic_rows(n: usize) {
-        let p = TestPaths::new("perf_seed");
-        let ledger = p.ledger.clone();
+    /// Write `n` synthetic rows into `ledger`, spread across the past 30 days so
+    /// the day/week/month cutoffs each match a distinct subset.
+    ///
+    /// Takes the path rather than returning one: `TestPaths` deletes its tree on
+    /// drop, so a helper that owned the guard and handed back a `PathBuf` would
+    /// return a path to a directory that no longer exists — and a timing ratio
+    /// over a missing ledger passes vacuously. The caller keeps the guard alive.
+    /// It also leaves the cache alone, so callers can time `refresh_cache_from`
+    /// as their own baseline.
+    fn write_synthetic_ledger(ledger: &Path, n: usize) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1375,13 +1419,10 @@ mod tests {
         let mut body = String::from(HEADER);
         body.push('\n');
         for i in 0..n as u64 {
-            // Spread rows across the past 30 days so the day/week/month
-            // cutoff queries each match a distinct subset.
             let ts = now - (i * (30 * 86_400_000) / n.max(1) as u64);
             body.push_str(&format!("{ts},sess,claude-opus-4-7,1,0,0,1\n"));
         }
         std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
-        std::fs::write(&ledger, body).unwrap();
-        refresh_cache_from(&ledger);
+        std::fs::write(ledger, body).unwrap();
     }
 }
