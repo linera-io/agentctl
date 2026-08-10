@@ -3535,6 +3535,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None, // no host ps either — nothing but the snapshot
+            &no_prev_cpu(),
         );
         assert_eq!(
             ids(&rows),
@@ -3563,6 +3564,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["brand-new"]);
     }
@@ -3584,6 +3586,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["dead-1"], "stale snapshot ⇒ no opinion");
     }
@@ -3609,6 +3612,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["a-1"]);
     }
@@ -3631,6 +3635,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert_eq!(ids(&rows), ["no-pid"]);
     }
@@ -3657,6 +3662,7 @@ mod foreign_session_tests {
             NOW,
             INTERVAL,
             None,
+            &no_prev_cpu(),
         );
         assert!(
             rows.is_empty(),
