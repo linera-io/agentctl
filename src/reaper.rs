@@ -42,25 +42,18 @@ use crate::sandbox_registry;
 
 /// Process-wide cache for the auto-detected sandbox name. `None` means
 /// `sbx ls` could not pick exactly one running sandbox; the resolver then
-/// falls back to `DEFAULT_SANDBOX_NAME`. Populated lazily on first call.
+/// falls back to the conventional `linera-agent`. Populated lazily on first call.
 static AUTO_SANDBOX_NAME: OnceLock<Option<String>> = OnceLock::new();
-
-const DEFAULT_SANDBOX_NAME: &str = "linera-agent";
-
-fn sandbox_name() -> String {
-    let env = std::env::var("CLAUDECTL_SANDBOX_NAME").ok();
-    let auto = AUTO_SANDBOX_NAME.get_or_init(detect_running_sandbox_name);
-    resolve_sandbox_name(env.as_deref(), auto.as_deref(), DEFAULT_SANDBOX_NAME)
-}
 
 /// The sandbox to `sbx exec` into, or `None` when there is no unambiguous one.
 ///
-/// [`sandbox_name`] always answers, falling back to [`DEFAULT_SANDBOX_NAME`]
-/// when it has nothing better. That default is a *convention*, not an
-/// observation, and `detect_running_sandbox_name` deliberately declines to
-/// guess whenever `sbx ls` shows anything other than exactly one running
-/// sandbox. On a host running three, every `sbx exec` built from the fallback
-/// therefore addressed a sandbox that does not exist:
+/// This module used to also carry a `sandbox_name()` that *always* answered,
+/// falling back to the conventional `linera-agent` when it had nothing better. That
+/// default is a *convention*, not an observation, and
+/// `detect_running_sandbox_name` deliberately declines to guess whenever
+/// `sbx ls` shows anything other than exactly one running sandbox. On a host
+/// running three, every `sbx exec` built from the fallback therefore addressed a
+/// sandbox that does not exist:
 ///
 /// ```text
 /// reaper: sandbox sidecar scan failed: sbx exec sidecar-scan failed:
@@ -110,7 +103,7 @@ pub(crate) fn resolve_sandbox_name(
 
 /// Shell out to `sbx ls --json` once and try to identify a unique running
 /// sandbox. Returns `None` for any failure (binary missing, non-zero exit,
-/// parse miss), in which case the caller falls back to `DEFAULT_SANDBOX_NAME`.
+/// parse miss), in which case the caller falls back to the conventional name.
 fn detect_running_sandbox_name() -> Option<String> {
     let output = sbx_list_json().ok()?;
     parse_sbx_ls_for_single_running_sandbox(&output)
@@ -977,8 +970,29 @@ fn sbx_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Parse host `ps -ax -o pid,command` for `sbx exec ... linera-agent` lines
-/// and pull `SANDBOX_HOST_TTY=/dev/ttysNNN` out of each.
+/// Every `SANDBOX_HOST_TTY` still open on this host, across **all** sandboxes.
+///
+/// Deliberately unfiltered by sandbox, because the orphan reaper asks a
+/// different question from the render path. The render path asks "which
+/// terminals belong to sandbox X?" — a per-sandbox question, answered by
+/// [`extract_open_ttys`] against a real registry name. This asks "is this tty
+/// still open anywhere on the host?", which no sandbox name narrows.
+///
+/// It used to filter by a `sandbox_name()` helper (deleted with this change),
+/// and that only ever worked by accident: the helper fell back to the
+/// conventional `linera-agent` whenever `sbx ls` showed anything other
+/// than exactly one running sandbox, and the old substring match then swept up
+/// every `linera-agent-<hash>` line. Two consequences, both silent:
+///
+/// - a sandbox named anything else (`SANDBOX_NAME=my-team-sandbox`) contributed
+///   no terminals, so its live sessions looked like orphans to `compute_orphans`
+///   and were candidates to be **killed**;
+/// - once the name is matched precisely, that fallback matches nothing at all,
+///   the set is empty, and `decide_action`'s Guard 1 skips every pass with
+///   "probable host scan failure" — orphan reaping silently switched off.
+///
+/// A host-wide set is also the conservative direction for the kill decision: a
+/// tty missing from a *broader* set is stronger evidence, never weaker.
 fn scan_host_open_ttys() -> io::Result<HashSet<String>> {
     let output = Command::new("ps")
         .args(["-ax", "-o", "pid,command"])
@@ -990,7 +1004,15 @@ fn scan_host_open_ttys() -> io::Result<HashSet<String>> {
         )));
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    Ok(extract_open_ttys(&text, &sandbox_name()))
+    Ok(host_open_ttys(&text))
+}
+
+/// Pure half of [`scan_host_open_ttys`]: every wrapper tty in a `ps` sweep,
+/// regardless of which sandbox it belongs to.
+fn host_open_ttys(ps_output: &str) -> HashSet<String> {
+    wrapper_terminals(ps_output)
+        .map(|(_, tty)| tty.to_string())
+        .collect()
 }
 
 /// How long a host `ps` sweep is reused. The render path asks once per refresh
@@ -2229,6 +2251,36 @@ mod tests {
     }
 
     #[test]
+    fn the_orphan_reapers_host_scan_is_not_narrowed_by_any_sandbox_name() {
+        // The regression this guards is the whole reason the per-sandbox match
+        // could not simply be tightened. `sandbox_name()` answers `linera-agent`
+        // on any host not running exactly one sandbox, so a name-filtered scan
+        // returns nothing once the name is matched precisely — and an empty set
+        // trips `decide_action`'s Guard 1, silently disabling orphan reaping.
+        // It must see every wrapper terminal, whatever the sandbox is called.
+        let ps = "\
+  100 ?? Ss   0:00.01 /usr/sbin/sshd
+  200 ?? S    0:00.05 sbx exec --env SANDBOX_HOST_TTY=/dev/ttys001 linera-agent-e3f43ae4b7d1 bash
+  201 ?? S    0:00.05 sbx exec --env SANDBOX_HOST_TTY=/dev/ttys055 my-team-sandbox bash
+  202 ?? S    0:00.05 sbx exec --env SANDBOX_HOST_TTY=/dev/ttys077 linera-agent bash
+";
+        let open = host_open_ttys(ps);
+        assert_eq!(
+            open,
+            ["/dev/ttys001", "/dev/ttys055", "/dev/ttys077"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<HashSet<_>>(),
+            "every sandbox's terminal counts, including one named nothing like the default"
+        );
+        // And the narrow question still gets a narrow answer.
+        assert_eq!(
+            extract_open_ttys(ps, "my-team-sandbox"),
+            std::iter::once("/dev/ttys055".to_string()).collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
     fn the_legacy_bare_name_does_not_match_its_identity_suffixed_siblings() {
         // `_is_reapable_name` in sandbox_common.sh still hands out the bare
         // `linera-agent` for a pre-identity sandbox, and every hashed name has
@@ -3164,7 +3216,7 @@ mod target_sandbox_tests {
     #[test]
     fn a_sandbox_name_is_never_invented_for_an_exec() {
         // `sandbox_name` answers unconditionally, falling back to the
-        // conventional DEFAULT_SANDBOX_NAME. That default is fine for naming
+        // conventional `linera-agent`. That default is fine for naming
         // and fatal for `sbx exec`: `detect_running_sandbox_name` returns None
         // whenever `sbx ls` shows anything but exactly one running sandbox, so
         // on a host running three every exec addressed a sandbox that does not
@@ -3176,8 +3228,8 @@ mod target_sandbox_tests {
         // — and `reap` swallowed that into Ok(()), so the sidecar and orphan
         // pass silently did nothing on every run while reporting success.
         assert_eq!(
-            resolve_sandbox_name(None, None, DEFAULT_SANDBOX_NAME),
-            DEFAULT_SANDBOX_NAME,
+            resolve_sandbox_name(None, None, "linera-agent"),
+            "linera-agent",
             "the naming resolver still answers — this test is about exec targets"
         );
 
