@@ -1096,9 +1096,18 @@ fn wrapper_terminals(ps_output: &str) -> impl Iterator<Item = (&str, &str)> {
 
 /// Pure parser: the set of `SANDBOX_HOST_TTY` values from
 /// `sbx exec ... <sandbox>` lines.
+///
+/// The name has to match a whole argv token, never a substring. `sbx exec`
+/// takes the sandbox as its own bare argument, and every identity-suffixed name
+/// has the legacy bare name as a prefix — so a substring test made
+/// `linera-agent` match every `linera-agent-<hash>` line on the host. That set
+/// then contained other sandboxes' terminals, and since a session's own tty is
+/// always in a superset, `terminal_is_gone` could never fire for that name: it
+/// failed open forever, silently, on exactly the name the wrapper still hands
+/// out for a pre-identity sandbox.
 fn extract_open_ttys(ps_output: &str, sandbox: &str) -> HashSet<String> {
     wrapper_terminals(ps_output)
-        .filter(|(line, _)| line.contains(sandbox))
+        .filter(|(line, _)| line.split_whitespace().any(|token| token == sandbox))
         .map(|(_, tty)| tty.to_string())
         .collect()
 }
@@ -2217,6 +2226,31 @@ mod tests {
         assert!(set.contains("/dev/ttys055"));
         assert!(!set.contains("/dev/ttys077")); // wrong sandbox name
         assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn the_legacy_bare_name_does_not_match_its_identity_suffixed_siblings() {
+        // `_is_reapable_name` in sandbox_common.sh still hands out the bare
+        // `linera-agent` for a pre-identity sandbox, and every hashed name has
+        // it as a prefix. Matching by substring pulled all three lines into the
+        // bare name's set — so its own tty was always present, and
+        // `terminal_is_gone` failed open for it forever.
+        let ps = "\
+  200 ?? S    0:00.05 sbx exec --env SANDBOX_HOST_TTY=/dev/ttys001 linera-agent bash
+  201 ?? S    0:00.05 sbx exec --env SANDBOX_HOST_TTY=/dev/ttys055 linera-agent-e3f43ae4b7d1 bash
+  202 ?? S    0:00.05 sbx exec --env SANDBOX_HOST_TTY=/dev/ttys077 linera-agent-09be684a5547 bash
+";
+        let bare = extract_open_ttys(ps, "linera-agent");
+        assert_eq!(
+            bare,
+            std::iter::once("/dev/ttys001".to_string()).collect::<HashSet<_>>(),
+            "the bare name owns exactly its own terminal"
+        );
+        // And the suffixed names keep working, matched as whole tokens too.
+        assert_eq!(
+            extract_open_ttys(ps, "linera-agent-e3f43ae4b7d1"),
+            std::iter::once("/dev/ttys055".to_string()).collect::<HashSet<_>>()
+        );
     }
 
     #[test]
