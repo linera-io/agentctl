@@ -707,6 +707,58 @@ pub fn newest_turn_event_ms(state: &HookState) -> u64 {
         .max(state.last_posttooluse_ts_ms)
 }
 
+/// Timestamp of the newest event of *any* kind we have for this session.
+///
+/// Unlike [`newest_turn_event_ms`] this is not about the turn — it is about the
+/// channel. `SessionStart` counts, because a session sitting untouched at its
+/// first prompt has legitimately produced nothing since, and reading that as a
+/// dead hook would flag every freshly opened session.
+pub fn newest_hook_event_ms(state: &HookState) -> u64 {
+    newest_turn_event_ms(state)
+        .max(state.last_notification_ts_ms)
+        .max(state.last_stop_ts_ms)
+        .max(state.last_subagentstop_ts_ms)
+        .max(state.last_precompact_ts_ms)
+        .max(state.last_postcompact_ts_ms)
+        .max(state.last_session_start_ts_ms)
+        .max(state.last_session_end_ts_ms)
+}
+
+/// How far a session's transcript may run ahead of its newest hook event before
+/// the hook channel is called dead rather than quiet.
+///
+/// Generous on purpose, because it has to clear every legitimate gap. The two
+/// channels advance together while a session works: a tool call brackets the
+/// `tool_result` the transcript records with `PreToolUse` and `PostToolUse`, and
+/// each user turn opens with `UserPromptSubmit`. Ten minutes of transcript
+/// writes with not one hook event is therefore not a quiet session, it is a
+/// channel that stopped delivering.
+const HOOK_SILENCE_GRACE_MS: u64 = 10 * 60 * 1_000;
+
+/// Whether this session's hook channel has stopped delivering: Claude Code kept
+/// writing its transcript long after the last hook event reached us.
+///
+/// The transcript is the control: Claude Code writes it itself, so it cannot be
+/// lost the way a hook invocation can — which is what makes the two comparable
+/// at all, and is the same asymmetry `monitor::transcript_ended_the_turn`
+/// already leans on.
+///
+/// Worth detecting because the failure is otherwise invisible. The hook command
+/// ends in `2>/dev/null || true`, `claudectl-hook` writes nothing to stdout by
+/// design, and its diagnostic log is opt-in — so a session whose hooks silently
+/// stopped firing looks exactly like a session that has been quiet. On
+/// 2026-08-10 one had been silent for **12 hours**, which cost its `SessionEnd`
+/// and left a dead row on screen for ~96 s.
+///
+/// Fails quiet: with no transcript timestamp there is nothing to compare, so it
+/// reports healthy rather than guessing.
+pub fn hook_channel_is_silent(transcript_mtime_ms: u64, newest_hook_ms: u64) -> bool {
+    if transcript_mtime_ms == 0 {
+        return false;
+    }
+    transcript_mtime_ms.saturating_sub(newest_hook_ms) > HOOK_SILENCE_GRACE_MS
+}
+
 /// Whether Claude is currently responding to a prompt.
 ///
 /// True when *any* mid-turn event is more recent than the last `Stop`. Tools
@@ -777,6 +829,67 @@ mod tests {
             session_id: session_id.into(),
             ..Default::default()
         }
+    }
+
+    /// The 2026-08-10 incident, to scale: the transcript ran 12 h past the last
+    /// hook event, which cost the session its `SessionEnd`.
+    const TWELVE_HOURS_MS: u64 = 12 * 60 * 60 * 1_000;
+
+    #[test]
+    fn a_transcript_running_hours_past_the_last_hook_event_is_a_dead_channel() {
+        let last_hook = 1_786_330_534_891;
+        assert!(hook_channel_is_silent(
+            last_hook + TWELVE_HOURS_MS,
+            last_hook
+        ));
+    }
+
+    #[test]
+    fn negative_control_a_quiet_session_inside_the_grace_is_healthy() {
+        // Both channels idle, or the transcript a little ahead — ordinary
+        // writer/hook jitter, not a failure.
+        let last_hook = 1_786_330_534_891;
+        assert!(!hook_channel_is_silent(last_hook, last_hook));
+        assert!(!hook_channel_is_silent(
+            last_hook + HOOK_SILENCE_GRACE_MS,
+            last_hook
+        ));
+        assert!(
+            hook_channel_is_silent(last_hook + HOOK_SILENCE_GRACE_MS + 1, last_hook),
+            "one ms past the grace is where it flips"
+        );
+    }
+
+    #[test]
+    fn negative_control_a_freshly_started_session_is_healthy() {
+        // Opened, never prompted: `newest_turn_event_ms` is 0 and only
+        // SessionStart has fired. Judging on turn events alone would flag every
+        // new session, which is why the yardstick includes SessionStart.
+        let started = 1_786_330_000_000;
+        let state = HookState {
+            last_session_start_ts_ms: started,
+            ..fresh_state("brand-new")
+        };
+        assert_eq!(newest_turn_event_ms(&state), 0);
+        assert_eq!(newest_hook_event_ms(&state), started);
+        assert!(!hook_channel_is_silent(started + 1_000, started));
+    }
+
+    #[test]
+    fn a_session_with_no_hook_state_at_all_is_a_dead_channel() {
+        // No state file ⇒ not one hook event ever reached us, while Claude Code
+        // has been writing a transcript. That is the shape of a hook that never
+        // ran, e.g. `claudectl-hook` absent from a sandbox's PATH — silent,
+        // because the hook command ends in `|| true`.
+        assert!(hook_channel_is_silent(1_786_330_534_891, 0));
+    }
+
+    #[test]
+    fn fails_quiet_when_the_transcript_has_no_timestamp() {
+        // Unstat-able or absent transcript: nothing to compare, so it must not
+        // manufacture a verdict from a zero.
+        assert!(!hook_channel_is_silent(0, 0));
+        assert!(!hook_channel_is_silent(0, 1_786_330_534_891));
     }
 
     #[test]
