@@ -1043,37 +1043,64 @@ fn cached_host_ps() -> Option<String> {
 /// Takes every sandbox at once because it is one `ps` sweep either way, and
 /// because the render path needs the whole map before it starts iterating —
 /// which is what keeps the selection logic itself free of process calls.
-pub(crate) fn open_host_ttys_by_sandbox(
-    sandboxes: &[String],
-) -> Option<HashMap<String, HashSet<String>>> {
+pub(crate) fn open_host_ttys_by_sandbox(sandboxes: &[String]) -> Option<OpenTerminals> {
     let ps = cached_host_ps()?;
-    Some(
-        sandboxes
+    Some(OpenTerminals {
+        by_sandbox: sandboxes
             .iter()
             .map(|name| (name.clone(), extract_open_ttys(&ps, name)))
             .collect(),
-    )
+        wrapper_argv_parsed: wrapper_terminals(&ps).next().is_some(),
+    })
 }
 
-/// Pure parser: takes `ps -ax -o pid,command` output, returns the set of
-/// `SANDBOX_HOST_TTY` values from `sbx exec ... <sandbox>` lines.
+/// One host `ps` sweep, read two ways.
+pub(crate) struct OpenTerminals {
+    /// One entry per sandbox asked about. An empty set means no `sbx exec`
+    /// terminal is attached to that sandbox — evidence of death only when
+    /// `wrapper_argv_parsed` says the sweep could have seen one.
+    pub(crate) by_sandbox: HashMap<String, HashSet<String>>,
+    /// Whether the sweep found at least one `sbx exec … SANDBOX_HOST_TTY=`
+    /// anywhere on the host, including sandboxes nobody asked about.
+    ///
+    /// This is what lets an empty per-sandbox set mean "nothing attached"
+    /// instead of "possibly an argv format we no longer parse". Without it the
+    /// signal cannot fire at all for a sandbox holding a single session, since
+    /// closing that session's window is exactly what empties its set — and one
+    /// session per ephemeral sandbox is the common shape, not the corner case.
+    ///
+    /// Deliberately taken from the raw sweep rather than from `by_sandbox`: the
+    /// sandboxes asked about come from the registry, which is written by the
+    /// same in-sandbox hook whose silence makes this signal load-bearing. A live
+    /// session missing from the registry must still count as proof that the
+    /// format parses.
+    pub(crate) wrapper_argv_parsed: bool,
+}
+
+/// Pure parser: every `(ps line, host tty)` the wrapper left in the process
+/// table.
+///
+/// One parser for both readings above, so "which terminals does this sandbox
+/// have" and "can we parse a wrapper line at all" can never disagree about what
+/// a wrapper line looks like.
+fn wrapper_terminals(ps_output: &str) -> impl Iterator<Item = (&str, &str)> {
+    ps_output
+        .lines()
+        .filter(|line| line.contains("sbx exec"))
+        .filter_map(|line| {
+            line.split_whitespace()
+                .find_map(|token| token.strip_prefix("SANDBOX_HOST_TTY="))
+                .map(|tty| (line, tty))
+        })
+}
+
+/// Pure parser: the set of `SANDBOX_HOST_TTY` values from
+/// `sbx exec ... <sandbox>` lines.
 fn extract_open_ttys(ps_output: &str, sandbox: &str) -> HashSet<String> {
-    let mut set = HashSet::new();
-    for line in ps_output.lines() {
-        if !line.contains("sbx exec") {
-            continue;
-        }
-        if !line.contains(sandbox) {
-            continue;
-        }
-        if let Some(tty) = line
-            .split_whitespace()
-            .find_map(|tok| tok.strip_prefix("SANDBOX_HOST_TTY="))
-        {
-            set.insert(tty.to_string());
-        }
-    }
-    set
+    wrapper_terminals(ps_output)
+        .filter(|(line, _)| line.contains(sandbox))
+        .map(|(_, tty)| tty.to_string())
+        .collect()
 }
 
 /// Run a single `sbx exec linera-agent bash -c '...'` that walks the sandbox's
@@ -2190,6 +2217,35 @@ mod tests {
         assert!(set.contains("/dev/ttys055"));
         assert!(!set.contains("/dev/ttys077")); // wrong sandbox name
         assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn a_wrapper_terminal_for_any_sandbox_corroborates_the_parse() {
+        // The corroboration is global on purpose: the only wrapper line here
+        // belongs to a sandbox the caller never asked about, and it still proves
+        // the argv format parses — which is what makes an empty set for the
+        // asked-about sandbox mean "nothing attached".
+        let ps = "\
+  100 ?? Ss   0:00.01 /usr/sbin/sshd
+  202 ?? S    0:00.05 sbx exec --env SANDBOX_HOST_TTY=/dev/ttys077 some-other-sandbox bash
+";
+        assert!(wrapper_terminals(ps).next().is_some());
+        assert!(
+            extract_open_ttys(ps, "linera-agent").is_empty(),
+            "and the asked-about sandbox has nothing attached"
+        );
+    }
+
+    #[test]
+    fn an_argv_format_we_cannot_parse_does_not_corroborate() {
+        // `sbx exec` lines are there, but none carries the variable we key on —
+        // indistinguishable from the wrapper having stopped setting it. Callers
+        // must fail open on this, so it must not read as corroborated.
+        let ps = "\
+  200 ?? S    0:00.05 sbx exec --tty /dev/ttys001 linera-agent bash
+  201 ?? S    0:00.05 sbx exec linera-agent bash
+";
+        assert!(wrapper_terminals(ps).next().is_none());
     }
 
     #[test]
