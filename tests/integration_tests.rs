@@ -2115,8 +2115,12 @@ fn a_tool_may_run_for_hours_without_being_declared_dead() {
     // build, a test suite, or a subagent — not a dropped hook. Bounding this
     // one would trade a false `Processing` for a false `Unknown` on every
     // long-running command.
+    //
+    // Doubles as the guard on `UNRESOLVED_TOOL_CALL_NEEDS_YOU_MS`: that bound
+    // is reachable only once the channel is dead, so a live tool must stay
+    // `Processing` well past it. A three-hour build is not a permission prompt.
     let tool = &scenarios()[1];
-    for age in [MIN, 16 * MIN, 3 * HOUR] {
+    for age in [MIN, 16 * MIN, 21 * MIN, 3 * HOUR, 72 * HOUR] {
         assert_eq!(
             status_at(tool, T0 + age, None),
             SessionStatus::Processing,
@@ -2144,11 +2148,19 @@ fn regression_a_dead_hook_channel_does_not_latch_idle_over_a_live_transcript() {
         SessionStatus::Processing,
         "the transcript is four seconds old and mid-turn; the nine-hour-old Stop is not evidence"
     );
-    // Dropping the stale state must not install a *new* latch in its place.
+    // Dropping the stale state must not install a *new* latch in its place —
+    // but nor may the claim expire into `Idle` while the tail is an
+    // outstanding tool call. See
+    // `regression_an_outstanding_tool_call_is_not_a_quiet_session`.
     assert_eq!(
         status_at(resurrected, T0 + 11 * MIN, None),
-        SessionStatus::Idle,
-        "once the transcript goes quiet too, the claim expires like any other"
+        SessionStatus::Processing,
+        "the tool call is still outstanding, so the turn is still open"
+    );
+    assert_eq!(
+        status_at(resurrected, T0 + 21 * MIN, None),
+        SessionStatus::NeedsInput,
+        "and once it has been outstanding this long with no channel, it needs the user"
     );
 }
 
@@ -2168,9 +2180,52 @@ fn regression_a_dead_hook_channel_does_not_latch_processing_either() {
     );
     assert_eq!(
         status_at(latched, T0 + 11 * MIN, None),
-        SessionStatus::Idle,
-        "but it now rests on the transcript, and expires with it"
+        SessionStatus::Processing,
+        "and it now rests on the transcript, which still shows the call outstanding"
     );
+}
+
+#[test]
+fn regression_an_outstanding_tool_call_is_not_a_quiet_session() {
+    // Session f431c406 (`declarative-high-throughput-networks`, pid 18085),
+    // captured live 2026-08-17 18:12Z. Its transcript's last record was an
+    // `assistant`/`tool_use` calling Bash at 18:00:09.897Z with no
+    // `tool_result` after it and not one further byte written; the command was
+    // a `python3 - <<'PY'` heredoc, which the sandbox's PreToolUse gate asks
+    // about. It was sitting on a permission prompt.
+    //
+    // Its hook channel had been silent since its own `SessionStart` at
+    // 12:14:47Z — 25 of 42 sessions were in that state — so
+    // `is_at_permission_prompt` never ran, and the transcript fallback called
+    // an outstanding tool call "quiet" and reported first `Processing`, then
+    // `Idle`. `Idle` says nothing is happening. Something was: a tool call had
+    // been outstanding for twelve minutes.
+    //
+    // The bug is that the previous fix asserted exactly this decay was correct
+    // ("expires like any other"), using this very session as its fixture. A
+    // `user` tail does expire like any other. A `tool_use` tail does not: it is
+    // the one tail that proves the turn is still open.
+    let blocked = &scenarios()[10];
+    for age in [12 * MIN, 21 * MIN, 3 * HOUR, 72 * HOUR] {
+        assert_ne!(
+            status_at(blocked, T0 + age, None),
+            SessionStatus::Idle,
+            "at {} min a tool call is still outstanding; Idle says the row can be skipped",
+            age / MIN
+        );
+    }
+    assert_eq!(
+        status_at(blocked, T0 + 12 * MIN, None),
+        SessionStatus::Processing,
+        "inside the bound we still say it is working"
+    );
+    for age in [21 * MIN, 3 * HOUR, 72 * HOUR] {
+        assert_eq!(
+            status_at(blocked, T0 + age, None),
+            SessionStatus::NeedsInput,
+            "past it, a session that cannot report its own progress needs the user"
+        );
+    }
 }
 
 #[test]
@@ -2327,10 +2382,13 @@ fn degradation_matrix() {
             SessionStatus::WaitingInput,
             SessionStatus::Idle,
         ),
+        // The three `tool_use`-tail rows below degrade to `NeedsInput`, not
+        // `Idle`. A day-old outstanding tool call on a *live* process is not a
+        // quiet session: nothing but the user is going to resolve it.
         (
             "no hooks have ever fired, transcript mid-turn",
             SessionStatus::Processing,
-            SessionStatus::Idle,
+            SessionStatus::NeedsInput,
         ),
         (
             "no hooks have ever fired, transcript ended the turn",
@@ -2343,12 +2401,12 @@ fn degradation_matrix() {
         (
             "hook channel died after Stop; the session started a new turn anyway",
             SessionStatus::Processing,
-            SessionStatus::Idle,
+            SessionStatus::NeedsInput,
         ),
         (
             "hook channel died mid-turn with a tool marker left in flight",
             SessionStatus::Processing,
-            SessionStatus::Idle,
+            SessionStatus::NeedsInput,
         ),
     ];
 
