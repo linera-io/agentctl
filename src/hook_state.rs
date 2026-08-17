@@ -334,9 +334,11 @@ pub fn record_live_sessions(check: &crate::terminal_owner::OwnerCheck) -> io::Re
         .filter(|session| !session.session_id.is_empty())
         .map(|session| {
             let owner = resolve_owner(&known, &session, sandbox.is_some(), check);
-            let transcript = crate::discovery::transcript_path(&session.session_id, &session.cwd)
-                .to_string_lossy()
-                .into_owned();
+            let transcript = crate::discovery::transcript_to_record(
+                &session.session_id,
+                &session.cwd,
+                &crate::discovery::find_transcript_by_session_id,
+            );
             let name = (!session.session_name.is_empty()).then_some(session.session_name);
             // Carry the host-side routing keys for sandbox sessions. Only the
             // sandbox can read them (they come from its own per-pid sidecar),
