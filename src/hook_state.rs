@@ -752,11 +752,17 @@ const HOOK_SILENCE_GRACE_MS: u64 = 10 * 60 * 1_000;
 ///
 /// Fails quiet: with no transcript timestamp there is nothing to compare, so it
 /// reports healthy rather than guessing.
-pub fn hook_channel_is_silent(transcript_mtime_ms: u64, newest_hook_ms: u64) -> bool {
-    if transcript_mtime_ms == 0 {
+///
+/// `newest_transcript_ms` is whichever transcript clock the caller has:
+/// `monitor::decide_status` passes the newest conversation message, which is the
+/// better signal because bookkeeping records (`system`, `bridge-session`,
+/// `attachment`) never move it; `--doctor` passes the file mtime, because it
+/// reports on sessions without parsing their JSONL.
+pub fn hook_channel_is_silent(newest_transcript_ms: u64, newest_hook_ms: u64) -> bool {
+    if newest_transcript_ms == 0 {
         return false;
     }
-    transcript_mtime_ms.saturating_sub(newest_hook_ms) > HOOK_SILENCE_GRACE_MS
+    newest_transcript_ms.saturating_sub(newest_hook_ms) > HOOK_SILENCE_GRACE_MS
 }
 
 /// Whether Claude is currently responding to a prompt.
