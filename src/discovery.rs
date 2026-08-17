@@ -501,6 +501,71 @@ pub fn recover_cwd_from_transcript(path: &Path) -> Option<String> {
     None
 }
 
+/// Where a session's transcript turned out to live.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TranscriptSite {
+    /// The recorded path is on disk.
+    AsRecorded(PathBuf),
+    /// The recorded path was wrong or blank; this is the real one, found by id.
+    Recovered(PathBuf),
+    /// Nothing recorded and nothing found — unknown, not proven absent.
+    Unrecorded,
+    /// A concrete recorded path that is absent, and no project directory holds
+    /// this session id. Carries the path tried, so callers report what failed.
+    Missing(PathBuf),
+}
+
+/// Locate a session's transcript, treating a recorded path as a hypothesis.
+///
+/// The recorded path is derived from the session's cwd, so a session that lost
+/// its cwd points at `projects/-/`, which never exists. The id is the
+/// transcript's filename and is globally unique, so the id-keyed scan is the
+/// authority whenever the recorded path misses. [`TranscriptSite::Unrecorded`]
+/// is deliberately distinct from `Missing`: an entry written before transcripts
+/// were tracked has no claim to disprove, and must not be treated as absent.
+pub fn locate_transcript(
+    session_id: &str,
+    recorded: &str,
+    exists: &impl Fn(&Path) -> bool,
+    find_by_id: &impl Fn(&str) -> Option<PathBuf>,
+) -> TranscriptSite {
+    let claimed = (!recorded.is_empty()).then(|| PathBuf::from(recorded));
+    if let Some(path) = claimed.as_ref().filter(|path| exists(path)) {
+        return TranscriptSite::AsRecorded(path.clone());
+    }
+    if let Some(found) = find_by_id(session_id) {
+        return TranscriptSite::Recovered(found);
+    }
+    match claimed {
+        Some(path) => TranscriptSite::Missing(path),
+        None => TranscriptSite::Unrecorded,
+    }
+}
+
+/// The transcript path to persist for a live session.
+///
+/// A blank cwd slugs to `-`, making the derived path `projects/-/<id>.jsonl` —
+/// a directory that has never existed. Persisting that is worse than persisting
+/// nothing: a sandbox slice freezes at `sbx rm` (which fires no hooks), so the
+/// wrong path is never corrected and restore rejects a resumable session.
+///
+/// A non-empty cwd is trusted without an existence check, because a session's
+/// transcript may not be written yet on its first hook and blanking the path
+/// then would lose it for the rest of the session.
+pub fn transcript_to_record(
+    session_id: &str,
+    cwd: &str,
+    find_by_id: &impl Fn(&str) -> Option<PathBuf>,
+) -> String {
+    let path = if cwd.is_empty() {
+        find_by_id(session_id)
+    } else {
+        Some(transcript_path(session_id, cwd))
+    };
+    path.map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 pub fn resolve_jsonl_paths(sessions: &mut [ClaudeSession]) {
     for session in sessions.iter_mut() {
         // A session that lost its cwd cannot name its own project directory,
@@ -1403,6 +1468,86 @@ mod tests {
         );
         let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
         assert_eq!(ids, vec![uuid, ""], "one identity, both rows visible");
+    }
+
+    /// The two `linera-agent-9cb61a3934ae` rows, verbatim: recorded under the
+    /// `-` slug a blank cwd produces, while the file sits in the real project
+    /// directory.
+    const BLANK_CWD_RECORDED: &str = "/Users/ndr/.claude/projects/-/7deca33a.jsonl";
+    const REAL_SITE: &str = "/Users/ndr/.claude/projects/-Users-ndr/7deca33a.jsonl";
+
+    fn finds_nothing(_: &str) -> Option<PathBuf> {
+        None
+    }
+
+    #[test]
+    fn regression_a_blank_cwd_transcript_is_located_by_session_id() {
+        // The reported bug: `--restore-sbx-sessions` reported "transcript
+        // missing" for two sessions whose transcripts were on disk the whole
+        // time, because the recorded path was derived from a cwd they had lost.
+        let site = locate_transcript("7deca33a", BLANK_CWD_RECORDED, &|_| false, &|id| {
+            (id == "7deca33a").then(|| PathBuf::from(REAL_SITE))
+        });
+        assert_eq!(site, TranscriptSite::Recovered(PathBuf::from(REAL_SITE)));
+    }
+
+    #[test]
+    fn a_recorded_transcript_that_exists_is_taken_as_is() {
+        // No-clobber half: a good recorded path must not trigger a scan, or
+        // every restore pays a directory listing per session.
+        let site = locate_transcript("abc-123", REAL_SITE, &|_| true, &|_| {
+            panic!("must not scan when the recorded path is on disk")
+        });
+        assert_eq!(site, TranscriptSite::AsRecorded(PathBuf::from(REAL_SITE)));
+    }
+
+    #[test]
+    fn an_entry_with_no_recorded_transcript_is_unrecorded_not_missing() {
+        // Entries predate transcript tracking. "Nothing recorded" is an absence
+        // of evidence, and restore must not read it as evidence of absence.
+        let site = locate_transcript("abc-123", "", &|_| false, &finds_nothing);
+        assert_eq!(site, TranscriptSite::Unrecorded);
+    }
+
+    #[test]
+    fn a_genuinely_absent_transcript_reports_the_path_it_tried() {
+        // The old message asserted "transcript missing" when all it knew was
+        // "the path I recorded is not there". Carrying the path keeps the
+        // stronger claim honest and makes the skip debuggable from the terminal.
+        let site = locate_transcript("abc-123", BLANK_CWD_RECORDED, &|_| false, &finds_nothing);
+        assert_eq!(
+            site,
+            TranscriptSite::Missing(PathBuf::from(BLANK_CWD_RECORDED))
+        );
+    }
+
+    #[test]
+    fn regression_a_blank_cwd_is_never_persisted_as_the_dash_slug() {
+        // Writer half of the same bug: `projects/-/` has never existed, and a
+        // sandbox slice freezes at `sbx rm`, so a wrong path written here is
+        // wrong forever.
+        let recorded = transcript_to_record("7deca33a", "", &|_| Some(PathBuf::from(REAL_SITE)));
+        assert_eq!(recorded, REAL_SITE);
+    }
+
+    #[test]
+    fn a_blank_cwd_with_no_findable_transcript_records_nothing() {
+        // Recording nothing is recoverable — `locate_transcript` reads it as
+        // Unrecorded and restore proceeds. Recording `projects/-/` is not.
+        assert_eq!(transcript_to_record("7deca33a", "", &finds_nothing), "");
+    }
+
+    #[test]
+    fn a_real_cwd_is_trusted_without_touching_the_disk() {
+        // A session's transcript does not exist yet at its first hook. Probing
+        // for it there would blank the path for the whole session.
+        let recorded = transcript_to_record("abc-123", "/Users/ndr/work", &|_| {
+            panic!("must not scan when the cwd is known")
+        });
+        assert!(
+            recorded.ends_with("/projects/-Users-ndr-work/abc-123.jsonl"),
+            "{recorded}"
+        );
     }
 
     #[test]

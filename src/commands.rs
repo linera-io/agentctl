@@ -116,8 +116,8 @@ pub(crate) fn restore_sandbox_sessions(sandbox_arg: &str, dry_run: bool) -> io::
 /// Spawn (or, with `--dry-run` / a non-spawning terminal, print) one
 /// `<resume_binary> --resume <id>` window per entry, in its recorded cwd —
 /// `resume_binary` is `claude` for local sessions, `sc` for sandbox ones.
-/// Skips invalid ids, already-running sessions, and missing transcripts;
-/// returns `(spawned, skipped)`.
+/// Skips invalid ids, already-running sessions, and sessions whose transcript is
+/// nowhere under `projects/`; returns `(spawned, skipped)`.
 fn restore_slice(
     entries: &[sandbox_registry::SessionEntry],
     resume_binary: &str,
@@ -145,18 +145,43 @@ fn restore_slice(
             skipped += 1;
             continue;
         }
-        // No transcript → not resumable; skip rather than open an erroring window.
-        if !entry.transcript.is_empty() && !Path::new(&entry.transcript).exists() {
+        // The recorded path is only a hypothesis: it is derived from the cwd, and
+        // a session that lost its cwd points at `projects/-/`, which never
+        // exists. Ask the session id before declaring the transcript gone.
+        let site = discovery::locate_transcript(
+            &entry.session_id,
+            &entry.transcript,
+            &|path| path.is_file(),
+            &discovery::find_transcript_by_session_id,
+        );
+        if let discovery::TranscriptSite::Missing(tried) = &site {
             eprintln!(
-                "  [skip] {} ({}): transcript missing",
+                "  [skip] {} ({}): no transcript at {}, and none under any project directory",
                 entry_label(entry),
-                entry.cwd
+                entry.cwd,
+                tried.display()
             );
             skipped += 1;
             continue;
         }
 
-        let cwd = resolve_cwd(&entry.cwd);
+        // Say so when the registry was wrong. Repairing this silently leaves the
+        // bad row looking identical to a healthy one, which is how it went
+        // unnoticed until a restore reported the session as lost.
+        if let discovery::TranscriptSite::Recovered(found) = &site {
+            let recorded = if entry.transcript.is_empty() {
+                "no transcript recorded".to_string()
+            } else {
+                format!("recorded transcript {} is absent", entry.transcript)
+            };
+            println!(
+                "  [note] {}: {recorded} — resuming from {}",
+                entry_label(entry),
+                found.display()
+            );
+        }
+
+        let cwd = restore_cwd(entry, &site, &discovery::recover_cwd_from_transcript);
         let command = format!("{resume_binary} --resume {}", entry.session_id);
 
         if dry_run || !can_spawn {
@@ -259,6 +284,26 @@ fn is_valid_session_id(session_id: &str) -> bool {
         && session_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// Where to reopen a restored session.
+///
+/// A recovered transcript carries the cwd its registry entry lost, and that
+/// beats [`resolve_cwd`]'s `$HOME` fallback — which is right only by luck for a
+/// session started in the home directory, and wrong for one in a worktree.
+fn restore_cwd(
+    entry: &sandbox_registry::SessionEntry,
+    site: &discovery::TranscriptSite,
+    read_cwd: &impl Fn(&Path) -> Option<String>,
+) -> String {
+    if entry.cwd.trim().is_empty() {
+        if let discovery::TranscriptSite::Recovered(path) = site {
+            if let Some(cwd) = read_cwd(path) {
+                return cwd;
+            }
+        }
+    }
+    resolve_cwd(&entry.cwd)
 }
 
 /// The directory to reopen a session in, falling back to `$HOME` (then `.`)
@@ -439,7 +484,7 @@ fn print_doctor_transcripts() {
     }
 }
 
-fn file_mtime_ms(path: &str) -> u64 {
+fn file_mtime_ms(path: &Path) -> u64 {
     std::fs::metadata(path)
         .and_then(|meta| meta.modified())
         .ok()
@@ -474,6 +519,9 @@ fn print_doctor_hook_liveness() {
 
     let mut checked = 0_usize;
     let mut silent = 0_usize;
+    // A row with no locatable transcript is unverifiable, not proven dead — the
+    // silence check needs a transcript as its control, and there isn't one.
+    let mut unverifiable = 0_usize;
     for (scope, entries) in scopes {
         // A stopped sandbox fires no hooks by definition; its slice is restore
         // material, not evidence of anything. `None` means we could not ask
@@ -494,10 +542,34 @@ fn print_doctor_hook_liveness() {
             let newest_hook_ms = hook_state::HookState::load(&entry.session_id)
                 .as_ref()
                 .map_or(0, hook_state::newest_hook_event_ms);
-            let transcript_ms = file_mtime_ms(&entry.transcript);
+            // Stat where the transcript actually is: a wrong recorded path stats
+            // as mtime 0, the silence check fails quiet on a zero, and the row
+            // then passes `[ok]` on a reading that never happened.
+            let site = discovery::locate_transcript(
+                &entry.session_id,
+                &entry.transcript,
+                &|path| path.is_file(),
+                &discovery::find_transcript_by_session_id,
+            );
+            let transcript_ms = match &site {
+                discovery::TranscriptSite::AsRecorded(path)
+                | discovery::TranscriptSite::Recovered(path) => file_mtime_ms(path),
+                discovery::TranscriptSite::Unrecorded | discovery::TranscriptSite::Missing(_) => 0,
+            };
             checked += 1;
             let label = entry.name.as_deref().unwrap_or("unnamed");
             let short = &entry.session_id[..entry.session_id.len().min(8)];
+            if let discovery::TranscriptSite::Missing(tried) = &site {
+                unverifiable += 1;
+                println!("  [!!] {scope} {short} ({label}): transcript not found");
+                println!("      recorded:   {} (absent)", tried.display());
+                println!(
+                    "      reading: no project directory holds this session id, so there is no \
+                     transcript to check the hook channel against. The row cannot be verified \
+                     either way and cannot be restored."
+                );
+                continue;
+            }
             if !hook_state::hook_channel_is_silent(transcript_ms, newest_hook_ms) {
                 println!("  [ok] {scope} {short} ({label})");
                 continue;
@@ -508,10 +580,17 @@ fn print_doctor_hook_liveness() {
                 "  [!!] {scope} {short} ({label}): transcript is {} ahead of the last hook event",
                 crate::history::format_duration(behind_secs)
             );
-            println!(
-                "      transcript: {} (mtime {transcript_ms})",
-                entry.transcript
-            );
+            match &site {
+                discovery::TranscriptSite::Recovered(path) => println!(
+                    "      transcript: {} (mtime {transcript_ms}) — recorded as {}, which is absent",
+                    path.display(),
+                    entry.transcript
+                ),
+                _ => println!(
+                    "      transcript: {} (mtime {transcript_ms})",
+                    entry.transcript
+                ),
+            }
             if newest_hook_ms == 0 {
                 println!("      last hook:  none ever recorded for this session");
             } else {
@@ -534,10 +613,15 @@ fn print_doctor_hook_liveness() {
 
     if checked == 0 {
         println!("  [--] no live registry sessions to check");
-    } else if silent == 0 {
+    } else if silent == 0 && unverifiable == 0 {
         println!("  {checked} session(s) delivering hooks");
     } else {
-        println!("  {silent} of {checked} session(s) have a dead hook channel");
+        if silent > 0 {
+            println!("  {silent} of {checked} session(s) have a dead hook channel");
+        }
+        if unverifiable > 0 {
+            println!("  {unverifiable} of {checked} session(s) have no locatable transcript");
+        }
     }
 }
 
@@ -1446,6 +1530,7 @@ pub(crate) fn run_brain_query(cfg: &config::Config, cli: &Cli) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// The registry as it looks mid-roll: the legacy sandbox still draining,
     /// two rolled ones, and an engineer's own task sandbox.
@@ -1551,6 +1636,45 @@ root  --resume\n";
         assert!(ids.contains("aaaa-1111"));
         assert!(ids.contains("bbbb-2222"));
         assert_eq!(ids.len(), 2, "a trailing --resume with no id is ignored");
+    }
+
+    fn entry_with_cwd(cwd: &str) -> sandbox_registry::SessionEntry {
+        sandbox_registry::SessionEntry {
+            session_id: "7deca33a".to_string(),
+            cwd: cwd.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_recovered_transcript_supplies_the_cwd_the_entry_lost() {
+        // Restoring into `$HOME` is right only by luck. The transcript stamps
+        // the real cwd on every record, so a recovered one can say where the
+        // session actually ran.
+        let site = discovery::TranscriptSite::Recovered(PathBuf::from("/t.jsonl"));
+        let cwd = restore_cwd(&entry_with_cwd(""), &site, &|_| {
+            Some("/Users/ndr/worktrees/feature".to_string())
+        });
+        assert_eq!(cwd, "/Users/ndr/worktrees/feature");
+    }
+
+    #[test]
+    fn a_recorded_cwd_is_never_overridden_by_the_transcript() {
+        // No-clobber: the registry's own cwd wins whenever it has one, so a
+        // recovered transcript can never move a session out of its directory.
+        let site = discovery::TranscriptSite::Recovered(PathBuf::from("/t.jsonl"));
+        let cwd = restore_cwd(&entry_with_cwd("/Users/ndr/pm-app"), &site, &|_| {
+            panic!("must not read the transcript when the entry has a cwd")
+        });
+        assert_eq!(cwd, "/Users/ndr/pm-app");
+    }
+
+    #[test]
+    fn an_unreadable_transcript_falls_back_to_the_home_default() {
+        // Recovery is best-effort; failing it must not leave the cwd empty.
+        let site = discovery::TranscriptSite::Recovered(PathBuf::from("/t.jsonl"));
+        let cwd = restore_cwd(&entry_with_cwd(""), &site, &|_| None);
+        assert_eq!(cwd, resolve_cwd(""));
     }
 
     #[test]
