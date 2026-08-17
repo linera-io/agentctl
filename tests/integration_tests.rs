@@ -411,6 +411,13 @@ fn hook_waiting_input_ages_out_to_idle() {
     std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
 
     let mut s = session_with_id(sid, 0.5);
+    // Backdate the transcript with it. `session_with_id` stamps the newest
+    // message at *now*, and a session cannot have both a message this second
+    // and a Stop eleven minutes old unless its hook channel has died — in which
+    // case the honest answer is what the transcript says (a turn that ended a
+    // moment ago, so `WaitingInput`), not the age-out being tested here. Quiet
+    // on both channels is the scenario this test is named for.
+    s.last_message_ts = s.last_message_ts.saturating_sub(11 * 60 * 1000);
     monitor::infer_status(&mut s, "assistant", "end_turn");
     assert_eq!(s.status, SessionStatus::Idle);
 }
@@ -1992,6 +1999,36 @@ fn scenarios() -> Vec<Scenario> {
             last_stop_reason: "end_turn",
             last_message_ts: T0,
         },
+        // Appended, not inserted: the tests above index this list positionally.
+        Scenario {
+            name: "hook channel died after Stop; the session started a new turn anyway",
+            state: Some(HookState {
+                last_promptsubmit_ts_ms: T0 - 9 * HOUR,
+                last_pretooluse_ts_ms: T0 - 9 * HOUR,
+                last_posttooluse_ts_ms: T0 - 9 * HOUR,
+                last_stop_ts_ms: T0 - 9 * HOUR,
+                last_session_start_ts_ms: T0 - 14 * MIN,
+                notification_kind: Some("idle_prompt".into()),
+                last_notification_ts_ms: T0 - 9 * HOUR,
+                ..hook_state()
+            }),
+            last_msg_type: "assistant",
+            last_stop_reason: "tool_use",
+            last_message_ts: T0,
+        },
+        Scenario {
+            name: "hook channel died mid-turn with a tool marker left in flight",
+            state: Some(HookState {
+                current_tool_name: Some("Bash".into()),
+                last_promptsubmit_ts_ms: T0 - 13 * HOUR,
+                last_pretooluse_ts_ms: T0 - 13 * HOUR,
+                last_session_start_ts_ms: T0 - 14 * MIN,
+                ..hook_state()
+            }),
+            last_msg_type: "assistant",
+            last_stop_reason: "tool_use",
+            last_message_ts: T0,
+        },
     ]
 }
 
@@ -2084,6 +2121,74 @@ fn a_tool_may_run_for_hours_without_being_declared_dead() {
             status_at(tool, T0 + age, None),
             SessionStatus::Processing,
             "a tool in flight for {} minutes is still a tool in flight",
+            age / MIN
+        );
+    }
+}
+
+#[test]
+fn regression_a_dead_hook_channel_does_not_latch_idle_over_a_live_transcript() {
+    // Session cf54da79 (pid 16539, `claude --resume`), captured live on
+    // 2026-08-17 at 12:26-12:29Z. Its transcript was emitting
+    // `assistant`/`tool_use` records every few seconds; its hook state file had
+    // not moved since `Stop` at 03:26Z, nine hours earlier, because the restore
+    // storm that morning left ~40 sessions with `SessionStart` delivered and
+    // every hook after it dropped. `is_waiting_for_user` believed that `Stop`
+    // and returned before the transcript was ever consulted, so claudectl
+    // reported `Idle` for a session that was visibly working. `--doctor` called
+    // the same channel dead in the same snapshot — 39 of 84 — using a predicate
+    // `decide_status` never asked.
+    let resurrected = &scenarios()[9];
+    assert_eq!(
+        status_at(resurrected, T0 + 4_000, None),
+        SessionStatus::Processing,
+        "the transcript is four seconds old and mid-turn; the nine-hour-old Stop is not evidence"
+    );
+    // Dropping the stale state must not install a *new* latch in its place.
+    assert_eq!(
+        status_at(resurrected, T0 + 11 * MIN, None),
+        SessionStatus::Idle,
+        "once the transcript goes quiet too, the claim expires like any other"
+    );
+}
+
+#[test]
+fn regression_a_dead_hook_channel_does_not_latch_processing_either() {
+    // The mirror image, same snapshot: session f431c406 sat at `Processing`
+    // with `current_tool_name` still set and its newest turn event 13 hours old.
+    // `tool_in_flight` deliberately licenses unbounded silence (see
+    // `a_tool_may_run_for_hours_without_being_declared_dead`), so `turn_went_silent`
+    // could never release it. That license is only defensible while the channel
+    // that would report the tool finishing is still delivering.
+    let latched = &scenarios()[10];
+    assert_eq!(
+        status_at(latched, T0 + MIN, None),
+        SessionStatus::Processing,
+        "the transcript is a minute old and mid-turn, so the verdict itself is right"
+    );
+    assert_eq!(
+        status_at(latched, T0 + 11 * MIN, None),
+        SessionStatus::Idle,
+        "but it now rests on the transcript, and expires with it"
+    );
+}
+
+#[test]
+fn a_dead_hook_channel_can_never_cost_a_needs_input() {
+    // Dropping stale hook state would be unacceptable if it could ever discard
+    // an open permission prompt — that is the one status André is notified on.
+    // It cannot, and the two predicates are arithmetically exclusive rather
+    // than merely untested: `is_at_permission_prompt` requires the transcript to
+    // have advanced no more than PROMPT_RESOLUTION_GRACE_MS (5 s) past the
+    // Notification, while a channel is only called dead once the transcript is
+    // HOOK_SILENCE_GRACE_MS (10 min) past every hook event, the Notification
+    // included. Swept here so a future change to either constant fails loudly.
+    let prompt = &scenarios()[0];
+    for age in [MIN, 31 * MIN, 12 * HOUR, 72 * HOUR] {
+        assert_eq!(
+            status_at(prompt, T0 + age, Some(50.0)),
+            SessionStatus::NeedsInput,
+            "an open prompt at age {} min must survive the channel-liveness filter",
             age / MIN
         );
     }
@@ -2230,6 +2335,19 @@ fn degradation_matrix() {
         (
             "no hooks have ever fired, transcript ended the turn",
             SessionStatus::WaitingInput,
+            SessionStatus::Idle,
+        ),
+        // Both dead-channel rows read exactly like their "no hooks have ever
+        // fired" counterparts, which is the point: state we cannot date is
+        // state we do not have.
+        (
+            "hook channel died after Stop; the session started a new turn anyway",
+            SessionStatus::Processing,
+            SessionStatus::Idle,
+        ),
+        (
+            "hook channel died mid-turn with a tool marker left in flight",
+            SessionStatus::Processing,
             SessionStatus::Idle,
         ),
     ];

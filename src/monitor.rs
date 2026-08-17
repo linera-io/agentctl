@@ -436,11 +436,17 @@ pub fn infer_status(session: &mut ClaudeSession, last_msg_type: &str, last_stop_
                 verdict.reason,
                 session.cpu_rate_percent,
                 hook_state.as_ref().map_or("none".into(), |s| format!(
-                    "notif={:?} turn_age_ms={} stop_age_ms={} tool={:?}",
+                    // `channel_dead` is why the verdict can contradict every
+                    // number beside it: the state was read, then discarded.
+                    "notif={:?} turn_age_ms={} stop_age_ms={} tool={:?} channel_dead={}",
                     s.notification_kind,
                     now_ms().saturating_sub(hook_state::newest_turn_event_ms(s)),
                     now_ms().saturating_sub(s.last_stop_ts_ms),
                     s.current_tool_name,
+                    hook_state::hook_channel_is_silent(
+                        session.last_message_ts,
+                        hook_state::newest_hook_event_ms(s),
+                    ),
                 )),
             ),
         );
@@ -514,6 +520,15 @@ const BUSY_CPU_RATE_PERCENT: f32 = 5.0;
 /// `Processing` ahead of a transcript that said the turn had ended. `Processing`
 /// is the worst possible default — it means "it's working, leave it alone".
 ///
+/// The rule has a second half, learned the hard way on 2026-08-17: a *weaker*
+/// claim still has to be checked against evidence that cannot be lost. Sessions
+/// whose hook channel had died kept a latched `Stop` and reported `Idle` while
+/// their transcripts were emitting `tool_use` blocks every few seconds — the
+/// wrong answer was the conservative-looking one, which is exactly why it went
+/// unnoticed. Hence the channel-liveness filter below: stale hook state is not
+/// weak evidence, it is *no* evidence, and it must be dropped rather than
+/// deferred to.
+///
 /// Two properties are asserted over this function in the test suite and are
 /// the reason it is shaped this way:
 ///   * **time alone never promotes** — advancing the clock with all other
@@ -522,9 +537,18 @@ const BUSY_CPU_RATE_PERCENT: f32 = 5.0;
 ///   * **eventual release** — with no tool in flight, no new events, and no CPU
 ///     to show for it, a `Processing` verdict must expire.
 pub fn decide_status(inputs: &StatusInputs) -> StatusVerdict {
-    let transcript_ended = transcript_ended_the_turn(inputs);
+    // Hook state is evidence only while its channel is still delivering: once
+    // the transcript has run far ahead of every hook event, what is on disk is
+    // an undateable snapshot, and believing it latches a status forever.
+    let hook_state = inputs.hook_state.filter(|state| {
+        !hook_state::hook_channel_is_silent(
+            inputs.last_message_ts,
+            hook_state::newest_hook_event_ms(state),
+        )
+    });
+    let transcript_ended = transcript_ended_the_turn(inputs, hook_state);
 
-    if let Some(state) = inputs.hook_state {
+    if let Some(state) = hook_state {
         // A pending permission prompt outranks everything, including
         // Compacting and Processing: such a session is technically mid-turn,
         // but the state that matters to the user is "blocked on me".
@@ -564,7 +588,7 @@ pub fn decide_status(inputs: &StatusInputs) -> StatusVerdict {
     // Hook markers still say mid-turn, but the transcript did not corroborate
     // it and the session is not burning CPU. We genuinely do not know what
     // this session is doing — say so, rather than claiming it is working.
-    if inputs.hook_state.is_some_and(hook_state::is_responding) {
+    if hook_state.is_some_and(hook_state::is_responding) {
         return verdict(
             SessionStatus::Unknown,
             "turn markers dangling, no corroboration",
@@ -633,13 +657,13 @@ fn turn_went_silent(state: &HookState, inputs: &StatusInputs) -> bool {
 ///      otherwise it describes the *previous* turn and vetoing on it would
 ///      report a live turn as finished. This is what keeps the fix from
 ///      trading one wrong status for its mirror image.
-fn transcript_ended_the_turn(inputs: &StatusInputs) -> bool {
+fn transcript_ended_the_turn(inputs: &StatusInputs, hook_state: Option<&HookState>) -> bool {
     if inputs.last_msg_type != "assistant"
         || !matches!(inputs.last_stop_reason, "end_turn" | "stop_sequence")
     {
         return false;
     }
-    match inputs.hook_state {
+    match hook_state {
         Some(state) => inputs.last_message_ts >= hook_state::newest_turn_event_ms(state),
         None => true,
     }
