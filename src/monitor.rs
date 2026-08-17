@@ -497,6 +497,19 @@ const TURN_SILENCE_MAX_MS: u64 = 15 * 60 * 1000;
 /// bucket that means "ready for you right now".
 const WAITING_TO_IDLE_MS: u64 = 10 * 60 * 1000;
 
+/// How long a tool call may sit outstanding in the transcript, with no hook
+/// channel to report it finishing, before the session is called out as needing
+/// the user.
+///
+/// Chosen to be longer than [`TURN_SILENCE_MAX_MS`] so that a session which
+/// merely lost its hooks mid-command is never flagged ahead of one that lost
+/// them mid-turn, and long enough that ordinary commands — a test run, a
+/// `cargo build`, a `gh pr checks --watch` — finish well inside it. A tool that
+/// genuinely runs longer is the accepted false positive, and it is the cheap
+/// one: it costs a glance at a session claudectl has gone blind on anyway,
+/// where the alternative costs the session.
+const UNRESOLVED_TOOL_CALL_NEEDS_YOU_MS: u64 = 20 * 60 * 1000;
+
 /// CPU rate, as a percentage of one core, above which a session with no other
 /// evidence is taken to be working. Compared against a *rate* measured between
 /// two samples — never `ps`'s `%cpu`, which is a lifetime average on Linux and
@@ -595,16 +608,44 @@ pub fn decide_status(inputs: &StatusInputs) -> StatusVerdict {
         );
     }
 
-    // Transcript-only fallbacks, for sessions whose hooks have never fired
-    // (started before claudectl's auto-init ran). **Never produces
-    // `NeedsInput`**: every attempt to guess "needs the user's attention" from
-    // JSONL alone was wrong in some common case, and the deterministic
-    // `Notification` hook owns that claim.
+    // Transcript-only fallbacks, for sessions with no live hook channel: hooks
+    // that never fired, or a channel that has stopped delivering. The
+    // `Notification` hook owns the claim "a permission prompt is open" and
+    // nothing here tries to reconstruct it — guessing that from JSONL was the
+    // old central source of false positives.
     if matches!(inputs.last_msg_type, "assistant" | "user") {
-        // An `assistant` + `tool_use` tail or a `user` tail (prompt or tool
-        // result) means work was under way as of that message. Recent ⇒
-        // Processing; long quiet ⇒ Idle.
-        return if inputs.now_ms.saturating_sub(inputs.last_message_ts) > WAITING_TO_IDLE_MS {
+        let quiet_for = inputs.now_ms.saturating_sub(inputs.last_message_ts);
+
+        // An `assistant`/`tool_use` tail is not a quiet session, it is an
+        // *outstanding tool call*: Claude Code appends the `tool_result` as a
+        // `user` record the instant the tool returns, so the tail is positive
+        // evidence that the turn is still open. Ageing that into `Idle` — a
+        // claim that nothing is happening and the row can be skipped — is the
+        // one answer that is never right, and it is what put a session sitting
+        // on a permission prompt into the bucket the user filters past.
+        //
+        // With no live channel we cannot tell a blocked prompt from a long
+        // build, and we do not pretend to: past the bound below, both mean the
+        // same thing to the user, which is that this session has stopped making
+        // progress on its own and needs their eyes. That is what `NeedsInput`
+        // is for. Sessions with a healthy channel never reach here — a live
+        // `tool_in_flight` returns `Processing` far above, so this cannot
+        // resurrect the false positives that got the old CPU heuristic deleted.
+        if inputs.last_msg_type == "assistant" && inputs.last_stop_reason == "tool_use" {
+            return if quiet_for > UNRESOLVED_TOOL_CALL_NEEDS_YOU_MS {
+                verdict(
+                    SessionStatus::NeedsInput,
+                    "transcript: tool call outstanding, no live hook channel",
+                )
+            } else {
+                verdict(SessionStatus::Processing, "transcript: tool call recent")
+            };
+        }
+
+        // A `user` tail — a prompt, or a tool result the model has not answered
+        // yet — means work was under way as of that message, with nothing
+        // outstanding to pin it open. Recent ⇒ Processing; long quiet ⇒ Idle.
+        return if quiet_for > WAITING_TO_IDLE_MS {
             verdict(SessionStatus::Idle, "transcript: mid-turn tail, long quiet")
         } else {
             verdict(
