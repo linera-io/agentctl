@@ -326,9 +326,40 @@ fn probe_sandbox_procs(name: &str, pids: &[u32]) -> io::Result<HashMap<u32, Sand
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    Ok(parse_sandbox_procs(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
+    observation_from(name, &String::from_utf8_lossy(&output.stdout), pids.len())
+}
+
+/// The pure half of [`probe_sandbox_procs`]: accept the probe's output only if
+/// it proves it came from the sandbox we asked about.
+///
+/// An answer from the wrong pid namespace is not a quieter answer, it is a
+/// different question's. Rejecting it routes the sandbox into the caller's
+/// carry-forward arm, which already knows that "we could not look" must never
+/// be published as "we looked and it is empty".
+fn observation_from(
+    name: &str,
+    stdout: &str,
+    pids_asked: usize,
+) -> io::Result<HashMap<u32, SandboxProc>> {
+    match parse_probe_identity(stdout) {
+        Some(observed) if observed == name => Ok(parse_sandbox_procs(stdout)),
+        Some(observed) => Err(io::Error::other(format!(
+            "proc-probe for '{name}' answered from '{observed}' ({pids_asked} pids asked); \
+             discarding an observation of the wrong sandbox"
+        ))),
+        None => Err(io::Error::other(format!(
+            "proc-probe for '{name}' printed no sandbox identity ({pids_asked} pids asked); \
+             discarding an observation we cannot place"
+        ))),
+    }
+}
+
+/// The sandbox [`PROC_PROBE_SCRIPT`] reports having run in, if it said.
+fn parse_probe_identity(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(PROBE_IDENTITY_PREFIX))
+        .map(str::trim)
+        .filter(|observed| !observed.is_empty())
 }
 
 /// The in-sandbox process probe, kept as a named constant for the same reason
@@ -343,10 +374,15 @@ fn probe_sandbox_procs(name: &str, pids: &[u32]) -> io::Result<HashMap<u32, Sand
 /// `ps` exits non-zero when *none* of the pids exist, which is an ordinary
 /// outcome (every recorded session has since exited), so its failure is
 /// swallowed and the script always exits 0. Empty stdout then reads as
-/// "nothing alive here", which is exactly right; a genuine `sbx` failure still
-/// shows up as a non-zero exit from `sbx` itself.
+/// "nothing alive here" — but only once [`PROBE_IDENTITY_PREFIX`] has proved
+/// *where* it looked; a genuine `sbx` failure still shows up as a non-zero exit
+/// from `sbx` itself.
+///
+/// The identity line is printed before the argument check so it is present on
+/// every path, including the no-pids one.
 const PROC_PROBE_SCRIPT: &str = r#"
 set -u
+printf 'sandbox %s\n' "${SANDBOX_VM_ID:-$(hostname)}"
 if [ "$#" -eq 0 ]; then exit 0; fi
 IFS=,
 pids="$*"
@@ -354,6 +390,18 @@ unset IFS
 ps -o pid=,cputime=,rss=,command= -p "$pids" 2>/dev/null || true
 exit 0
 "#;
+
+/// Marker prefix identifying the sandbox [`PROC_PROBE_SCRIPT`] actually ran in.
+///
+/// `ps` reports on the pid namespace it is executed in, so a probe that lands
+/// somewhere other than the sandbox it was asked about finds none of the pids
+/// and prints nothing — and empty stdout is indistinguishable from "this
+/// sandbox is genuinely empty". On 2026-08-17 a collector running *inside* one
+/// sandbox probed a sibling, `sbx exec` did not land where the caller assumed,
+/// and all 41 of that sandbox's live sessions were published as zero and
+/// vanished from the dashboard at once. The `Err` arm's carry-forward could not
+/// help: nothing had failed.
+const PROBE_IDENTITY_PREFIX: &str = "sandbox ";
 
 /// Pure parser for the probe's `ps` output, keyed by pid.
 ///
@@ -2837,7 +2885,10 @@ notapid 00:00:01  1024 claude
             String::from_utf8_lossy(&out.stderr)
         );
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let rows: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+        let rows: Vec<&str> = stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with(PROBE_IDENTITY_PREFIX))
+            .collect();
         assert_eq!(rows.len(), 1, "exactly the live pid, got {stdout:?}");
         let fields: Vec<&str> = rows[0].split_whitespace().collect();
         assert_eq!(fields[0].parse::<u32>().ok(), Some(pid), "column 1 is pid");
@@ -2861,10 +2912,108 @@ notapid 00:00:01  1024 claude
     fn probe_script_exits_clean_with_no_pids_at_all() {
         let out = std::process::Command::new("bash")
             .args(["-c", PROC_PROBE_SCRIPT, "--"])
+            .env("SANDBOX_VM_ID", "sbx-empty")
             .output()
             .expect("run the probe script");
         assert!(out.status.success());
-        assert!(out.stdout.is_empty(), "no pids means no rows");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            parse_sandbox_procs(&stdout).is_empty(),
+            "no pids means no rows"
+        );
+        assert_eq!(
+            parse_probe_identity(&stdout),
+            Some("sbx-empty"),
+            "the identity line is printed before the argument check, so an empty \
+             sandbox still proves where it looked"
+        );
+    }
+
+    #[test]
+    fn probe_script_names_the_sandbox_it_ran_in() {
+        let out = std::process::Command::new("bash")
+            .args([
+                "-c",
+                PROC_PROBE_SCRIPT,
+                "--",
+                &std::process::id().to_string(),
+            ])
+            .env("SANDBOX_VM_ID", "linera-agent-deadbeef")
+            .output()
+            .expect("run the probe script");
+        assert_eq!(
+            parse_probe_identity(&String::from_utf8_lossy(&out.stdout)),
+            Some("linera-agent-deadbeef")
+        );
+    }
+
+    #[test]
+    fn probe_script_falls_back_to_the_hostname_when_no_vm_id_is_set() {
+        // Older sandbox images may not export SANDBOX_VM_ID. `hostname` is the
+        // same value there, and an identity we can compare beats none: without
+        // one every probe would be discarded and no sandbox would ever update.
+        let out = std::process::Command::new("bash")
+            .args(["-c", PROC_PROBE_SCRIPT, "--"])
+            .env_remove("SANDBOX_VM_ID")
+            .output()
+            .expect("run the probe script");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let identity = parse_probe_identity(&stdout);
+        assert!(
+            identity.is_some_and(|observed| !observed.is_empty()),
+            "expected a hostname, got {identity:?}"
+        );
+    }
+
+    #[test]
+    fn the_identity_line_is_never_mistaken_for_a_process_row() {
+        let stdout = "sandbox linera-agent-a66e92e29e00\n\
+                      4297 00:12:31 220400 claude --resume abc\n";
+        let procs = parse_sandbox_procs(stdout);
+        assert_eq!(procs.len(), 1, "one ps row, not two");
+        assert!(procs.contains_key(&4297));
+    }
+
+    #[test]
+    fn regression_a_probe_answered_by_the_wrong_sandbox_is_not_an_empty_sandbox() {
+        // 2026-08-17: a collector running inside `…a66e92e29e00` probed its
+        // sibling `…09bfb4b7c635`. `sbx exec` did not land in the sibling, so
+        // `ps` was asked about 41 pids that do not exist in the namespace it
+        // reached, printed nothing, and exited 0. `collect_one_sandbox`
+        // returned `Ok([])` — a confident "I looked, it is empty" — and all 41
+        // live sessions were published as zero and disappeared from the
+        // dashboard at once. The `Err` carry-forward could not help: nothing
+        // had failed.
+        let wrong_namespace = "sandbox linera-agent-a66e92e29e00\n";
+        let err = observation_from("linera-agent-09bfb4b7c635", wrong_namespace, 41)
+            .expect_err("an answer from another sandbox is not an observation of this one");
+        let message = err.to_string();
+        // The log has to name both sandboxes and the size of what was
+        // discarded, or this reads as an ordinary quiet tick in the reaper log.
+        assert!(message.contains("linera-agent-09bfb4b7c635"), "{message}");
+        assert!(message.contains("linera-agent-a66e92e29e00"), "{message}");
+        assert!(message.contains("41 pids"), "{message}");
+    }
+
+    #[test]
+    fn an_unidentifiable_probe_is_discarded_rather_than_believed() {
+        let err = observation_from("linera-agent-09bfb4b7c635", "", 41)
+            .expect_err("output that cannot be placed proves nothing about this sandbox");
+        assert!(err.to_string().contains("no sandbox identity"));
+    }
+
+    #[test]
+    fn a_genuinely_empty_sandbox_still_reports_empty() {
+        // The other half: this guard must not pin dead rows on screen forever.
+        // A probe that proves it ran in the right place and found nothing is a
+        // real observation, and the rows must go.
+        let observed = observation_from(
+            "linera-agent-09bfb4b7c635",
+            "sandbox linera-agent-09bfb4b7c635\n",
+            41,
+        )
+        .expect("an identified probe is an observation, however empty");
+        assert!(observed.is_empty());
     }
 
     #[test]
