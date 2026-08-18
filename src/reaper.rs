@@ -306,8 +306,22 @@ fn collect_one_sandbox(
         // startup, paid once per running sandbox on every reaper tick.
         return Ok(Vec::new());
     }
-    let live = probe_sandbox_procs(name, &pids)?;
-    Ok(sessions_from_registry(registry, &live))
+    let observed = probe_sandbox_procs(name, &pids)?;
+    Ok(sessions_from_registry(
+        registry,
+        &observed.procs,
+        observed.parents.as_ref(),
+    ))
+}
+
+/// One probe's worth of evidence about a sandbox.
+#[derive(Debug)]
+struct SandboxObservation {
+    /// The live claude processes it found, by pid.
+    procs: HashMap<u32, SandboxProc>,
+    /// Pids that parent at least one process. `None` when the probe did not
+    /// report the section at all, which is not the same as reporting none.
+    parents: Option<HashSet<u32>>,
 }
 
 /// Run [`PROC_PROBE_SCRIPT`] inside `name` for `pids` and parse what it saw.
@@ -315,7 +329,7 @@ fn collect_one_sandbox(
 /// Caller must have established that `name` is *running*: `sbx exec` starts a
 /// stopped sandbox, so probing one indiscriminately would resurrect sandboxes
 /// the user had deliberately shut down.
-fn probe_sandbox_procs(name: &str, pids: &[u32]) -> io::Result<HashMap<u32, SandboxProc>> {
+fn probe_sandbox_procs(name: &str, pids: &[u32]) -> io::Result<SandboxObservation> {
     let mut cmd = Command::new("sbx");
     cmd.args(["exec", name, "bash", "-c", PROC_PROBE_SCRIPT, "--"]);
     cmd.args(pids.iter().map(u32::to_string));
@@ -336,13 +350,14 @@ fn probe_sandbox_procs(name: &str, pids: &[u32]) -> io::Result<HashMap<u32, Sand
 /// different question's. Rejecting it routes the sandbox into the caller's
 /// carry-forward arm, which already knows that "we could not look" must never
 /// be published as "we looked and it is empty".
-fn observation_from(
-    name: &str,
-    stdout: &str,
-    pids_asked: usize,
-) -> io::Result<HashMap<u32, SandboxProc>> {
+fn observation_from(name: &str, stdout: &str, pids_asked: usize) -> io::Result<SandboxObservation> {
     match parse_probe_identity(stdout) {
-        Some(observed) if observed == name => Ok(parse_sandbox_procs(stdout)),
+        Some(observed) if observed == name => Ok(SandboxObservation {
+            procs: parse_sandbox_procs(stdout),
+            // `None` when the probe never printed the section: an older build
+            // saying nothing about children is not a probe reporting none.
+            parents: probe_reported_parents(stdout).then(|| parse_parent_pids(stdout)),
+        }),
         Some(observed) => Err(io::Error::other(format!(
             "proc-probe for '{name}' answered from '{observed}' ({pids_asked} pids asked); \
              discarding an observation of the wrong sandbox"
@@ -388,8 +403,23 @@ IFS=,
 pids="$*"
 unset IFS
 ps -o pid=,cputime=,rss=,command= -p "$pids" 2>/dev/null || true
+printf 'parents\n'
+ps -eo ppid= 2>/dev/null || true
 exit 0
 "#;
+
+/// Marker after which [`PROC_PROBE_SCRIPT`] prints one parent pid per line.
+///
+/// Distinguishes a `Bash` tool call that is *running* from one blocked on a
+/// permission prompt, which the transcript alone cannot do: Claude Code spawns
+/// a child for `Bash`, so a session pid that is somebody's parent has its
+/// command under way, and one that is not is waiting on the user. That is the
+/// last case `NeedsInput` could not reach without the hook channel.
+///
+/// Deliberately still `ps` and nothing else — no `sort`, no `sed`, no jq — so
+/// the probe keeps working against any sandbox image. Duplicates and blank
+/// lines are the parser's problem, not the script's.
+const PROBE_PARENTS_MARKER: &str = "parents";
 
 /// Marker prefix identifying the sandbox [`PROC_PROBE_SCRIPT`] actually ran in.
 ///
@@ -402,6 +432,24 @@ exit 0
 /// vanished from the dashboard at once. The `Err` arm's carry-forward could not
 /// help: nothing had failed.
 const PROBE_IDENTITY_PREFIX: &str = "sandbox ";
+
+/// Pids that are a parent of at least one process, from the probe's trailing
+/// section. Empty when the probe predates the marker, which leaves the signal
+/// unknown rather than asserting that nothing has children.
+fn parse_parent_pids(text: &str) -> HashSet<u32> {
+    text.lines()
+        .skip_while(|line| line.trim() != PROBE_PARENTS_MARKER)
+        .skip(1)
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect()
+}
+
+/// Whether the probe reported the parent section at all. A probe from an older
+/// build says nothing about children, and `Some(false)` must never be inferred
+/// from its silence.
+fn probe_reported_parents(text: &str) -> bool {
+    text.lines().any(|line| line.trim() == PROBE_PARENTS_MARKER)
+}
 
 /// Pure parser for the probe's `ps` output, keyed by pid.
 ///
@@ -459,6 +507,7 @@ fn parse_sandbox_procs(text: &str) -> HashMap<u32, SandboxProc> {
 fn sessions_from_registry(
     entries: &[sandbox_registry::SessionEntry],
     live: &HashMap<u32, SandboxProc>,
+    parents: Option<&HashSet<u32>>,
 ) -> Vec<serde_json::Value> {
     entries
         .iter()
@@ -484,6 +533,13 @@ fn sessions_from_registry(
                 // f32 to JSON otherwise writes its binary error out in full
                 // (`3.4` becomes 3.4000000953674316).
                 "mem_mb": (sample.mem_mb * 100.0).round() / 100.0,
+                // Whether this claude process has a child, which is what
+                // separates a running `Bash` call from one blocked on a
+                // permission prompt. Omitted entirely when the probe did not
+                // report the section, so a reader can tell "no children" from
+                // "not measured" — the distinction every status bug this month
+                // was made of.
+                "has_child": parents.map(|set| set.contains(&sample.pid)),
             }))
         })
         .collect()
@@ -2714,7 +2770,8 @@ notapid 00:00:01  1024 claude
             "9905252f-e0aa-43d0-b578-c3023b36b2fb",
             Some("argo-validator-migration-strategy"),
         )];
-        let rows = sessions_from_registry(&entries, &live_map(vec![sample(11036, 3.4, 1024.0)]));
+        let rows =
+            sessions_from_registry(&entries, &live_map(vec![sample(11036, 3.4, 1024.0)]), None);
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0]["session_id"], "9905252f-e0aa-43d0-b578-c3023b36b2fb",
@@ -2758,7 +2815,8 @@ notapid 00:00:01  1024 claude
         // for itself. Assert against the real reader rather than a restated
         // copy of the key names, which is how the two drifted before.
         let entries = vec![registry_entry(11036, "abc-123", Some("my-title"))];
-        let rows = sessions_from_registry(&entries, &live_map(vec![sample(11036, 7.5, 256.0)]));
+        let rows =
+            sessions_from_registry(&entries, &live_map(vec![sample(11036, 7.5, 256.0)]), None);
         let vitals = crate::app::snapshot_vitals_at(
             &snapshot_of("linera-agent", rows),
             COLLECTED_AT_MS,
@@ -2783,7 +2841,8 @@ notapid 00:00:01  1024 claude
         // Proves the test above discriminates: strip exactly the two keys and
         // the reader finds nothing to read.
         let entries = vec![registry_entry(11036, "abc-123", Some("my-title"))];
-        let mut rows = sessions_from_registry(&entries, &live_map(vec![sample(11036, 7.5, 256.0)]));
+        let mut rows =
+            sessions_from_registry(&entries, &live_map(vec![sample(11036, 7.5, 256.0)]), None);
         let map = rows[0].as_object_mut().expect("collected rows are objects");
         map.remove("cputime_secs");
         map.remove("mem_mb");
@@ -2808,7 +2867,7 @@ notapid 00:00:01  1024 claude
             registry_entry(11036, "alive", Some("still-here")),
             registry_entry(999, "departed", Some("long-gone")),
         ];
-        let rows = sessions_from_registry(&entries, &live_map(vec![sample(11036, 1.0, 8.0)]));
+        let rows = sessions_from_registry(&entries, &live_map(vec![sample(11036, 1.0, 8.0)]), None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["session_id"], "alive");
     }
@@ -2821,6 +2880,7 @@ notapid 00:00:01  1024 claude
         let rows = sessions_from_registry(
             &entries,
             &live_map(vec![sample(11036, 1.0, 8.0), sample(1, 1.0, 8.0)]),
+            None,
         );
         assert!(
             rows.is_empty(),
@@ -2830,7 +2890,7 @@ notapid 00:00:01  1024 claude
 
     #[test]
     fn empty_registry_slice_collects_nothing() {
-        assert!(sessions_from_registry(&[], &live_map(vec![sample(1, 1.0, 1.0)])).is_empty());
+        assert!(sessions_from_registry(&[], &live_map(vec![sample(1, 1.0, 1.0)]), None).is_empty());
     }
 
     /// Spawn a `sleep`, kill it and reap it. Its pid is then definitively dead
@@ -2887,6 +2947,7 @@ notapid 00:00:01  1024 claude
         let stdout = String::from_utf8_lossy(&out.stdout);
         let rows: Vec<&str> = stdout
             .lines()
+            .take_while(|l| l.trim() != PROBE_PARENTS_MARKER)
             .filter(|l| !l.trim().is_empty() && !l.starts_with(PROBE_IDENTITY_PREFIX))
             .collect();
         assert_eq!(rows.len(), 1, "exactly the live pid, got {stdout:?}");
@@ -2926,6 +2987,59 @@ notapid 00:00:01  1024 claude
             Some("sbx-empty"),
             "the identity line is printed before the argument check, so an empty \
              sandbox still proves where it looked"
+        );
+    }
+
+    #[test]
+    fn probe_script_reports_which_pids_have_children() {
+        // The signal that separates a running `Bash` call from one blocked on a
+        // permission prompt, exercised against a real process tree rather than
+        // a fixture: this test process spawns a child, so its own pid must come
+        // back in the parent set, and a reaped pid must not.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a child");
+        let out = std::process::Command::new("bash")
+            .args([
+                "-c",
+                PROC_PROBE_SCRIPT,
+                "--",
+                &std::process::id().to_string(),
+            ])
+            .env("SANDBOX_VM_ID", "sbx-parents")
+            .output()
+            .expect("run the probe script");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parents = parse_parent_pids(&stdout);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            probe_reported_parents(&stdout),
+            "the script must print the marker: {stdout:?}"
+        );
+        assert!(
+            parents.contains(&std::process::id()),
+            "this process has a live child, so it must be in the parent set"
+        );
+        assert!(
+            !parents.contains(&reaped_pid()),
+            "a reaped pid parents nothing"
+        );
+    }
+
+    #[test]
+    fn a_probe_without_the_parents_section_reports_unknown_not_none() {
+        // Version skew: an older probe says nothing about children. Reading its
+        // silence as "no children" would call every session a permission
+        // prompt — the same absence-as-evidence mistake, one more time.
+        let old_style = "sandbox sbx-old\n4297 00:12:31 220400 claude --resume abc\n";
+        assert!(!probe_reported_parents(old_style));
+        let observed = observation_from("sbx-old", old_style, 1).expect("a valid observation");
+        assert!(
+            observed.parents.is_none(),
+            "no section means unknown, never an empty set"
         );
     }
 
@@ -3013,7 +3127,7 @@ notapid 00:00:01  1024 claude
             41,
         )
         .expect("an identified probe is an observation, however empty");
-        assert!(observed.is_empty());
+        assert!(observed.procs.is_empty());
     }
 
     #[test]

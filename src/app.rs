@@ -255,6 +255,8 @@ pub(crate) fn foreign_sessions_from(
                     .and_then(|(prev, cur)| crate::cpu::cpu_rate_percent(prev, cur));
                 session.cpu_sample = vitals.cpu_sample;
                 session.mem_mb = vitals.mem_mb;
+                session.has_child_process = vitals.has_child;
+                session.child_observed_at_ms = vitals.observed_at_ms;
             }
             out.push(session);
         }
@@ -433,6 +435,13 @@ pub(crate) struct SnapshotVitals {
     /// this field, which leaves the rate unknown rather than inventing one.
     pub cpu_sample: Option<crate::cpu::CpuSample>,
     pub mem_mb: f64,
+    /// Whether the collector saw this claude process parenting anything.
+    /// `None` when it did not report — an older probe, or a sandbox it could
+    /// not place — and absence must never be read as "no children".
+    pub has_child: Option<bool>,
+    /// When the observation above was taken, so a reader can require it to be
+    /// *newer* than the tool call it is being used to judge.
+    pub observed_at_ms: u64,
 }
 
 /// Index the snapshot's collected rows by session id so a registry-built row
@@ -478,6 +487,8 @@ pub(crate) fn snapshot_vitals_at(
                         .get("mem_mb")
                         .and_then(serde_json::Value::as_f64)
                         .unwrap_or(0.0),
+                    has_child: value.get("has_child").and_then(serde_json::Value::as_bool),
+                    observed_at_ms: snapshot.collected_at_ms,
                 },
             );
         }

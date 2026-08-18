@@ -1869,8 +1869,11 @@ struct Scenario {
     last_msg_type: &'static str,
     last_stop_reason: &'static str,
     last_message_ts: u64,
-    /// Outstanding tool calls by name. Defaults to none via [`no_pending_tools`].
+    /// Outstanding tool calls by name.
     pending_tools: &'static [String],
+    /// Whether the process was observed parenting anything, and when.
+    has_child_process: Option<bool>,
+    child_observed_at_ms: u64,
 }
 
 fn hook_state() -> HookState {
@@ -1890,6 +1893,8 @@ fn status_at(scenario: &Scenario, now_ms: u64, cpu_rate_percent: Option<f32>) ->
         cpu_rate_percent,
         telemetry_available: true,
         pending_tools: scenario.pending_tools,
+        has_child_process: scenario.has_child_process,
+        child_observed_at_ms: scenario.child_observed_at_ms,
     })
     .status
 }
@@ -1916,6 +1921,8 @@ fn scenarios() -> Vec<Scenario> {
             last_stop_reason: "",
             last_message_ts: T0 - MIN,
             pending_tools: &[],
+            has_child_process: None,
+            child_observed_at_ms: 0,
         },
         Scenario {
             name: "tool in flight",
@@ -1929,6 +1936,8 @@ fn scenarios() -> Vec<Scenario> {
             last_stop_reason: "tool_use",
             last_message_ts: T0,
             pending_tools: &[],
+            has_child_process: None,
+            child_observed_at_ms: 0,
         },
         Scenario {
             name: "turn under way, no tool in flight",
@@ -1942,6 +1951,8 @@ fn scenarios() -> Vec<Scenario> {
             last_stop_reason: "",
             last_message_ts: T0,
             pending_tools: &[],
+            has_child_process: None,
+            child_observed_at_ms: 0,
         },
         Scenario {
             name: "stop fired, waiting for the user",
@@ -1956,6 +1967,8 @@ fn scenarios() -> Vec<Scenario> {
             last_stop_reason: "end_turn",
             last_message_ts: T0,
             pending_tools: &[],
+            has_child_process: None,
+            child_observed_at_ms: 0,
         },
         Scenario {
             name: "compacting",
@@ -1968,6 +1981,8 @@ fn scenarios() -> Vec<Scenario> {
             last_stop_reason: "tool_use",
             last_message_ts: T0 - MIN,
             pending_tools: &[],
+            has_child_process: None,
+            child_observed_at_ms: 0,
         },
         Scenario {
             name: "stop was dropped; user interrupted, so the tail is a user message",
@@ -1981,6 +1996,8 @@ fn scenarios() -> Vec<Scenario> {
             last_stop_reason: "",
             last_message_ts: T0,
             pending_tools: &[],
+            has_child_process: None,
+            child_observed_at_ms: 0,
         },
         Scenario {
             name: "stop was dropped; transcript ended the turn cleanly",
@@ -1994,6 +2011,8 @@ fn scenarios() -> Vec<Scenario> {
             last_stop_reason: "end_turn",
             last_message_ts: T0,
             pending_tools: &[],
+            has_child_process: None,
+            child_observed_at_ms: 0,
         },
         Scenario {
             name: "no hooks have ever fired, transcript mid-turn",
@@ -2002,6 +2021,8 @@ fn scenarios() -> Vec<Scenario> {
             last_stop_reason: "tool_use",
             last_message_ts: T0,
             pending_tools: &[],
+            has_child_process: None,
+            child_observed_at_ms: 0,
         },
         Scenario {
             name: "no hooks have ever fired, transcript ended the turn",
@@ -2010,6 +2031,8 @@ fn scenarios() -> Vec<Scenario> {
             last_stop_reason: "end_turn",
             last_message_ts: T0,
             pending_tools: &[],
+            has_child_process: None,
+            child_observed_at_ms: 0,
         },
         // Appended, not inserted: the tests above index this list positionally.
         Scenario {
@@ -2028,6 +2051,8 @@ fn scenarios() -> Vec<Scenario> {
             last_stop_reason: "tool_use",
             last_message_ts: T0,
             pending_tools: &[],
+            has_child_process: None,
+            child_observed_at_ms: 0,
         },
         Scenario {
             name: "hook channel died mid-turn with a tool marker left in flight",
@@ -2042,6 +2067,8 @@ fn scenarios() -> Vec<Scenario> {
             last_stop_reason: "tool_use",
             last_message_ts: T0,
             pending_tools: &[],
+            has_child_process: None,
+            child_observed_at_ms: 0,
         },
     ]
 }
@@ -2260,6 +2287,8 @@ fn a_question_only_the_user_can_answer_needs_no_hook_at_all() {
             last_stop_reason: "tool_use",
             last_message_ts: T0,
             pending_tools: Box::leak(pending.into_boxed_slice()),
+            has_child_process: None,
+            child_observed_at_ms: 0,
         };
         for age in [0, 1_000, 30_000, 11 * MIN, 21 * MIN, HOUR, 72 * HOUR] {
             for cpu in [None, Some(0.0), Some(50.0)] {
@@ -2296,6 +2325,8 @@ fn a_question_outranks_hook_state_that_says_otherwise() {
         last_stop_reason: "tool_use",
         last_message_ts: T0,
         pending_tools: Box::leak(pending.clone().into_boxed_slice()),
+        has_child_process: None,
+        child_observed_at_ms: 0,
     };
     assert_eq!(
         status_at(&stale_stop, T0 + 11 * MIN, None),
@@ -2315,6 +2346,8 @@ fn a_question_outranks_hook_state_that_says_otherwise() {
         last_stop_reason: "tool_use",
         last_message_ts: T0,
         pending_tools: Box::leak(pending.into_boxed_slice()),
+        has_child_process: None,
+        child_observed_at_ms: 0,
     };
     assert_eq!(
         status_at(&live_tool, T0 + MIN, None),
@@ -2336,11 +2369,102 @@ fn an_answered_question_stops_needing_the_user() {
         last_stop_reason: "tool_use",
         last_message_ts: T0,
         pending_tools: &[],
+        has_child_process: None,
+        child_observed_at_ms: 0,
     };
     assert_ne!(
         status_at(&answered, T0 + MIN, None),
         SessionStatus::NeedsInput,
         "nothing is outstanding, so nothing is waiting on the user"
+    );
+}
+
+fn bash_pending(has_child: Option<bool>, observed_at_ms: u64) -> Scenario {
+    Scenario {
+        name: "a Bash call is outstanding",
+        state: None,
+        last_msg_type: "assistant",
+        last_stop_reason: "tool_use",
+        last_message_ts: T0,
+        pending_tools: Box::leak(vec!["Bash".to_string()].into_boxed_slice()),
+        has_child_process: has_child,
+        child_observed_at_ms: observed_at_ms,
+    }
+}
+
+#[test]
+fn a_pending_command_with_no_child_to_run_it_is_a_permission_prompt() {
+    // The case NeedsInput could not reach without the hook channel, and the one
+    // that actually happened: f431c406 sat on a Bash permission prompt for a
+    // `python3 - <<'PY'` heredoc the sandbox gate asks about. The transcript
+    // cannot tell that from a running command — both are an outstanding
+    // `tool_use` over a near-idle process. The child can: Claude Code spawns one
+    // to run the command, and a prompt never gets that far.
+    let blocked = bash_pending(Some(false), T0 + MIN);
+    for age in [MIN, 11 * MIN, 21 * MIN, 3 * HOUR] {
+        assert_eq!(
+            status_at(&blocked, T0 + age, None),
+            SessionStatus::NeedsInput,
+            "no child at {} min means the command never started",
+            age / MIN
+        );
+    }
+}
+
+#[test]
+fn a_command_that_is_actually_running_is_not_a_prompt() {
+    // The blast radius, and the reason this replaces #57's timer rather than
+    // stacking on it: a three-hour build has a child the whole way through and
+    // must never be called a prompt.
+    let running = bash_pending(Some(true), T0 + MIN);
+    for age in [MIN, 21 * MIN, 3 * HOUR, 72 * HOUR] {
+        assert_eq!(
+            status_at(&running, T0 + age, None),
+            SessionStatus::Processing,
+            "a command with a child is a command running"
+        );
+    }
+}
+
+#[test]
+fn an_unmeasured_child_signal_claims_nothing() {
+    // `None` is "not measured" — an older probe, or a sandbox the collector
+    // could not place. Reading it as "no children" would turn every unprobed
+    // session into a permission prompt, which is this month's bug wearing a new
+    // hat: absence of evidence as evidence of absence.
+    let unmeasured = bash_pending(None, T0 + MIN);
+    assert_ne!(
+        status_at(&unmeasured, T0 + 2 * MIN, None),
+        SessionStatus::NeedsInput,
+        "not measured must claim nothing"
+    );
+}
+
+#[test]
+fn an_observation_older_than_the_tool_call_claims_nothing() {
+    // Both races that would report a running command as a prompt. The collector
+    // runs every 300 s, so its answer routinely predates the call it would be
+    // used to judge; and even a fresh observation can land in the gap between
+    // the tool_use record and the child being spawned.
+    let stale = bash_pending(Some(false), T0 - MIN);
+    assert_ne!(
+        status_at(&stale, T0 + 2 * MIN, None),
+        SessionStatus::NeedsInput,
+        "an observation taken before the call proves nothing about it"
+    );
+
+    let inside_margin = bash_pending(Some(false), T0 + 5_000);
+    assert_ne!(
+        status_at(&inside_margin, T0 + 2 * MIN, None),
+        SessionStatus::NeedsInput,
+        "within the spawn margin the child may simply not exist yet"
+    );
+
+    // And once the observation clears the margin, it counts.
+    let clear = bash_pending(Some(false), T0 + 31_000);
+    assert_eq!(
+        status_at(&clear, T0 + 2 * MIN, None),
+        SessionStatus::NeedsInput
     );
 }
 
@@ -2358,6 +2482,8 @@ fn an_ordinary_tool_is_not_a_question() {
         last_stop_reason: "tool_use",
         last_message_ts: T0,
         pending_tools: Box::leak(pending.into_boxed_slice()),
+        has_child_process: None,
+        child_observed_at_ms: 0,
     };
     assert_eq!(
         status_at(&working, T0 + MIN, None),

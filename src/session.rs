@@ -228,6 +228,11 @@ pub struct ClaudeSession {
     /// `%cpu` column cannot answer this question. Renamed from `cpu_percent`
     /// deliberately: the quantity changed, and every reader had to be revisited.
     pub cpu_rate_percent: Option<f32>,
+    /// Whether this session's process was last seen parenting another process.
+    /// `None` means not measured, which is not the same as "no children".
+    pub has_child_process: Option<bool>,
+    /// When [`Self::has_child_process`] was observed.
+    pub child_observed_at_ms: u64,
     /// Previous cumulative CPU-time sample, carried across refresh ticks by
     /// `app::merge_discovered_sessions`. Without that hand-off there is never a
     /// pair to difference and the rate stays permanently unknown.
@@ -464,6 +469,8 @@ impl ClaudeSession {
             terminal_resolved: false,
             status: SessionStatus::Idle,
             cpu_rate_percent: None,
+            has_child_process: None,
+            child_observed_at_ms: 0,
             cpu_sample: None,
             mem_mb: 0.0,
             own_input_tokens: 0,
