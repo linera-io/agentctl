@@ -630,10 +630,42 @@ pub fn local_registry_path() -> PathBuf {
 /// registry — callers treat "no registry" and "empty registry" identically, and
 /// a corrupt file must never block a restore attempt or a hook.
 pub fn load() -> Registry {
-    match fs::read(sandbox_registry_path()) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(_) => Registry::default(),
-    }
+    try_load().unwrap_or_default()
+}
+
+/// The same read, keeping the difference between "there is nothing recorded"
+/// and "we could not find out".
+///
+/// **Any read-modify-write must use this one.** [`load`] answers both cases
+/// with an empty registry, which is right for a renderer and catastrophic as
+/// the base of a write-back: [`replace_sandbox_slice`] serialises the whole
+/// file, so one unreadable read while a hook saves its own slice deletes every
+/// other sandbox's sessions from disk.
+///
+/// That is not hypothetical. On 2026-08-17 the registry went from 42 sessions
+/// across two sandboxes to the 1 session of the sandbox whose hook happened to
+/// fire, and 41 live sessions vanished from the dashboard. A torn read is the
+/// mechanism to expect here: the file is rewritten in place by the host
+/// collector while in-sandbox hooks read it over virtiofs, where fresh
+/// metadata with stale pages is a known hazard, and a half-written 20 KB JSON
+/// fails to parse.
+///
+/// A *missing* file is not a failure — that is a first run, and an empty
+/// registry is the honest answer.
+pub fn try_load() -> io::Result<Registry> {
+    let bytes = match fs::read(sandbox_registry_path()) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Registry::default()),
+        Err(e) => return Err(e),
+    };
+    serde_json::from_slice(&bytes).map_err(|e| {
+        io::Error::other(format!(
+            "registry at {} is unreadable ({e}); refusing to treat {} bytes we cannot parse \
+             as an empty registry",
+            sandbox_registry_path().display(),
+            bytes.len()
+        ))
+    })
 }
 
 /// Read the local registry (same missing/corrupt tolerance as [`load`]).
@@ -683,7 +715,10 @@ where
 pub fn replace_sandbox_slice(sandbox: &str, mut entries: Vec<SessionEntry>) -> io::Result<()> {
     let path = sandbox_registry_path();
     with_lock(&path, || {
-        let mut registry = load();
+        // Never `load()` here: this write serialises the *whole* file, so a
+        // base we could not read would publish this sandbox's slice as the
+        // entire registry and delete every other sandbox with it.
+        let mut registry = try_load()?;
         // A replace is wholesale, so without this a single tick whose live
         // set was assembled from the process table alone (registry read
         // missed, pointers long gone) would blank EVERY session title in the
@@ -724,7 +759,7 @@ pub fn replace_sandbox_slice(sandbox: &str, mut entries: Vec<SessionEntry>) -> i
 pub fn forget_session(session_id: &str) -> io::Result<()> {
     match current_sandbox() {
         Some(sandbox) => {
-            let remaining: Vec<SessionEntry> = load()
+            let remaining: Vec<SessionEntry> = try_load()?
                 .sandboxes
                 .remove(&sandbox)
                 .unwrap_or_default()
@@ -772,7 +807,7 @@ pub fn mark_session_departed(session_id: &str, at_ms: u64) -> io::Result<()> {
     };
     match current_sandbox() {
         Some(sandbox) => {
-            let slice = load().sandboxes.remove(&sandbox).unwrap_or_default();
+            let slice = try_load()?.sandboxes.remove(&sandbox).unwrap_or_default();
             // Nothing recorded for this sandbox yet ⇒ nothing to stamp. Writing
             // an empty slice here would remove the key and, with it, any
             // restore material a concurrent writer had just added.
@@ -1469,6 +1504,69 @@ pub(crate) mod tests {
         update_local(|_| vec![]).unwrap();
         assert!(load_local().sessions.is_empty());
         assert_eq!(load().sandboxes.get("linera-agent").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn regression_an_unreadable_registry_never_deletes_another_sandbox() {
+        // 2026-08-17, 18:22:26Z. Two sandboxes, 42 sessions. One sandbox's hook
+        // saved its own 1-session slice; the read that write-back was built on
+        // came up empty, and `replace_sandbox_slice` serialised the result as
+        // the whole file. The sibling's key — 41 live sessions, every one of
+        // them still writing its transcript — was gone from disk, and every row
+        // disappeared from the dashboard at once.
+        //
+        // The read failing is not the bug and cannot be prevented here: the
+        // file is rewritten in place by the host collector while in-sandbox
+        // hooks read it over virtiofs. Publishing a write built on that read is
+        // the bug.
+        let _fixture = TempRegistry::new("unreadable-registry-write-back");
+        let path = sandbox_registry_path();
+
+        replace_sandbox_slice("sandbox-a", vec![entry("aaa", "/work/a")]).unwrap();
+        replace_sandbox_slice("sandbox-b", vec![entry("bbb", "/work/b")]).unwrap();
+        assert_eq!(load().sandboxes.len(), 2, "two sandboxes recorded");
+
+        // A torn read: the trailing half of the JSON never made it to the page
+        // cache, so it parses as nothing.
+        let intact = fs::read(&path).unwrap();
+        fs::write(&path, &intact[..intact.len() / 2]).unwrap();
+        let truncated = fs::read(&path).unwrap();
+
+        let result = replace_sandbox_slice("sandbox-a", vec![entry("aaa", "/work/a")]);
+        let err = result.expect_err("a registry we cannot parse is not an empty registry");
+        assert!(
+            err.to_string().contains("unreadable"),
+            "the error must say the file could not be read, got: {err}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            truncated,
+            "the write must be abandoned, not applied on top of a base we never read"
+        );
+
+        // And once the file is readable again, the other sandbox is still there
+        // — the entries were never the thing at risk, the write-back was.
+        fs::write(&path, &intact).unwrap();
+        replace_sandbox_slice("sandbox-a", vec![entry("aaa", "/work/a2")]).unwrap();
+        let registry = load();
+        assert_eq!(registry.sandboxes.len(), 2, "sandbox-b survived");
+        assert_eq!(registry.sandboxes["sandbox-b"][0].session_id, "bbb");
+    }
+
+    #[test]
+    fn a_registry_that_has_never_been_written_is_legitimately_empty() {
+        // The other half: absence is a real answer. Treating a first run as a
+        // failure would mean no sandbox could ever record its first session.
+        let _fixture = TempRegistry::new("registry-first-run");
+        assert!(!sandbox_registry_path().exists());
+        assert!(
+            try_load()
+                .expect("a missing registry is empty, not unreadable")
+                .sandboxes
+                .is_empty()
+        );
+        replace_sandbox_slice("sandbox-a", vec![entry("aaa", "/work/a")]).unwrap();
+        assert_eq!(load().sandboxes["sandbox-a"].len(), 1);
     }
 
     #[test]
