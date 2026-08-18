@@ -410,6 +410,7 @@ pub fn infer_status(session: &mut ClaudeSession, last_msg_type: &str, last_stop_
     } else {
         HookState::load(&session.session_id)
     };
+    let pending_tools: Vec<String> = session.pending_tool_uses.values().cloned().collect();
 
     let verdict = decide_status(&StatusInputs {
         hook_state: hook_state.as_ref(),
@@ -419,6 +420,7 @@ pub fn infer_status(session: &mut ClaudeSession, last_msg_type: &str, last_stop_
         last_message_ts: session.last_message_ts,
         cpu_rate_percent: session.cpu_rate_percent,
         telemetry_available: session.telemetry_status.is_available(),
+        pending_tools: &pending_tools,
     });
 
     // Log the *evidence*, not just the ruling. Diagnosing a wrong status
@@ -472,6 +474,11 @@ pub struct StatusInputs<'a> {
     /// session is working.
     pub cpu_rate_percent: Option<f32>,
     pub telemetry_available: bool,
+    /// Names of the tool calls this session has outstanding, from the
+    /// transcript's own `tool_use`/`tool_result` pairing. Empty when nothing is
+    /// in flight. Written by Claude Code itself, so unlike hook state it cannot
+    /// be dropped.
+    pub pending_tools: &'a [String],
 }
 
 /// A status plus the branch that produced it, for the diagnostic log.
@@ -516,6 +523,30 @@ const UNRESOLVED_TOOL_CALL_NEEDS_YOU_MS: u64 = 20 * 60 * 1000;
 /// a ~1-minute decaying average on macOS.
 const BUSY_CPU_RATE_PERCENT: f32 = 5.0;
 
+/// Tools that only the user can answer.
+///
+/// `ExitPlanMode` and `AskUserQuestion` do not run, compute, or time out —
+/// each renders a prompt and waits, and the only thing that can retire it is a
+/// person. So an outstanding one *is* the status, with no inference in the
+/// middle: no Notification hook to be dropped, no CPU reading to be
+/// misjudged, no elapsed-time bound to be tuned. The transcript records the
+/// `tool_use` and, when the user answers, the matching `tool_result` — and
+/// Claude Code writes that file itself, so it cannot go silent the way the
+/// hook channel does.
+///
+/// This is the answer to "NeedsInput stopped working": for these two tools it
+/// no longer depends on anything that can stop working.
+const TOOLS_ONLY_THE_USER_CAN_ANSWER: [&str; 2] = ["ExitPlanMode", "AskUserQuestion"];
+
+/// Whether a tool call is outstanding that nothing but the user will ever
+/// retire.
+fn blocked_on_a_question(inputs: &StatusInputs) -> bool {
+    inputs
+        .pending_tools
+        .iter()
+        .any(|tool| TOOLS_ONLY_THE_USER_CAN_ANSWER.contains(&tool.as_str()))
+}
+
 /// Decide a session's status from its evidence. Pure: same inputs, same answer,
 /// on any machine at any time.
 ///
@@ -559,6 +590,18 @@ pub fn decide_status(inputs: &StatusInputs) -> StatusVerdict {
             hook_state::newest_hook_event_ms(state),
         )
     });
+    // Ahead of every hook branch on purpose. A pending `AskUserQuestion` is not
+    // weaker evidence than a `Notification` saying the same thing — it is the
+    // same fact, from the one channel that cannot be lost. Placing it lower
+    // would make the strongest signal we have reachable only when the weakest
+    // one is missing.
+    if blocked_on_a_question(inputs) {
+        return verdict(
+            SessionStatus::NeedsInput,
+            "transcript: a question only the user can answer is open",
+        );
+    }
+
     let transcript_ended = transcript_ended_the_turn(inputs, hook_state);
 
     if let Some(state) = hook_state {
