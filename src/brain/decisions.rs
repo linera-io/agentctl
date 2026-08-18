@@ -793,6 +793,8 @@ mod tests {
         files.insert("src/main.rs".to_string(), 2u32);
 
         let session = ClaudeSession {
+            has_child_process: None,
+            child_observed_at_ms: 0,
             pid: 42,
             session_id: "test-session".into(),
             origin: crate::session::SessionOrigin::Local,

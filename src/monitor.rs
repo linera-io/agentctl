@@ -421,6 +421,8 @@ pub fn infer_status(session: &mut ClaudeSession, last_msg_type: &str, last_stop_
         cpu_rate_percent: session.cpu_rate_percent,
         telemetry_available: session.telemetry_status.is_available(),
         pending_tools: &pending_tools,
+        has_child_process: session.has_child_process,
+        child_observed_at_ms: session.child_observed_at_ms,
     });
 
     // Log the *evidence*, not just the ruling. Diagnosing a wrong status
@@ -479,6 +481,10 @@ pub struct StatusInputs<'a> {
     /// in flight. Written by Claude Code itself, so unlike hook state it cannot
     /// be dropped.
     pub pending_tools: &'a [String],
+    /// Whether this session's process was last seen parenting another process,
+    /// and when. `None` is "not measured" and never "no children".
+    pub has_child_process: Option<bool>,
+    pub child_observed_at_ms: u64,
 }
 
 /// A status plus the branch that produced it, for the diagnostic log.
@@ -547,6 +553,46 @@ fn blocked_on_a_question(inputs: &StatusInputs) -> bool {
         .any(|tool| TOOLS_ONLY_THE_USER_CAN_ANSWER.contains(&tool.as_str()))
 }
 
+/// Tools Claude Code runs by spawning a child process.
+///
+/// The child is the evidence: while the command runs the session's process is
+/// somebody's parent, and while it waits at a permission prompt it is not.
+/// Nothing else separates those two — both look identical in the transcript
+/// (an outstanding `tool_use`) and both leave the claude process near-idle,
+/// which is why the old CPU heuristic could not tell them apart and why #57
+/// had to fall back to a twenty-minute timer.
+const TOOLS_THAT_SPAWN_A_CHILD: [&str; 1] = ["Bash"];
+
+/// How long after a tool call starts the child-process observation must have
+/// been taken before it counts.
+///
+/// Two races to clear, both of which would otherwise report a running command
+/// as a prompt: the tool_use record is written before the child is spawned,
+/// and the collector's observation may predate the call entirely. Requiring
+/// the observation to be strictly newer than the message plus this margin
+/// makes a stale snapshot say nothing rather than something false.
+const CHILD_OBSERVATION_MARGIN_MS: u64 = 30 * 1000;
+
+/// Whether a spawning tool is outstanding and the process was *observed*,
+/// after it started, to have no child — i.e. the command never began, because
+/// the session is waiting for the user to allow it.
+fn blocked_on_a_permission_prompt(inputs: &StatusInputs) -> bool {
+    if inputs.has_child_process != Some(false) {
+        return false;
+    }
+    if inputs.child_observed_at_ms
+        <= inputs
+            .last_message_ts
+            .saturating_add(CHILD_OBSERVATION_MARGIN_MS)
+    {
+        return false;
+    }
+    inputs
+        .pending_tools
+        .iter()
+        .any(|tool| TOOLS_THAT_SPAWN_A_CHILD.contains(&tool.as_str()))
+}
+
 /// Decide a session's status from its evidence. Pure: same inputs, same answer,
 /// on any machine at any time.
 ///
@@ -599,6 +645,16 @@ pub fn decide_status(inputs: &StatusInputs) -> StatusVerdict {
         return verdict(
             SessionStatus::NeedsInput,
             "transcript: a question only the user can answer is open",
+        );
+    }
+
+    // Same standing as the question above, and above the hook block for the
+    // same reason: it is a direct observation of the session, not an inference
+    // from a channel that can stop delivering.
+    if blocked_on_a_permission_prompt(inputs) {
+        return verdict(
+            SessionStatus::NeedsInput,
+            "process: a command is pending with no child to run it",
         );
     }
 
@@ -675,7 +731,14 @@ pub fn decide_status(inputs: &StatusInputs) -> StatusVerdict {
         // `tool_in_flight` returns `Processing` far above, so this cannot
         // resurrect the false positives that got the old CPU heuristic deleted.
         if inputs.last_msg_type == "assistant" && inputs.last_stop_reason == "tool_use" {
-            return if quiet_for > UNRESOLVED_TOOL_CALL_NEEDS_YOU_MS {
+            // The timer below is the best-effort answer for a session we could
+            // not measure. Where the process *was* measured and has a child,
+            // the command is demonstrably running and no amount of elapsed time
+            // makes it a prompt — that is a long build, and calling it
+            // `NeedsInput` was the accepted cost of having no better evidence.
+            // We have better evidence now.
+            let command_is_running = inputs.has_child_process == Some(true);
+            return if quiet_for > UNRESOLVED_TOOL_CALL_NEEDS_YOU_MS && !command_is_running {
                 verdict(
                     SessionStatus::NeedsInput,
                     "transcript: tool call outstanding, no live hook channel",
