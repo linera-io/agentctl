@@ -1869,6 +1869,8 @@ struct Scenario {
     last_msg_type: &'static str,
     last_stop_reason: &'static str,
     last_message_ts: u64,
+    /// Outstanding tool calls by name. Defaults to none via [`no_pending_tools`].
+    pending_tools: &'static [String],
 }
 
 fn hook_state() -> HookState {
@@ -1887,6 +1889,7 @@ fn status_at(scenario: &Scenario, now_ms: u64, cpu_rate_percent: Option<f32>) ->
         last_message_ts: scenario.last_message_ts,
         cpu_rate_percent,
         telemetry_available: true,
+        pending_tools: scenario.pending_tools,
     })
     .status
 }
@@ -1912,6 +1915,7 @@ fn scenarios() -> Vec<Scenario> {
             last_msg_type: "user",
             last_stop_reason: "",
             last_message_ts: T0 - MIN,
+            pending_tools: &[],
         },
         Scenario {
             name: "tool in flight",
@@ -1924,6 +1928,7 @@ fn scenarios() -> Vec<Scenario> {
             last_msg_type: "assistant",
             last_stop_reason: "tool_use",
             last_message_ts: T0,
+            pending_tools: &[],
         },
         Scenario {
             name: "turn under way, no tool in flight",
@@ -1936,6 +1941,7 @@ fn scenarios() -> Vec<Scenario> {
             last_msg_type: "user",
             last_stop_reason: "",
             last_message_ts: T0,
+            pending_tools: &[],
         },
         Scenario {
             name: "stop fired, waiting for the user",
@@ -1949,6 +1955,7 @@ fn scenarios() -> Vec<Scenario> {
             last_msg_type: "assistant",
             last_stop_reason: "end_turn",
             last_message_ts: T0,
+            pending_tools: &[],
         },
         Scenario {
             name: "compacting",
@@ -1960,6 +1967,7 @@ fn scenarios() -> Vec<Scenario> {
             last_msg_type: "assistant",
             last_stop_reason: "tool_use",
             last_message_ts: T0 - MIN,
+            pending_tools: &[],
         },
         Scenario {
             name: "stop was dropped; user interrupted, so the tail is a user message",
@@ -1972,6 +1980,7 @@ fn scenarios() -> Vec<Scenario> {
             last_msg_type: "user",
             last_stop_reason: "",
             last_message_ts: T0,
+            pending_tools: &[],
         },
         Scenario {
             name: "stop was dropped; transcript ended the turn cleanly",
@@ -1984,6 +1993,7 @@ fn scenarios() -> Vec<Scenario> {
             last_msg_type: "assistant",
             last_stop_reason: "end_turn",
             last_message_ts: T0,
+            pending_tools: &[],
         },
         Scenario {
             name: "no hooks have ever fired, transcript mid-turn",
@@ -1991,6 +2001,7 @@ fn scenarios() -> Vec<Scenario> {
             last_msg_type: "assistant",
             last_stop_reason: "tool_use",
             last_message_ts: T0,
+            pending_tools: &[],
         },
         Scenario {
             name: "no hooks have ever fired, transcript ended the turn",
@@ -1998,6 +2009,7 @@ fn scenarios() -> Vec<Scenario> {
             last_msg_type: "assistant",
             last_stop_reason: "end_turn",
             last_message_ts: T0,
+            pending_tools: &[],
         },
         // Appended, not inserted: the tests above index this list positionally.
         Scenario {
@@ -2015,6 +2027,7 @@ fn scenarios() -> Vec<Scenario> {
             last_msg_type: "assistant",
             last_stop_reason: "tool_use",
             last_message_ts: T0,
+            pending_tools: &[],
         },
         Scenario {
             name: "hook channel died mid-turn with a tool marker left in flight",
@@ -2028,6 +2041,7 @@ fn scenarios() -> Vec<Scenario> {
             last_msg_type: "assistant",
             last_stop_reason: "tool_use",
             last_message_ts: T0,
+            pending_tools: &[],
         },
     ]
 }
@@ -2226,6 +2240,130 @@ fn regression_an_outstanding_tool_call_is_not_a_quiet_session() {
             "past it, a session that cannot report its own progress needs the user"
         );
     }
+}
+
+#[test]
+fn a_question_only_the_user_can_answer_needs_no_hook_at_all() {
+    // The guarantee: for the two tools that nothing but a person can retire,
+    // NeedsInput does not depend on the hook channel, the clock, or CPU. It is
+    // read straight off the transcript, which Claude Code writes itself.
+    //
+    // Swept with NO hook state, at every age, at every CPU reading. If any
+    // combination here fails to say NeedsInput, a session is sitting on a
+    // question with nobody being told.
+    for tool in ["ExitPlanMode", "AskUserQuestion"] {
+        let pending = vec![tool.to_string()];
+        let scenario = Scenario {
+            name: "blocked on a question, no hooks have ever fired",
+            state: None,
+            last_msg_type: "assistant",
+            last_stop_reason: "tool_use",
+            last_message_ts: T0,
+            pending_tools: Box::leak(pending.into_boxed_slice()),
+        };
+        for age in [0, 1_000, 30_000, 11 * MIN, 21 * MIN, HOUR, 72 * HOUR] {
+            for cpu in [None, Some(0.0), Some(50.0)] {
+                assert_eq!(
+                    status_at(&scenario, T0 + age, cpu),
+                    SessionStatus::NeedsInput,
+                    "{tool} outstanding at {} min, cpu={cpu:?}",
+                    age / MIN
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_question_outranks_hook_state_that_says_otherwise() {
+    // Not merely a fallback for missing hook state — it must win over hook
+    // state that is present and says something else. Both bugs this month were
+    // a live hook marker being believed over the transcript: a nine-hour-old
+    // `Stop` reading as Idle, and a latched `tool_in_flight` reading as
+    // Processing. Neither may bury an open question.
+    let pending = vec!["AskUserQuestion".to_string()];
+    let stale_stop = Scenario {
+        name: "hook state says the turn ended hours ago",
+        state: Some(HookState {
+            last_promptsubmit_ts_ms: T0 - 9 * HOUR,
+            last_pretooluse_ts_ms: T0 - 9 * HOUR,
+            last_stop_ts_ms: T0 - 9 * HOUR,
+            notification_kind: Some("idle_prompt".into()),
+            last_notification_ts_ms: T0 - 9 * HOUR,
+            ..hook_state()
+        }),
+        last_msg_type: "assistant",
+        last_stop_reason: "tool_use",
+        last_message_ts: T0,
+        pending_tools: Box::leak(pending.clone().into_boxed_slice()),
+    };
+    assert_eq!(
+        status_at(&stale_stop, T0 + 11 * MIN, None),
+        SessionStatus::NeedsInput,
+        "a latched Stop must not bury an open question"
+    );
+
+    let live_tool = Scenario {
+        name: "hook state says a tool is in flight",
+        state: Some(HookState {
+            current_tool_name: Some("AskUserQuestion".into()),
+            last_promptsubmit_ts_ms: T0 - MIN,
+            last_pretooluse_ts_ms: T0,
+            ..hook_state()
+        }),
+        last_msg_type: "assistant",
+        last_stop_reason: "tool_use",
+        last_message_ts: T0,
+        pending_tools: Box::leak(pending.into_boxed_slice()),
+    };
+    assert_eq!(
+        status_at(&live_tool, T0 + MIN, None),
+        SessionStatus::NeedsInput,
+        "a healthy channel calls this tool in flight; it is in flight *on the user*"
+    );
+}
+
+#[test]
+fn an_answered_question_stops_needing_the_user() {
+    // The release condition, and the reason this reads from `pending_tool_uses`
+    // rather than the transcript tail: the entry is retired by id the moment
+    // its `tool_result` lands. Without this the status would latch forever —
+    // the failure mode of every latch fixed in this file.
+    let answered = Scenario {
+        name: "the question was answered",
+        state: None,
+        last_msg_type: "assistant",
+        last_stop_reason: "tool_use",
+        last_message_ts: T0,
+        pending_tools: &[],
+    };
+    assert_ne!(
+        status_at(&answered, T0 + MIN, None),
+        SessionStatus::NeedsInput,
+        "nothing is outstanding, so nothing is waiting on the user"
+    );
+}
+
+#[test]
+fn an_ordinary_tool_is_not_a_question() {
+    // The blast radius. Bash, Edit and Read all complete on their own, so an
+    // outstanding one proves nothing about the user; those keep the old
+    // treatment (Processing, then the 20-minute bound from #57). Only the two
+    // tools that cannot self-retire get the immediate claim.
+    let pending = vec!["Bash".to_string(), "Edit".to_string(), "Read".to_string()];
+    let working = Scenario {
+        name: "ordinary tools outstanding",
+        state: None,
+        last_msg_type: "assistant",
+        last_stop_reason: "tool_use",
+        last_message_ts: T0,
+        pending_tools: Box::leak(pending.into_boxed_slice()),
+    };
+    assert_eq!(
+        status_at(&working, T0 + MIN, None),
+        SessionStatus::Processing,
+        "a running command is not a question"
+    );
 }
 
 #[test]
