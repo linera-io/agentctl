@@ -122,8 +122,31 @@ pub(crate) fn dirs_home() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
 }
 
+/// Reject pids that `kill(1)` reads as something other than one process.
+///
+/// `kill 0` signals every process in the CALLER's process group — for the TUI
+/// that is claudectl and whatever terminal launched it, and `kill_process`
+/// escalates to `-9`. Zero is not a hypothetical here: a sandbox session's row
+/// is built by `ClaudeSession::from_registry_entry`, which maps an absent pid to
+/// `0` because a foreign pid belongs to another VM's namespace and the host can
+/// never learn it. Every such row is one keystroke from this call.
+///
+/// Negative targets are unreachable through `u32` but named here because they
+/// are the same class: `kill -1` means every process the user may signal.
+fn kill_target(pid: u32) -> Result<u32, String> {
+    if pid == 0 {
+        return Err(
+            "refusing to kill pid 0: that signals this process group, not a session. \
+             A sandbox session has no host pid — close its terminal instead."
+                .to_string(),
+        );
+    }
+    Ok(pid)
+}
+
 /// Kill a process by PID. Tries SIGTERM first, then SIGKILL on failure.
 pub(crate) fn kill_process(pid: u32) -> Result<(), String> {
+    let pid = kill_target(pid)?;
     let output = std::process::Command::new("kill")
         .arg(pid.to_string())
         .output()
@@ -162,4 +185,23 @@ pub(crate) fn create_aggregate_session(total_cost: f64, limit: f64, period: &str
     s.cost_usd = total_cost;
     s.model = format!("limit=${limit:.2}");
     s
+}
+
+#[cfg(test)]
+mod kill_target_tests {
+    use super::kill_target;
+
+    #[test]
+    fn pid_zero_is_refused_because_it_signals_our_own_process_group() {
+        let error = kill_target(0).expect_err("pid 0 must never reach kill(1)");
+        assert!(
+            error.contains("process group"),
+            "the message must say why, not just refuse: {error}"
+        );
+    }
+
+    #[test]
+    fn a_real_pid_passes_through() {
+        assert_eq!(kill_target(4242), Ok(4242));
+    }
 }
