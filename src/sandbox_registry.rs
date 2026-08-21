@@ -704,6 +704,16 @@ where
     })
 }
 
+/// What an empty `entries` means to [`replace_sandbox_slice_with`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmptySlice {
+    /// Keep the previous slice. For reconciles, where empty is a *measurement*
+    /// and a wrong one costs sessions that cannot be recovered from the file.
+    Freeze,
+    /// Drop the key. Only for a deliberate close, where empty is a *decision*.
+    Remove,
+}
+
 /// Reconcile one sandbox's slice (keyed by `sandbox` name) of
 /// `sandbox-sessions.json` to its current live set.
 ///
@@ -711,8 +721,19 @@ where
 /// is abrupt and fires no further hooks, so the slice freezes at its last live
 /// state on its own — exactly what `--restore-sbx-sessions` restores — and
 /// container pids say nothing about which host terminal owned anything.
-/// Empty `entries` removes the key; other sandboxes' slices are untouched.
-pub fn replace_sandbox_slice(sandbox: &str, mut entries: Vec<SessionEntry>) -> io::Result<()> {
+/// Other sandboxes' slices are untouched, and an empty `entries` freezes this
+/// one rather than deleting it: see [`EmptySlice`] for why a reconcile is never
+/// allowed to make that call.
+pub fn replace_sandbox_slice(sandbox: &str, entries: Vec<SessionEntry>) -> io::Result<()> {
+    replace_sandbox_slice_with(sandbox, entries, EmptySlice::Freeze)
+}
+
+/// [`replace_sandbox_slice`] with an explicit choice of what empty means.
+pub fn replace_sandbox_slice_with(
+    sandbox: &str,
+    mut entries: Vec<SessionEntry>,
+    on_empty: EmptySlice,
+) -> io::Result<()> {
     let path = sandbox_registry_path();
     with_lock(&path, || {
         // Never `load()` here: this write serialises the *whole* file, so a
@@ -725,6 +746,12 @@ pub fn replace_sandbox_slice(sandbox: &str, mut entries: Vec<SessionEntry>) -> i
         // sandbox at once. Backfill before the unchanged-comparison so a
         // no-op-after-backfill write is still skipped.
         if let Some(existing) = registry.sandboxes.get(sandbox) {
+            // The backfill below repairs a degraded reading's session *titles*;
+            // this repairs a fully empty one's *existence*, which the backfill
+            // cannot reach because there is no entry left to backfill into.
+            if entries.is_empty() && on_empty == EmptySlice::Freeze && !existing.is_empty() {
+                return Ok(());
+            }
             backfill_missing_identity(existing, &mut entries);
         }
         let unchanged = match (registry.sandboxes.get(sandbox), entries.is_empty()) {
@@ -766,7 +793,7 @@ pub fn forget_session(session_id: &str) -> io::Result<()> {
                 .into_iter()
                 .filter(|entry| entry.session_id != session_id)
                 .collect();
-            replace_sandbox_slice(&sandbox, remaining)
+            replace_sandbox_slice_with(&sandbox, remaining, EmptySlice::Remove)
         }
         None => update_local(|current| {
             current
@@ -1447,10 +1474,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn replace_sandbox_slice_empty_removes_the_sandbox() {
+    fn a_reconcile_that_measures_zero_never_empties_a_live_slice() {
+        let _guard = TempRegistry::new("freeze-on-empty");
+        replace_sandbox_slice("linera-agent", vec![entry("aaa", "/a")]).unwrap();
+        // A live scan can come back empty for reasons that are not "every
+        // session ended": the process table read failed, the pointer files are
+        // gone, the hook fired during teardown. Losing the slice to any of
+        // those is unrecoverable, so a measured zero must freeze, not delete.
+        replace_sandbox_slice("linera-agent", vec![]).unwrap();
+        assert_eq!(
+            ids(load().sandboxes.get("linera-agent").expect("slice kept")),
+            ["aaa"]
+        );
+    }
+
+    #[test]
+    fn a_deliberate_close_of_the_last_session_still_removes_the_sandbox() {
         let _guard = TempRegistry::new("empty");
         replace_sandbox_slice("linera-agent", vec![entry("aaa", "/a")]).unwrap();
-        replace_sandbox_slice("linera-agent", vec![]).unwrap();
+        replace_sandbox_slice_with("linera-agent", vec![], EmptySlice::Remove).unwrap();
         assert!(!load().sandboxes.contains_key("linera-agent"));
     }
 
@@ -1459,7 +1501,7 @@ pub(crate) mod tests {
         let _guard = TempRegistry::new("independent");
         replace_sandbox_slice("linera-agent", vec![entry("aaa", "/a")]).unwrap();
         replace_sandbox_slice("pm-task", vec![entry("bbb", "/b")]).unwrap();
-        replace_sandbox_slice("linera-agent", vec![]).unwrap();
+        replace_sandbox_slice_with("linera-agent", vec![], EmptySlice::Remove).unwrap();
         let registry = load();
         assert!(!registry.sandboxes.contains_key("linera-agent"));
         assert_eq!(registry.sandboxes.get("pm-task").unwrap().len(), 1);
