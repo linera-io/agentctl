@@ -744,6 +744,59 @@ pub fn replace_sandbox_slice(sandbox: &str, mut entries: Vec<SessionEntry>) -> i
     })
 }
 
+/// Every session id the registry holds, across all sandboxes.
+pub fn known_session_ids() -> std::collections::HashSet<String> {
+    load()
+        .sandboxes
+        .values()
+        .flatten()
+        .map(|entry| entry.session_id.clone())
+        .collect()
+}
+
+/// Add sessions the host can see that the registry has no record of.
+///
+/// Additive only, and that is the point. A host `ps` sweep proves a session
+/// EXISTS; it never proves one does not, because a session launched with a
+/// prompt rather than `--resume` carries no id in its argv. Every removal path
+/// in this module is driven by evidence from inside the sandbox; this one only
+/// ever adds, so it cannot participate in losing anything.
+///
+/// It closes the gap that leaves live sessions invisible: a slice is rewritten
+/// only when a hook fires inside its sandbox, so a session idle since it was
+/// resumed never triggers one, and a slice lost while it was idle stays lost.
+/// The host's process table has no such blind spot.
+///
+/// An id the registry already holds is left exactly as it is — the in-sandbox
+/// writer knows the pid and the `/rename` name, and this caller does not.
+pub fn adopt_host_visible(
+    seen: impl IntoIterator<Item = (String, SessionEntry)>,
+) -> io::Result<()> {
+    let path = sandbox_registry_path();
+    with_lock(&path, || {
+        let mut registry = try_load()?;
+        let known: std::collections::HashSet<String> = registry
+            .sandboxes
+            .values()
+            .flatten()
+            .map(|entry| entry.session_id.clone())
+            .collect();
+
+        let mut added = 0usize;
+        for (sandbox, entry) in seen {
+            if entry.session_id.is_empty() || known.contains(&entry.session_id) {
+                continue;
+            }
+            registry.sandboxes.entry(sandbox).or_default().push(entry);
+            added += 1;
+        }
+        if added == 0 {
+            return Ok(());
+        }
+        write_atomic(&path, &serialize(&registry)?)
+    })
+}
+
 /// Durably forget `session_id` from the restore registry for the current scope
 /// — the current sandbox's slice inside a sandbox, else the host-local registry.
 ///
@@ -1452,6 +1505,43 @@ pub(crate) mod tests {
         replace_sandbox_slice("linera-agent", vec![entry("aaa", "/a")]).unwrap();
         replace_sandbox_slice("linera-agent", vec![]).unwrap();
         assert!(!load().sandboxes.contains_key("linera-agent"));
+    }
+
+    #[test]
+    fn adopt_adds_a_session_the_registry_never_saw() {
+        let _guard = TempRegistry::new("adopt-new");
+        replace_sandbox_slice("sbx-a", vec![entry("aaa", "/a")]).unwrap();
+        adopt_host_visible([("sbx-a".to_string(), entry("bbb", "/b"))]).unwrap();
+        assert_eq!(ids(load().sandboxes.get("sbx-a").unwrap()), ["aaa", "bbb"]);
+    }
+
+    /// The in-sandbox writer knows the pid and the `/rename` name; a host sweep
+    /// knows neither. Overwriting would downgrade a good entry to a poorer one.
+    #[test]
+    fn adopt_never_overwrites_an_entry_the_registry_already_holds() {
+        let _guard = TempRegistry::new("adopt-existing");
+        let mut rich = entry("aaa", "/a");
+        rich.pid = Some(4242);
+        rich.name = Some("named-by-the-sandbox".to_string());
+        replace_sandbox_slice("sbx-a", vec![rich]).unwrap();
+
+        adopt_host_visible([("sbx-a".to_string(), entry("aaa", "/somewhere-else"))]).unwrap();
+
+        let slice = load().sandboxes.remove("sbx-a").unwrap();
+        assert_eq!(slice.len(), 1, "no duplicate row");
+        assert_eq!(slice[0].pid, Some(4242), "pid preserved");
+        assert_eq!(slice[0].name.as_deref(), Some("named-by-the-sandbox"));
+    }
+
+    #[test]
+    fn adopt_never_removes_anything() {
+        let _guard = TempRegistry::new("adopt-additive");
+        replace_sandbox_slice("sbx-a", vec![entry("aaa", "/a")]).unwrap();
+        replace_sandbox_slice("sbx-b", vec![entry("bbb", "/b")]).unwrap();
+        adopt_host_visible(std::iter::empty()).unwrap();
+        let registry = load();
+        assert_eq!(ids(registry.sandboxes.get("sbx-a").unwrap()), ["aaa"]);
+        assert_eq!(ids(registry.sandboxes.get("sbx-b").unwrap()), ["bbb"]);
     }
 
     #[test]
