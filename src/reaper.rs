@@ -1220,6 +1220,96 @@ fn wrapper_terminals(ps_output: &str) -> impl Iterator<Item = (&str, &str)> {
         })
 }
 
+/// Fold every host-visible session into the registry, adding only what is
+/// missing.
+///
+/// A no-op inside a sandbox, where the process table holds no `sbx exec` lines.
+pub(crate) fn adopt_host_visible_sessions() {
+    let Some(ps) = cached_host_ps() else {
+        return;
+    };
+    // Resolving a transcript costs a `read_dir` per session, and this runs on
+    // every refresh tick. Filter against what the registry already holds first
+    // so the steady state — nothing missing — costs only the cached ps parse.
+    let known = crate::sandbox_registry::known_session_ids();
+    let missing: Vec<_> = host_visible_sessions(&ps)
+        .into_iter()
+        .filter(|found| !known.contains(&found.session_id))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+
+    let projects = crate::helpers::dirs_home().join(".claude/projects");
+    let seen = missing.into_iter().map(|found| {
+        let transcript = std::fs::read_dir(&projects)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|dir| dir.path().join(format!("{}.jsonl", found.session_id)))
+            .find(|path| path.is_file())
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        let entry = crate::sandbox_registry::SessionEntry {
+            session_id: found.session_id,
+            cwd: crate::helpers::dirs_home().display().to_string(),
+            transcript,
+            host_tty: Some(found.host_tty),
+            host_terminal_id: found.host_terminal_id,
+            ..Default::default()
+        };
+        (found.sandbox, entry)
+    });
+    let _ = crate::sandbox_registry::adopt_host_visible(seen);
+}
+
+/// One `sc` session the host can see in its own process table.
+pub(crate) struct HostVisibleSession {
+    pub(crate) sandbox: String,
+    pub(crate) session_id: String,
+    pub(crate) host_tty: String,
+    pub(crate) host_terminal_id: Option<String>,
+}
+
+/// Pure parser: every resumed session the wrapper argv names, with the sandbox
+/// it belongs to.
+///
+/// This is the only view of a sandbox session that needs nothing running inside
+/// the sandbox. The registry is written by an in-sandbox hook that fires on
+/// session events, so a session that has been idle since it was resumed leaves
+/// the registry untouched for as long as it stays idle — and if its slice is
+/// lost in the meantime, nothing brings it back. The host's own process table
+/// does not have that gap.
+///
+/// Only `--resume` launches carry an id. A session started with a prompt is new,
+/// so its `SessionStart` hook has already registered it; the gap this closes is
+/// specifically the long-idle resumed session.
+pub(crate) fn host_visible_sessions(ps_output: &str) -> Vec<HostVisibleSession> {
+    wrapper_terminals(ps_output)
+        .filter_map(|(line, tty)| {
+            let mut tokens = line.split_whitespace();
+            let mut sandbox = None;
+            let mut terminal_id = None;
+            let mut session_id = None;
+            while let Some(token) = tokens.next() {
+                if let Some(value) = token.strip_prefix("SANDBOX_NAME=") {
+                    sandbox = Some(value.to_string());
+                } else if let Some(value) = token.strip_prefix("SANDBOX_HOST_TERMINAL_ID=") {
+                    terminal_id = Some(value.to_string());
+                } else if token == "--resume" {
+                    session_id = tokens.next().map(str::to_string);
+                }
+            }
+            Some(HostVisibleSession {
+                sandbox: sandbox?,
+                session_id: session_id?,
+                host_tty: tty.to_string(),
+                host_terminal_id: terminal_id,
+            })
+        })
+        .collect()
+}
+
 /// Pure parser: the set of `SANDBOX_HOST_TTY` values from
 /// `sbx exec ... <sandbox>` lines.
 ///
@@ -3518,5 +3608,38 @@ mod target_sandbox_tests {
             Some("linera-agent-9cb6"),
             "an empty override is not an override"
         );
+    }
+}
+
+#[cfg(test)]
+mod host_visible_tests {
+    use super::host_visible_sessions;
+
+    const WRAPPER: &str = "83987 82239 Mon Aug 17 09:14:13 2026 sbx exec -it -w /Users/ndr -e HOME=/Users/ndr -e SANDBOX_HOST_TTY=/dev/ttys012 -e SANDBOX_HOST_TERMINAL_ID=C3ABEA1D-6978-4D02-B4D2-F2764C0FEA4A -e LINERA_SANDBOX=1 -e SANDBOX_NAME=linera-agent-09bfb4b7c635 linera-agent-09bfb4b7c635 bash -lc exec claude --dangerously-skip-permissions --resume 09a9eba4-b654-4971-864c-7368de1b76ed";
+
+    #[test]
+    fn a_resumed_session_yields_its_sandbox_id_and_terminal() {
+        let found = host_visible_sessions(WRAPPER);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].sandbox, "linera-agent-09bfb4b7c635");
+        assert_eq!(found[0].session_id, "09a9eba4-b654-4971-864c-7368de1b76ed");
+        assert_eq!(found[0].host_tty, "/dev/ttys012");
+        assert_eq!(
+            found[0].host_terminal_id.as_deref(),
+            Some("C3ABEA1D-6978-4D02-B4D2-F2764C0FEA4A")
+        );
+    }
+
+    /// A prompt launch has no id to adopt. Yielding it with an empty id would
+    /// let a later merge invent an entry keyed on nothing.
+    #[test]
+    fn a_prompt_launch_is_skipped_rather_than_yielded_without_an_id() {
+        let line = WRAPPER.rsplit_once(" --resume ").unwrap().0;
+        assert!(host_visible_sessions(line).is_empty());
+    }
+
+    #[test]
+    fn a_line_that_is_not_the_wrapper_is_ignored() {
+        assert!(host_visible_sessions("1 2 claude --resume abc").is_empty());
     }
 }

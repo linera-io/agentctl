@@ -152,6 +152,10 @@ fn foreign_sessions(
     prev_cpu_samples: &std::collections::HashMap<String, crate::cpu::CpuSample>,
 ) -> Vec<ClaudeSession> {
     let here = crate::sandbox_registry::current_sandbox();
+    // Before reading the registry, fold in anything the host can see that the
+    // registry lost. A slice is only rewritten when a hook fires inside its
+    // sandbox, so an idle session's row never comes back on its own.
+    crate::reaper::adopt_host_visible_sessions();
     let registry = crate::sandbox_registry::load();
     let snapshot = crate::sandbox_registry::load_snapshot();
     let running = running_sandbox_filter(&snapshot);
