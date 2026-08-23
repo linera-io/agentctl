@@ -103,8 +103,8 @@ impl HookRegistry {
 
         for template in commands {
             let cmd = expand_template(template, session)
-                .replace("{old_status}", old_status)
-                .replace("{new_status}", new_status);
+                .replace("{old_status}", &shell_quote(old_status))
+                .replace("{new_status}", &shell_quote(new_status));
 
             crate::logger::log("DEBUG", &format!("hook {}: {}", event.name(), cmd));
 
@@ -147,20 +147,31 @@ impl HookRegistry {
 /// Replace template placeholders with session data.
 fn expand_template(template: &str, session: &ClaudeSession) -> String {
     template
-        .replace("{pid}", &session.pid.to_string())
-        .replace("{project}", session.display_name())
-        .replace("{status}", &session.status.to_string())
-        .replace("{cost}", &format!("{:.2}", session.cost_usd))
-        .replace("{model}", &session.model)
-        .replace("{cwd}", &session.cwd)
-        .replace("{tokens_in}", &session.total_input_tokens.to_string())
-        .replace("{tokens_out}", &session.total_output_tokens.to_string())
-        .replace("{elapsed}", &session.format_elapsed())
-        .replace("{session_id}", &session.session_id)
+        .replace("{pid}", &shell_quote(&session.pid.to_string()))
+        .replace("{project}", &shell_quote(session.display_name()))
+        .replace("{status}", &shell_quote(&session.status.to_string()))
+        .replace("{cost}", &shell_quote(&format!("{:.2}", session.cost_usd)))
+        .replace("{model}", &shell_quote(&session.model))
+        .replace("{cwd}", &shell_quote(&session.cwd))
+        .replace(
+            "{tokens_in}",
+            &shell_quote(&session.total_input_tokens.to_string()),
+        )
+        .replace(
+            "{tokens_out}",
+            &shell_quote(&session.total_output_tokens.to_string()),
+        )
+        .replace("{elapsed}", &shell_quote(&session.format_elapsed()))
+        .replace("{session_id}", &shell_quote(&session.session_id))
         .replace(
             "{context_pct}",
-            &format!("{:.0}", session.context_percent()),
+            &shell_quote(&format!("{:.0}", session.context_percent())),
         )
+}
+
+/// Quote a placeholder value for safe interpolation into a POSIX shell command.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
 }
 
 #[cfg(test)]
@@ -191,11 +202,25 @@ mod tests {
     fn test_expand_template() {
         let s = make_session();
         let result = expand_template("echo {pid} {project} ${cost}", &s);
-        assert_eq!(result, "echo 12345 my-app $3.45");
+        assert_eq!(result, "echo '12345' 'my-app' $'3.45'");
+    }
+
+    #[test]
+    fn test_shell_quote_blocks_command_injection() {
+        let mut s = make_session();
+        s.cwd = "/tmp/project; touch /tmp/should-not-run".into();
+
+        let result = expand_template("printf '%s' {cwd}", &s);
+
+        assert_eq!(
+            result,
+            "printf '%s' '/tmp/project; touch /tmp/should-not-run'"
+        );
     }
 
     #[test]
     fn test_expand_all_vars() {
+
         let s = make_session();
         let result = expand_template(
             "{pid}|{project}|{status}|{cost}|{model}|{cwd}|{tokens_in}|{tokens_out}|{session_id}",
