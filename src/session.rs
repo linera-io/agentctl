@@ -626,6 +626,9 @@ impl AgentSession {
             name_source: None,
         };
         let mut session = Self::from_raw(raw);
+        // `from_raw` stamps Claude; a registry entry knows better. Without this
+        // a restored Codex row would be resumed with `claude --resume <ULID>`.
+        session.provider = entry.provider;
         session.origin = SessionOrigin::Sandbox(sandbox.to_string());
         if !entry.transcript.is_empty() {
             session.jsonl_path = Some(PathBuf::from(&entry.transcript));

@@ -114,3 +114,81 @@ fn a_rollout_without_session_meta_is_not_a_session() {
     );
     assert!(discover_sessions(root.path()).is_empty());
 }
+
+/// `codex -C/--cd <DIR>` moves the agent's root but not the process's cwd.
+///
+/// Correlating on `/proc/<pid>/cwd` alone misses every session started that
+/// way, and misses it silently — an absent row, not a wrong one, which is the
+/// hardest kind to notice.
+#[test]
+fn the_working_root_override_is_read_from_the_command_line() {
+    use agentctl::providers::codex::working_root_override;
+
+    // All three spellings reach the same clap argument.
+    assert_eq!(
+        working_root_override("-C /work/repo"),
+        Some("/work/repo".to_string())
+    );
+    assert_eq!(
+        working_root_override("--cd /work/repo"),
+        Some("/work/repo".to_string())
+    );
+    assert_eq!(
+        working_root_override("--cd=/work/repo"),
+        Some("/work/repo".to_string())
+    );
+    assert_eq!(
+        working_root_override("-C/work/repo"),
+        Some("/work/repo".to_string())
+    );
+
+    // Present among other arguments.
+    assert_eq!(
+        working_root_override("resume abc --cd /work/repo \"do the thing\""),
+        Some("/work/repo".to_string())
+    );
+
+    // Absent, or malformed, means fall back to the process cwd.
+    assert_eq!(working_root_override(""), None);
+    assert_eq!(working_root_override("resume abc"), None);
+    assert_eq!(working_root_override("--cd"), None, "flag with no value");
+    // clap accepts the `=` form for a short flag too.
+    assert_eq!(
+        working_root_override("-C=/work/repo"),
+        Some("/work/repo".to_string())
+    );
+    assert_eq!(
+        working_root_override("--config model=o3"),
+        None,
+        "an unrelated flag is not a working root"
+    );
+}
+
+/// A registry round-trip must not turn a Codex session into a Claude one.
+///
+/// `AgentSession::from_raw` stamps Claude, so before the entry carried a
+/// provider a restored Codex row would have been resumed with
+/// `claude --resume <ULID>` — the wrong binary and the wrong id format.
+#[test]
+fn a_registry_entry_keeps_its_provider_across_a_round_trip() {
+    use agentctl::provider::AgentProvider;
+    use agentctl::sandbox_registry::SessionEntry;
+    use agentctl::session::AgentSession;
+
+    let entry = SessionEntry {
+        provider: AgentProvider::Codex,
+        session_id: "01J0THREAD".to_string(),
+        cwd: "/work/repo".to_string(),
+        pid: Some(4242),
+        ..Default::default()
+    };
+
+    let session = AgentSession::from_registry_entry("sbx-1", &entry).expect("session");
+    assert_eq!(session.provider, AgentProvider::Codex);
+
+    // And the default stays Claude, so every entry written before the field
+    // existed still means what it meant.
+    let json = r#"{"session_id":"legacy","cwd":"/w","transcript":"","started_at_ms":0}"#;
+    let legacy: SessionEntry = serde_json::from_str(json).expect("legacy entry parses");
+    assert_eq!(legacy.provider, AgentProvider::Claude);
+}
