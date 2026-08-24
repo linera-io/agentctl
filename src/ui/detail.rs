@@ -66,6 +66,7 @@ pub fn render_detail_panel(frame: &mut Frame, area: Rect, session: &AgentSession
 
     let mut lines = vec![
         detail_line("PID", &pid, t),
+        detail_line("Agent", session.provider.label(), t),
         detail_line("Session ID", &session.session_id, t),
         detail_line("CWD", &session.cwd, t),
         detail_line("Project", &session.project_name, t),

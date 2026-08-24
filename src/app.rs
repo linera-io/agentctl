@@ -2867,6 +2867,7 @@ impl App {
             session.model.clone(),
             session.cwd.clone(),
             session.session_id.clone(),
+            session.provider.label().to_string(),
         ];
 
         fields
@@ -4333,6 +4334,32 @@ mod tests {
         app.search_query = "unknown-metrics".into();
         let visible: Vec<u32> = app.visible_sessions().iter().map(|s| s.pid).collect();
         assert_eq!(visible, vec![14]);
+    }
+
+    /// Searching by product name must select on the Agent column.
+    ///
+    /// Every fixture session is Claude, so "claude" matching everything and
+    /// "codex" matching nothing is the discriminating pair: a provider field
+    /// missing from the search set would make the first return nothing.
+    #[test]
+    fn search_query_matches_the_agent_column() {
+        let mut app = make_test_app();
+        let all: usize = app.visible_sessions().len();
+        assert!(all > 0, "fixture must have sessions to discriminate");
+
+        app.search_query = "claude".into();
+        assert_eq!(
+            app.visible_sessions().len(),
+            all,
+            "every fixture session is Claude, so all must match"
+        );
+
+        app.search_query = "codex".into();
+        assert_eq!(
+            app.visible_sessions().len(),
+            0,
+            "no fixture session is Codex"
+        );
     }
 
     #[test]
