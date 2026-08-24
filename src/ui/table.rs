@@ -23,10 +23,29 @@ use super::status_bar::render_status_bar;
 /// ORIGIN is last deliberately: `sort_header_idx` below maps sort columns to
 /// header positions by hand, so inserting mid-table would silently mis-point
 /// the sort arrow.
-const HEADER_NAMES: [&str; 14] = [
-    "PID", "Name", "Project", "Status", "Context", "Cost", "$/hr", "Elapsed", "Last", "CPU%",
-    "MEM", "In/Out", "Activity", "Origin",
+const HEADER_NAMES: [&str; 15] = [
+    "PID", "Agent", "Name", "Project", "Status", "Context", "Cost", "$/hr", "Elapsed", "Last",
+    "CPU%", "MEM", "In/Out", "Activity", "Origin",
 ];
+
+/// Header position carrying the sort arrow, for a `SORT_COLUMNS` index.
+///
+/// Hand-maintained, and the reason `HEADER_NAMES` cannot be reordered casually.
+/// `sort_arrow_lands_on_the_column_it_names` asserts every arm against the
+/// header it claims, so a shifted column fails a test instead of pointing the
+/// arrow one column off.
+fn sort_header_idx(sort_column: usize) -> usize {
+    match sort_column {
+        0 => 4, // Status
+        1 => 5, // Context
+        2 => 6, // Cost
+        3 => 7, // $/hr
+        4 => 8, // Elapsed
+        5 => 9, // Last
+        6 => 2, // Name
+        _ => usize::MAX,
+    }
+}
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
@@ -148,18 +167,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     // Build header with sort indicator
     let header_names = HEADER_NAMES;
 
-    // Map sort_column index to header index:
-    // 0=Status->3, 1=Context->4, 2=Cost->5, 3=$/hr->6, 4=Elapsed->7, 5=Last->8, 6=Name->1
-    let sort_header_idx = match app.sort_column {
-        0 => 3, // Status
-        1 => 4, // Context
-        2 => 5, // Cost
-        3 => 6, // $/hr
-        4 => 7, // Elapsed
-        5 => 8, // Last
-        6 => 1, // Name
-        _ => usize::MAX,
-    };
+    let sort_header_idx = sort_header_idx(app.sort_column);
 
     let sort_arrow = if app.sort_reversed {
         '\u{25b2}' // ▲ reversed (arrow points "up" = top is the end)
@@ -267,6 +275,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     let widths = [
         Constraint::Length(7),  // PID
+        Constraint::Length(7),  // Agent (fits "Claude")
         Constraint::Min(14),    // Name (flex)
         Constraint::Min(10),    // Project (flex)
         Constraint::Length(14), // Status (wider for * indicator)
@@ -595,6 +604,7 @@ fn session_row(s: &AgentSession, app: &App) -> Row<'static> {
 
     Row::new(vec![
         Cell::from(s.pid.to_string()),
+        Cell::from(s.provider.label()),
         Cell::from(name_text),
         Cell::from(project_text),
         Cell::from(status_text).style(status_style),
@@ -666,6 +676,7 @@ fn subagent_row(
     };
 
     Row::new(vec![
+        Cell::from(""),
         Cell::from(""),
         name_cell,
         project_cell,
@@ -1150,5 +1161,50 @@ mod tests {
             Some("pricey-beta".to_string()),
             "the highlighted row and the session Tab acts on must agree"
         );
+    }
+
+    /// The sort arrow must land on the header it names, for every sort column.
+    ///
+    /// `sort_header_idx` is a hand-written index map, so adding or moving a
+    /// column silently points the arrow one place off. Asserting against the
+    /// header's NAME rather than a literal index means the map cannot rot
+    /// without failing here.
+    #[test]
+    fn sort_arrow_lands_on_the_column_it_names() {
+        for (sort_column, name) in crate::app::SORT_COLUMNS.iter().enumerate() {
+            let idx = sort_header_idx(sort_column);
+            assert!(
+                idx < HEADER_NAMES.len(),
+                "sort column {sort_column} ({name}) maps outside the header row"
+            );
+            assert_eq!(
+                HEADER_NAMES[idx], *name,
+                "sort column {sort_column} claims header {idx}, which is {:?}, not {name:?}",
+                HEADER_NAMES[idx]
+            );
+        }
+    }
+
+    /// Every sort column is reachable and none share a header slot.
+    #[test]
+    fn no_two_sort_columns_share_a_header() {
+        let mut seen = std::collections::HashSet::new();
+        for sort_column in 0..crate::app::SORT_COLUMNS.len() {
+            assert!(
+                seen.insert(sort_header_idx(sort_column)),
+                "sort column {sort_column} reuses a header slot"
+            );
+        }
+    }
+
+    #[test]
+    fn the_agent_column_sits_between_pid_and_name() {
+        assert_eq!(
+            HEADER_NAMES.iter().position(|h| *h == "Agent"),
+            Some(1),
+            "Agent belongs between PID and Name, got {HEADER_NAMES:?}"
+        );
+        assert_eq!(HEADER_NAMES[0], "PID");
+        assert_eq!(HEADER_NAMES[2], "Name");
     }
 }
