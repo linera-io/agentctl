@@ -10,6 +10,8 @@
 //! nothing and reports an empty session rather than failing, which is why the
 //! fixture is checked in beside the parser.
 
+use std::path::{Path, PathBuf};
+
 use serde::Deserialize;
 
 /// What a rollout file tells us about a session.
@@ -105,4 +107,65 @@ pub fn summarize(contents: &str) -> RolloutSummary {
     }
 
     out
+}
+
+/// Depth of the dated layout Codex writes: `sessions/YYYY/MM/DD/<file>.jsonl`.
+///
+/// Bounded rather than unlimited so a symlink loop or a stray deep tree under
+/// the sessions root cannot turn a dashboard refresh into an unbounded walk.
+const MAX_SCAN_DEPTH: usize = 4;
+
+/// Rollout files under a sessions root.
+///
+/// Only `sessions/` is scanned. `archived_sessions/` is a sibling directory, so
+/// archived threads are excluded by construction rather than by filtering — an
+/// archived session is not a live one and must not appear on the dashboard.
+///
+/// A missing root is an empty list, not an error: not having Codex installed is
+/// the common case, not a failure.
+pub fn discover_rollout_files(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    collect(root, 1, &mut found);
+    found.sort();
+    found
+}
+
+fn collect(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > MAX_SCAN_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `file_type` does not follow symlinks, so a link pointing back up the
+        // tree is never descended into.
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            collect(&path, depth + 1, out);
+        } else if kind.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
+            out.push(path);
+        }
+    }
+}
+
+/// Summarise one rollout file, or `None` if it cannot be read.
+pub fn summarize_file(path: &Path) -> Option<RolloutSummary> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let summary = summarize(&contents);
+    // A file with no `session_meta` has nothing to key a session on; rendering
+    // it would produce a row with no identity.
+    summary.thread_id.as_ref()?;
+    Some(summary)
+}
+
+/// Every readable Codex session under a sessions root.
+pub fn discover_sessions(root: &Path) -> Vec<RolloutSummary> {
+    discover_rollout_files(root)
+        .iter()
+        .filter_map(|p| summarize_file(p))
+        .collect()
 }

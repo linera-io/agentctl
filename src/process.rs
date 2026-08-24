@@ -335,6 +335,16 @@ pub struct LiveClaudeProc {
 /// *claude* process here, not merely any process (pid collisions across
 /// namespaces are common).
 pub fn live_claude_procs() -> Option<HashMap<u32, LiveClaudeProc>> {
+    live_procs_for("claude")
+}
+
+/// Snapshot every live process whose argv0 basename is exactly `exe`.
+///
+/// Generalised from [`live_claude_procs`] so a second product gets the same
+/// `ps` scoping and the same argv0 strictness. `None` when `ps` itself failed —
+/// callers must degrade to their previous liveness source, never to "no
+/// sessions".
+pub fn live_procs_for(exe: &str) -> Option<HashMap<u32, LiveClaudeProc>> {
     // `x` (not `ax`): only the invoking user's processes, tty-less included.
     // The pointer scan is scoped to $HOME, so the process-table source must
     // stay scoped to the same user — `ax` would surface other users' claude
@@ -365,7 +375,7 @@ pub fn live_claude_procs() -> Option<HashMap<u32, LiveClaudeProc>> {
             continue;
         };
         let command = fields[2..].join(" ");
-        let Some(argv0_tokens) = claude_argv0_token_count(&command) else {
+        let Some(argv0_tokens) = argv0_token_count(&command, exe) else {
             continue;
         };
         let args = command
