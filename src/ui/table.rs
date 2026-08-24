@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, SORT_COLUMNS};
-use crate::session::{ClaudeSession, SessionStatus, SubagentBreakdown, SubagentState};
+use crate::session::{AgentSession, SessionStatus, SubagentBreakdown, SubagentState};
 
 use super::detail::render_detail_panel;
 use super::help::render_help_overlay;
@@ -486,7 +486,7 @@ fn parked_separator_row(app: &App, parked_count: usize) -> Row<'static> {
     Row::new(cells)
 }
 
-fn render_rows_for_session(s: &ClaudeSession, app: &App) -> Vec<Row<'static>> {
+fn render_rows_for_session(s: &AgentSession, app: &App) -> Vec<Row<'static>> {
     let mut rows = vec![session_row(s, app)];
     let breakdown = s.subagent_breakdown();
     let total = breakdown.len();
@@ -503,7 +503,7 @@ fn render_rows_for_session(s: &ClaudeSession, app: &App) -> Vec<Row<'static>> {
     rows
 }
 
-fn session_row(s: &ClaudeSession, app: &App) -> Row<'static> {
+fn session_row(s: &AgentSession, app: &App) -> Row<'static> {
     let t = &app.theme;
     // Color escalation for NeedsInput based on wait time
     let status_style = if s.status == SessionStatus::NeedsInput {
@@ -615,7 +615,7 @@ fn session_row(s: &ClaudeSession, app: &App) -> Row<'static> {
 /// The ORIGIN cell. A foreign session is dimmed: its numbers are real but were
 /// measured at the last collector pass rather than this tick, and rendering it
 /// identically to a live local row would overstate how current it is.
-fn origin_cell(s: &ClaudeSession, app: &App) -> Cell<'static> {
+fn origin_cell(s: &AgentSession, app: &App) -> Cell<'static> {
     let t = &app.theme;
     let label = s
         .origin
@@ -631,7 +631,7 @@ fn origin_cell(s: &ClaudeSession, app: &App) -> Cell<'static> {
 }
 
 fn subagent_row(
-    parent: &ClaudeSession,
+    parent: &AgentSession,
     row: &SubagentBreakdown,
     app: &App,
     index: usize,
@@ -701,7 +701,7 @@ pub(crate) struct CellDecorations<'a> {
 /// the session has been renamed, else fall back to Project. An unnamed
 /// session's Name cell is always empty.
 pub(crate) fn build_name_and_project_text(
-    s: &ClaudeSession,
+    s: &AgentSession,
     dec: &CellDecorations<'_>,
 ) -> (String, String) {
     let conflict_prefix = if dec.file_conflict {
@@ -807,9 +807,9 @@ fn format_cost(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{ClaudeSession, RawSession};
+    use crate::session::{AgentSession, RawSession};
 
-    fn session_with(name: &str, project_cwd: &str, subagents: usize) -> ClaudeSession {
+    fn session_with(name: &str, project_cwd: &str, subagents: usize) -> AgentSession {
         let raw = RawSession {
             pid: 1,
             session_id: "s".into(),
@@ -818,7 +818,7 @@ mod tests {
             name: None,
             name_source: None,
         };
-        let mut s = ClaudeSession::from_raw(raw);
+        let mut s = AgentSession::from_raw(raw);
         s.session_name = name.into();
         s.subagent_count = subagents;
         s
@@ -982,7 +982,7 @@ mod tests {
     /// A session identified by its own uuid, with a pid that callers may
     /// deliberately duplicate — mirroring two sandboxes each numbering their
     /// processes from a low base.
-    fn sandbox_session(pid: u32, session_id: &str, name: &str, project: &str) -> ClaudeSession {
+    fn sandbox_session(pid: u32, session_id: &str, name: &str, project: &str) -> AgentSession {
         let raw = RawSession {
             pid,
             session_id: session_id.into(),
@@ -991,13 +991,13 @@ mod tests {
             name: None,
             name_source: None,
         };
-        let mut s = ClaudeSession::from_raw(raw);
+        let mut s = AgentSession::from_raw(raw);
         s.session_name = name.into();
         s.project_name = project.into();
         s
     }
 
-    fn app_with(sessions: Vec<ClaudeSession>) -> App {
+    fn app_with(sessions: Vec<AgentSession>) -> App {
         let app = App::new();
         app.replace_data(AppData {
             sessions,

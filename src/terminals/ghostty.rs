@@ -1,12 +1,12 @@
 use super::{applescript_escape, run_osascript};
-use crate::session::ClaudeSession;
+use crate::session::AgentSession;
 
 /// A session with no routing data at all cannot be matched to any Ghostty
 /// surface — fail with an actionable claudectl error instead of shipping an
 /// AppleScript guaranteed to die with an empty lookup key (seen live as
 /// `execution error: No Ghostty terminal found for  (-2700)` after a registry
 /// briefly recorded sessions without cwds).
-fn require_routing_data(session: &ClaudeSession) -> Result<(), String> {
+fn require_routing_data(session: &AgentSession) -> Result<(), String> {
     if session.terminal_id.is_none() && session.tty.is_empty() && session.cwd.is_empty() {
         return Err(format!(
             "no terminal routing data for {} (pid {}): no surface id, tty, or cwd yet — \
@@ -38,7 +38,7 @@ fn require_routing_data(session: &ClaudeSession) -> Result<(), String> {
 ///      row from the sandbox TUI cwd-guessed onto the wrong tab).
 ///   3. working directory, exact then substring, + title disambiguator — the
 ///      fallback for older Ghostty. Breaks down when multiple claudes share a CWD.
-fn find_terminal_script(session: &ClaudeSession) -> String {
+fn find_terminal_script(session: &AgentSession) -> String {
     if let Some(ref id) = session.terminal_id {
         let escaped = applescript_escape(id);
         return format!(
@@ -135,7 +135,7 @@ fn find_terminal_script(session: &ClaudeSession) -> String {
     find
 }
 
-pub fn switch(session: &ClaudeSession) -> Result<(), String> {
+pub fn switch(session: &AgentSession) -> Result<(), String> {
     require_routing_data(session)?;
     let find = find_terminal_script(session);
 
@@ -152,7 +152,7 @@ pub fn switch(session: &ClaudeSession) -> Result<(), String> {
     run_osascript(&script)
 }
 
-pub fn send_input(session: &ClaudeSession, text: &str) -> Result<(), String> {
+pub fn send_input(session: &AgentSession, text: &str) -> Result<(), String> {
     require_routing_data(session)?;
     let find = find_terminal_script(session);
 
@@ -179,7 +179,7 @@ pub fn send_input(session: &ClaudeSession, text: &str) -> Result<(), String> {
     run_osascript(&script)
 }
 
-pub fn approve(session: &ClaudeSession) -> Result<(), String> {
+pub fn approve(session: &AgentSession) -> Result<(), String> {
     require_routing_data(session)?;
     let find = find_terminal_script(session);
 
@@ -228,15 +228,10 @@ pub fn spawn_window(cwd: &str, command: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{ClaudeSession, RawSession};
+    use crate::session::{AgentSession, RawSession};
 
-    fn routed_session(
-        terminal_id: Option<&str>,
-        tty: &str,
-        cwd: &str,
-        name: &str,
-    ) -> ClaudeSession {
-        let mut session = ClaudeSession::from_raw(RawSession {
+    fn routed_session(terminal_id: Option<&str>, tty: &str, cwd: &str, name: &str) -> AgentSession {
+        let mut session = AgentSession::from_raw(RawSession {
             pid: 42,
             session_id: "sess-42".into(),
             cwd: cwd.into(),
@@ -319,7 +314,7 @@ mod tests {
         assert!(script.contains("initial working directory:\"/work/a\\\"b\""));
     }
 
-    fn make_session(cwd: &str, name: &str) -> ClaudeSession {
+    fn make_session(cwd: &str, name: &str) -> AgentSession {
         let raw = RawSession {
             pid: 100,
             session_id: "test".into(),
@@ -328,7 +323,7 @@ mod tests {
             name: None,
             name_source: None,
         };
-        let mut s = ClaudeSession::from_raw(raw);
+        let mut s = AgentSession::from_raw(raw);
         s.session_name = name.into();
         s
     }

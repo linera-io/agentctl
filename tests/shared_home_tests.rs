@@ -516,3 +516,36 @@ fn every_provider_in_the_table_is_handled_without_a_special_case() {
         }
     }
 }
+
+/// Two provider lists that can disagree are the bug this catches.
+///
+/// `AgentProvider` and `shared_home::PROVIDERS` name the same two products for
+/// different jobs — running sessions, and rendering adapters. Nothing in the
+/// type system ties them together, so a product whose home or transcript
+/// directory drifts between the two would surface as adapters written to one
+/// place and sessions read from another. It lives here rather than beside
+/// either one because only an integration test links both.
+#[test]
+fn every_agent_provider_agrees_with_the_shared_home_table() {
+    use agentctl::provider::AgentProvider;
+    use agentctl::shared_home::PROVIDERS;
+
+    for provider in AgentProvider::all() {
+        let row = PROVIDERS
+            .iter()
+            .find(|row| row.home_dir == provider.home_dir())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: no shared_home row for {}",
+                    provider.label(),
+                    provider.home_dir()
+                )
+            });
+        assert_eq!(
+            row.transcripts,
+            Some(provider.transcript_root()),
+            "{}: transcript root disagrees with the shared_home table",
+            provider.label()
+        );
+    }
+}

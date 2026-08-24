@@ -249,7 +249,7 @@ pub(super) fn local_hour_from_epoch(epoch_secs: i64) -> u8 {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Build a JSON snapshot of session state for embedding in a JSONL record.
-fn snapshot_context(session: &crate::session::ClaudeSession) -> serde_json::Value {
+fn snapshot_context(session: &crate::session::AgentSession) -> serde_json::Value {
     let context_pct = if session.context_max > 0 {
         ((session.context_tokens as f64 / session.context_max as f64) * 100.0) as u8
     } else {
@@ -287,7 +287,7 @@ pub fn log_decision(
     command: Option<&str>,
     suggestion: &BrainSuggestion,
     user_action: &str,
-    session: Option<&crate::session::ClaudeSession>,
+    session: Option<&crate::session::AgentSession>,
     decision_type: DecisionType,
 ) {
     let mut record = serde_json::json!({
@@ -335,7 +335,7 @@ pub fn log_observation(
     tool: Option<&str>,
     command: Option<&str>,
     observed_action: &str, // "user_approve", "user_input", "rule_approve", "rule_deny", etc.
-    session: Option<&crate::session::ClaudeSession>,
+    session: Option<&crate::session::AgentSession>,
 ) {
     let mut record = serde_json::json!({
         "ts": timestamp_now(),
@@ -781,7 +781,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_context_fields() {
-        use crate::session::{ClaudeSession, SessionStatus};
+        use crate::session::{AgentSession, SessionStatus};
         use std::collections::HashMap;
         use std::time::Duration;
 
@@ -792,7 +792,8 @@ mod tests {
         let mut files = HashMap::new();
         files.insert("src/main.rs".to_string(), 2u32);
 
-        let session = ClaudeSession {
+        let session = AgentSession {
+            provider: crate::provider::AgentProvider::Claude,
             has_child_process: None,
             child_observed_at_ms: 0,
             pid: 42,

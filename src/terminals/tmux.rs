@@ -1,4 +1,4 @@
-use crate::session::ClaudeSession;
+use crate::session::AgentSession;
 
 /// Open a new tmux window running `command` in `cwd`, in the current session
 /// (restore runs inside tmux — `detect_terminal` returns `Tmux` only when
@@ -39,7 +39,7 @@ pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<S
     }
 }
 
-pub fn switch(session: &ClaudeSession) -> Result<(), String> {
+pub fn switch(session: &AgentSession) -> Result<(), String> {
     // tmux can list panes with their TTY: `tmux list-panes -a -F '#{pane_tty} #{session_name}:#{window_index}.#{pane_index}'`
     let output = std::process::Command::new("tmux")
         .args([
@@ -71,7 +71,7 @@ pub fn switch(session: &ClaudeSession) -> Result<(), String> {
     Err(format!("TTY {} not found in tmux panes", session.tty))
 }
 
-pub fn send_input(session: &ClaudeSession, text: &str) -> Result<(), String> {
+pub fn send_input(session: &AgentSession, text: &str) -> Result<(), String> {
     let output = std::process::Command::new("tmux")
         .args([
             "list-panes",

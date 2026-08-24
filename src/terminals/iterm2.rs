@@ -1,5 +1,5 @@
 use super::{applescript_cd_exec, run_osascript};
-use crate::session::ClaudeSession;
+use crate::session::AgentSession;
 
 /// Open a new iTerm2 window that runs `command` in `cwd`. `create window with
 /// default profile` opens a window with a login shell; we then `write text` the
@@ -22,7 +22,7 @@ fn new_window_script(cwd: &str, command: &str) -> String {
     )
 }
 
-pub fn switch(session: &ClaudeSession) -> Result<(), String> {
+pub fn switch(session: &AgentSession) -> Result<(), String> {
     let script = format!(
         r#"
         tell application "iTerm2"

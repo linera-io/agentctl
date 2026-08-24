@@ -176,9 +176,11 @@ impl SessionOrigin {
 }
 
 #[derive(Debug, Clone)]
-pub struct ClaudeSession {
+pub struct AgentSession {
     pub pid: u32,
     pub session_id: String,
+    /// Which agent product this session belongs to.
+    pub provider: crate::provider::AgentProvider,
     /// Which machine/VM this session runs in. See [`SessionOrigin`].
     pub origin: SessionOrigin,
     pub cwd: String,
@@ -436,7 +438,7 @@ impl SubagentBreakdown {
     }
 }
 
-impl ClaudeSession {
+impl AgentSession {
     pub fn from_raw(raw: RawSession) -> Self {
         let project_name = raw.cwd.rsplit('/').next().unwrap_or("unknown").to_string();
         let session_name = raw.title().unwrap_or_default();
@@ -451,6 +453,9 @@ impl ClaudeSession {
         Self {
             pid: raw.pid,
             session_id: raw.session_id,
+            // Discovery only finds Claude today; Codex process discovery sets
+            // this from the `ps` row rather than assuming.
+            provider: crate::provider::AgentProvider::Claude,
             // Everything reaching `from_raw` came from this VM's own sidecars
             // or process table, so it is by construction local. Foreign
             // sessions are built by `from_registry_entry` instead, which
@@ -877,6 +882,9 @@ impl ClaudeSession {
             // Without these a consumer can only address a session by pid,
             // which means nothing outside the VM that produced it.
             "session_id": self.session_id,
+            // Which product the row came from: a consumer resuming it needs to
+            // know whether to invoke claude or codex.
+            "provider": self.provider.label(),
             "cwd": self.cwd,
             "session_name": self.session_name,
             "started_at": self.started_at,
@@ -1058,7 +1066,7 @@ mod origin_tests {
 
     #[test]
     fn registry_entry_rebuilds_identity_and_marks_the_origin_foreign() {
-        let session = ClaudeSession::from_registry_entry(
+        let session = AgentSession::from_registry_entry(
             "linera-agent-251d",
             &registry_entry("abc-123", Some("fix-scylla-disk")),
         )
@@ -1079,14 +1087,14 @@ mod origin_tests {
     #[test]
     fn registry_entry_without_an_id_is_dropped() {
         assert!(
-            ClaudeSession::from_registry_entry("sbx", &registry_entry("", Some("nameless")))
+            AgentSession::from_registry_entry("sbx", &registry_entry("", Some("nameless")))
                 .is_none()
         );
     }
 
     #[test]
     fn an_unnamed_entry_still_renders_under_its_project() {
-        let session = ClaudeSession::from_registry_entry("sbx", &registry_entry("abc-123", None))
+        let session = AgentSession::from_registry_entry("sbx", &registry_entry("abc-123", None))
             .expect("an unnamed session is still identifiable");
         assert_eq!(session.session_name, "");
         assert_eq!(session.display_name(), "linera-infra");
@@ -1100,7 +1108,7 @@ mod origin_tests {
         // `monitor::update_tokens`.
         let mut entry = registry_entry("abc-123", Some("named"));
         entry.transcript = "/Users/ndr/.claude/projects/-Users-ndr/abc-123.jsonl".to_string();
-        let session = ClaudeSession::from_registry_entry("sbx", &entry).expect("well-formed entry");
+        let session = AgentSession::from_registry_entry("sbx", &entry).expect("well-formed entry");
         assert_eq!(
             session.jsonl_path.as_deref(),
             Some(Path::new(
@@ -1113,7 +1121,7 @@ mod origin_tests {
     fn an_entry_without_a_transcript_leaves_the_path_for_discovery_to_resolve() {
         // `do_refresh_io` falls back to `resolve_jsonl_paths` when this is
         // None; inventing a path here would defeat that.
-        let session = ClaudeSession::from_registry_entry("sbx", &registry_entry("abc-123", None))
+        let session = AgentSession::from_registry_entry("sbx", &registry_entry("abc-123", None))
             .expect("well-formed entry");
         assert!(session.jsonl_path.is_none());
     }
@@ -1128,7 +1136,7 @@ mod origin_tests {
         entry.host_terminal_id = Some("8161D3F2-17C1-40CA-814F-4D714DB8F7BC".to_string());
         entry.host_tty = Some("/dev/ttys031".to_string());
 
-        let session = ClaudeSession::from_registry_entry("sbx", &entry).expect("well-formed entry");
+        let session = AgentSession::from_registry_entry("sbx", &entry).expect("well-formed entry");
         assert_eq!(
             session.terminal_id.as_deref(),
             Some("8161D3F2-17C1-40CA-814F-4D714DB8F7BC")
@@ -1141,7 +1149,7 @@ mod origin_tests {
     /// fabricated one would match the wrong surface (or none).
     #[test]
     fn registry_entry_without_routing_leaves_the_session_unrouted() {
-        let session = ClaudeSession::from_registry_entry("sbx", &registry_entry("abc-123", None))
+        let session = AgentSession::from_registry_entry("sbx", &registry_entry("abc-123", None))
             .expect("well-formed entry");
         assert!(session.terminal_id.is_none());
         assert!(session.tty.is_empty());
@@ -1151,7 +1159,7 @@ mod origin_tests {
     fn registry_entry_does_not_fabricate_metrics() {
         // The registry carries identity only. A zero cost rendered as a real
         // measurement would be worse than a blank cell.
-        let session = ClaudeSession::from_registry_entry("sbx", &registry_entry("abc-123", None))
+        let session = AgentSession::from_registry_entry("sbx", &registry_entry("abc-123", None))
             .expect("well-formed entry");
         assert!(!session.usage_metrics_available);
         assert_eq!(session.cost_usd, 0.0);
@@ -1183,7 +1191,7 @@ mod origin_tests {
 
     #[test]
     fn locally_discovered_sessions_are_local() {
-        let session = ClaudeSession::from_raw(RawSession {
+        let session = AgentSession::from_raw(RawSession {
             pid: 1,
             session_id: "local-1".into(),
             cwd: "/tmp".into(),
@@ -1200,8 +1208,8 @@ mod origin_tests {
 mod tests {
     use super::*;
 
-    fn make_session() -> ClaudeSession {
-        ClaudeSession::from_raw(RawSession {
+    fn make_session() -> AgentSession {
+        AgentSession::from_raw(RawSession {
             pid: 1,
             session_id: "session-1".into(),
             cwd: "/tmp/project".into(),
@@ -1224,7 +1232,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(raw.name_source.as_deref(), Some("derived"));
-        assert!(ClaudeSession::from_raw(raw).session_name.is_empty());
+        assert!(AgentSession::from_raw(raw).session_name.is_empty());
     }
 
     #[test]
@@ -1237,7 +1245,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            ClaudeSession::from_raw(raw).session_name,
+            AgentSession::from_raw(raw).session_name,
             "detect-bad-slow-validators"
         );
     }
@@ -1251,7 +1259,7 @@ mod tests {
                 "name":"my-title","nameSource":"custom"}"#,
         )
         .unwrap();
-        assert_eq!(ClaudeSession::from_raw(raw).session_name, "my-title");
+        assert_eq!(AgentSession::from_raw(raw).session_name, "my-title");
     }
 
     #[test]

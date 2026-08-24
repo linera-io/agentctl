@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::session::{ClaudeSession, RawSession, SessionStatus, TelemetryStatus, ToolStats};
+use crate::session::{AgentSession, RawSession, SessionStatus, TelemetryStatus, ToolStats};
 
 /// Fake project definitions for demo mode.
 const PROJECTS: &[(&str, &str, &str)] = &[
@@ -125,7 +125,7 @@ const PENDING_TOOLS: &[(&str, &str)] = &[
 ];
 
 /// Generate deterministic fake sessions for demo mode.
-pub fn generate_sessions(tick: u32) -> Vec<ClaudeSession> {
+pub fn generate_sessions(tick: u32) -> Vec<AgentSession> {
     let base_pid = 10000u32;
 
     PROJECTS
@@ -141,7 +141,7 @@ pub fn generate_sessions(tick: u32) -> Vec<ClaudeSession> {
                 name: None,
                 name_source: None,
             };
-            let mut s = ClaudeSession::from_raw(raw);
+            let mut s = AgentSession::from_raw(raw);
             s.project_name = name.to_string();
             s.model = model.to_string();
             s.telemetry_status = TelemetryStatus::Available;

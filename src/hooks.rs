@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-use crate::session::ClaudeSession;
+use crate::session::AgentSession;
 
 /// Event types that can trigger hooks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,7 +69,7 @@ impl HookRegistry {
     }
 
     /// Fire all hooks for an event with session context.
-    pub fn fire(&self, event: HookEvent, session: &ClaudeSession) {
+    pub fn fire(&self, event: HookEvent, session: &AgentSession) {
         let Some(commands) = self.hooks.get(&event) else {
             return;
         };
@@ -93,7 +93,7 @@ impl HookRegistry {
     pub fn fire_with_status(
         &self,
         event: HookEvent,
-        session: &ClaudeSession,
+        session: &AgentSession,
         old_status: &str,
         new_status: &str,
     ) {
@@ -148,7 +148,7 @@ impl HookRegistry {
 }
 
 /// Replace template placeholders with session data.
-fn expand_template(template: &str, session: &ClaudeSession) -> String {
+fn expand_template(template: &str, session: &AgentSession) -> String {
     template
         .replace("{pid}", &session.pid.to_string())
         .replace("{project}", session.display_name())
@@ -169,9 +169,9 @@ fn expand_template(template: &str, session: &ClaudeSession) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{ClaudeSession, RawSession, TelemetryStatus};
+    use crate::session::{AgentSession, RawSession, TelemetryStatus};
 
-    fn make_session() -> ClaudeSession {
+    fn make_session() -> AgentSession {
         let raw = RawSession {
             pid: 12345,
             session_id: "abc-def-123".into(),
@@ -180,7 +180,7 @@ mod tests {
             name: None,
             name_source: None,
         };
-        let mut s = ClaudeSession::from_raw(raw);
+        let mut s = AgentSession::from_raw(raw);
         s.model = "opus-4.6".into();
         s.cost_usd = 3.45;
         s.total_input_tokens = 500_000;

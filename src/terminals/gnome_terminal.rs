@@ -1,4 +1,4 @@
-use crate::session::ClaudeSession;
+use crate::session::AgentSession;
 
 /// Open a new GNOME Terminal window running `command` in `cwd`, via a login
 /// shell so PATH resolves `claude`/`sc`. `cwd` and `command` are passed as argv
@@ -48,21 +48,21 @@ pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<S
     }
 }
 
-pub fn switch(_session: &ClaudeSession) -> Result<(), String> {
+pub fn switch(_session: &AgentSession) -> Result<(), String> {
     Err(
         "GNOME Terminal launch is supported, but remote focus/input control is not yet reliable. Use tmux or Kitty for session switching and input automation."
             .into(),
     )
 }
 
-pub fn send_input(_session: &ClaudeSession, _text: &str) -> Result<(), String> {
+pub fn send_input(_session: &AgentSession, _text: &str) -> Result<(), String> {
     Err(
         "GNOME Terminal launch is supported, but remote focus/input control is not yet reliable. Use tmux or Kitty for session input automation."
             .into(),
     )
 }
 
-pub fn approve(_session: &ClaudeSession) -> Result<(), String> {
+pub fn approve(_session: &AgentSession) -> Result<(), String> {
     Err(
         "GNOME Terminal launch is supported, but remote focus/input control is not yet reliable. Use tmux or Kitty for approval automation."
             .into(),

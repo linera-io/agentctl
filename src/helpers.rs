@@ -1,8 +1,8 @@
-use crate::session::ClaudeSession;
+use crate::session::AgentSession;
 
 /// Fire a webhook POST with session status change payload.
 /// Runs in a background thread to avoid blocking the TUI loop.
-pub(crate) fn fire_webhook(url: &str, session: &ClaudeSession, old_status: String) {
+pub(crate) fn fire_webhook(url: &str, session: &AgentSession, old_status: String) {
     let payload = serde_json::json!({
         "event": "status_change",
         "session": {
@@ -130,7 +130,7 @@ pub(crate) fn dirs_home() -> std::path::PathBuf {
 /// `kill 0` signals every process in the CALLER's process group — for the TUI
 /// that is agentctl and whatever terminal launched it, and `kill_process`
 /// escalates to `-9`. Zero is not a hypothetical here: a sandbox session's row
-/// is built by `ClaudeSession::from_registry_entry`, which maps an absent pid to
+/// is built by `AgentSession::from_registry_entry`, which maps an absent pid to
 /// `0` because a foreign pid belongs to another VM's namespace and the host can
 /// never learn it. Every such row is one keystroke from this call.
 ///
@@ -173,7 +173,7 @@ pub(crate) fn kill_process(pid: u32) -> Result<(), String> {
 
 /// Create a synthetic session for aggregate budget hook firing.
 /// Uses {project} = "daily"/"weekly", {cost} = total spend.
-pub(crate) fn create_aggregate_session(total_cost: f64, limit: f64, period: &str) -> ClaudeSession {
+pub(crate) fn create_aggregate_session(total_cost: f64, limit: f64, period: &str) -> AgentSession {
     use crate::session::RawSession;
     let raw = RawSession {
         pid: 0,
@@ -183,7 +183,7 @@ pub(crate) fn create_aggregate_session(total_cost: f64, limit: f64, period: &str
         name: None,
         name_source: None,
     };
-    let mut s = ClaudeSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     s.project_name = format!("{period}-budget");
     s.cost_usd = total_cost;
     s.model = format!("limit=${limit:.2}");

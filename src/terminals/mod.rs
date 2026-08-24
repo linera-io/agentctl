@@ -9,7 +9,7 @@ mod warp;
 mod wezterm;
 mod windows_terminal;
 
-use crate::session::{ClaudeSession, HostTerminalTarget};
+use crate::session::{AgentSession, HostTerminalTarget};
 use sandbox_terminal_bridge::{BridgeError, BridgeTarget, BridgeTerminal, BridgeVerb};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1337,7 +1337,7 @@ fn spawn_window_supported(terminal: &Terminal) -> bool {
     }
 }
 
-pub fn switch_to_terminal(session: &ClaudeSession) -> Result<(), String> {
+pub fn switch_to_terminal(session: &AgentSession) -> Result<(), String> {
     // In-sandbox + Linux host terminal: route through sandbox-terminal-bridge
     // because the host terminal's CLI / unix socket is not reachable from
     // inside the microVM. macOS hosts continue to fall through to the
@@ -1406,7 +1406,7 @@ pub fn switch_to_terminal(session: &ClaudeSession) -> Result<(), String> {
     }
 }
 
-pub fn send_input(session: &ClaudeSession, text: &str) -> Result<(), String> {
+pub fn send_input(session: &AgentSession, text: &str) -> Result<(), String> {
     if let Some(SandboxHostBridge::Terminal(t)) = sandbox_host_bridge() {
         return dispatch_terminal_bridge(
             t,
@@ -1443,7 +1443,7 @@ pub fn send_input(session: &ClaudeSession, text: &str) -> Result<(), String> {
     }
 }
 
-pub fn approve_session(session: &ClaudeSession) -> Result<(), String> {
+pub fn approve_session(session: &AgentSession) -> Result<(), String> {
     if let Some(SandboxHostBridge::Terminal(t)) = sandbox_host_bridge() {
         // "Approve" = press Enter. The bridge spec defines both "Enter" and
         // "Return" as accepted key names; we use "Enter" to match the
@@ -1610,7 +1610,7 @@ fn sandbox_host_bridge() -> Option<SandboxHostBridge> {
 /// wrappers. Returns Err with a user-facing message otherwise.
 fn bridge_target_for(
     terminal: BridgeTerminal,
-    session: &ClaudeSession,
+    session: &AgentSession,
 ) -> Result<BridgeTarget, String> {
     let target = session.host_terminal_target.as_ref().ok_or_else(|| {
         format!(
@@ -1659,7 +1659,7 @@ fn bridge_target_for(
 /// `Result<(), String>` shape the rest of the terminal API uses.
 fn dispatch_terminal_bridge(
     terminal: BridgeTerminal,
-    session: &ClaudeSession,
+    session: &AgentSession,
     verb: BridgeVerb,
 ) -> Result<(), String> {
     let target = bridge_target_for(terminal, session)?;

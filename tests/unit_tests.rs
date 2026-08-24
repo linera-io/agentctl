@@ -24,7 +24,7 @@ fn test_session_status_display() {
 
 #[test]
 fn test_session_from_raw() {
-    use agentctl::session::{ClaudeSession, RawSession};
+    use agentctl::session::{AgentSession, RawSession};
     let raw = RawSession {
         pid: 12345,
         session_id: "abc-123".to_string(),
@@ -33,7 +33,7 @@ fn test_session_from_raw() {
         name: None,
         name_source: None,
     };
-    let session = ClaudeSession::from_raw(raw);
+    let session = AgentSession::from_raw(raw);
     assert_eq!(session.pid, 12345);
     assert_eq!(session.project_name, "my-app");
     assert_eq!(session.display_name(), "my-app");
@@ -41,7 +41,7 @@ fn test_session_from_raw() {
 
 #[test]
 fn test_session_display_name_prefers_session_name() {
-    use agentctl::session::{ClaudeSession, RawSession};
+    use agentctl::session::{AgentSession, RawSession};
     let raw = RawSession {
         pid: 1,
         session_id: "x".to_string(),
@@ -50,14 +50,14 @@ fn test_session_display_name_prefers_session_name() {
         name: None,
         name_source: None,
     };
-    let mut session = ClaudeSession::from_raw(raw);
+    let mut session = AgentSession::from_raw(raw);
     session.session_name = "my-custom-name".to_string();
     assert_eq!(session.display_name(), "my-custom-name");
 }
 
 #[test]
 fn test_format_elapsed() {
-    use agentctl::session::{ClaudeSession, RawSession};
+    use agentctl::session::{AgentSession, RawSession};
     let raw = RawSession {
         pid: 1,
         session_id: "x".to_string(),
@@ -66,7 +66,7 @@ fn test_format_elapsed() {
         name: None,
         name_source: None,
     };
-    let mut session = ClaudeSession::from_raw(raw);
+    let mut session = AgentSession::from_raw(raw);
     session.elapsed = Duration::from_secs(3661);
     assert_eq!(session.format_elapsed(), "01:01:01");
 
@@ -76,7 +76,7 @@ fn test_format_elapsed() {
 
 #[test]
 fn test_format_tokens() {
-    use agentctl::session::{ClaudeSession, RawSession, TelemetryStatus};
+    use agentctl::session::{AgentSession, RawSession, TelemetryStatus};
     let raw = RawSession {
         pid: 1,
         session_id: "x".to_string(),
@@ -85,7 +85,7 @@ fn test_format_tokens() {
         name: None,
         name_source: None,
     };
-    let mut session = ClaudeSession::from_raw(raw);
+    let mut session = AgentSession::from_raw(raw);
 
     assert_eq!(session.format_tokens(), "n/a");
 
@@ -98,7 +98,7 @@ fn test_format_tokens() {
 
 #[test]
 fn test_format_cost() {
-    use agentctl::session::{ClaudeSession, RawSession, TelemetryStatus};
+    use agentctl::session::{AgentSession, RawSession, TelemetryStatus};
     let raw = RawSession {
         pid: 1,
         session_id: "x".to_string(),
@@ -107,7 +107,7 @@ fn test_format_cost() {
         name: None,
         name_source: None,
     };
-    let mut session = ClaudeSession::from_raw(raw);
+    let mut session = AgentSession::from_raw(raw);
 
     assert_eq!(session.format_cost(), "n/a");
 
@@ -122,7 +122,7 @@ fn test_format_cost() {
 
 #[test]
 fn test_cwd_to_project_name() {
-    use agentctl::session::{ClaudeSession, RawSession};
+    use agentctl::session::{AgentSession, RawSession};
     let cases = vec![
         ("/Users/foo/bar/my-project", "my-project"),
         ("/tmp", "tmp"),
@@ -137,14 +137,14 @@ fn test_cwd_to_project_name() {
             name: None,
             name_source: None,
         };
-        let session = ClaudeSession::from_raw(raw);
+        let session = AgentSession::from_raw(raw);
         assert_eq!(session.project_name, expected, "cwd={cwd}");
     }
 }
 
 #[test]
 fn test_session_name_from_raw_name_field() {
-    use agentctl::session::{ClaudeSession, RawSession};
+    use agentctl::session::{AgentSession, RawSession};
     // When the session JSON has a `name` field (e.g. from Claude Code's
     // `/rename` slash command or topic auto-naming), it should become the
     // session's display name.
@@ -156,7 +156,7 @@ fn test_session_name_from_raw_name_field() {
         name: Some("fix-validator-oom".into()),
         name_source: None,
     };
-    let s = ClaudeSession::from_raw(raw);
+    let s = AgentSession::from_raw(raw);
     assert_eq!(s.session_name, "fix-validator-oom");
     assert_eq!(s.display_name(), "fix-validator-oom");
     // Cwd-derived project_name still computed as a fallback.
@@ -165,7 +165,7 @@ fn test_session_name_from_raw_name_field() {
 
 #[test]
 fn test_display_name_falls_back_to_cwd_when_name_absent() {
-    use agentctl::session::{ClaudeSession, RawSession};
+    use agentctl::session::{AgentSession, RawSession};
     let raw = RawSession {
         pid: 1,
         session_id: "abcd-efgh".into(),
@@ -174,7 +174,7 @@ fn test_display_name_falls_back_to_cwd_when_name_absent() {
         name: None,
         name_source: None,
     };
-    let s = ClaudeSession::from_raw(raw);
+    let s = AgentSession::from_raw(raw);
     assert_eq!(s.session_name, "");
     assert_eq!(s.display_name(), "linera-protocol");
 }

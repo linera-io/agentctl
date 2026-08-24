@@ -1,4 +1,4 @@
-use crate::session::ClaudeSession;
+use crate::session::AgentSession;
 
 /// Open a new WezTerm window running `command` in `cwd`, via a login shell so
 /// PATH resolves `claude`/`sc`. `--new-window` gives one window per session
@@ -50,7 +50,7 @@ pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<S
     }
 }
 
-pub fn switch(session: &ClaudeSession) -> Result<(), String> {
+pub fn switch(session: &AgentSession) -> Result<(), String> {
     // WezTerm has `wezterm cli list` and `wezterm cli activate-pane`.
     // `wezterm cli list --format json` shows all panes with their cwd and tty.
     let output = std::process::Command::new("wezterm")

@@ -29,7 +29,7 @@ fn history_path() -> PathBuf {
 }
 
 /// Append a session record to the history CSV.
-pub fn record_session(session: &crate::session::ClaudeSession) {
+pub fn record_session(session: &crate::session::AgentSession) {
     let dir = history_dir();
     if fs::create_dir_all(&dir).is_err() {
         return;
