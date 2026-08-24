@@ -14,15 +14,23 @@ fn launch_title(cwd: &str, resume: Option<&str>) -> String {
     format!("claude: {project}")
 }
 
-fn build_wsl_command(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> String {
+fn build_wsl_command(
+    provider: crate::provider::AgentProvider,
+    cwd: &str,
+    prompt: Option<&str>,
+    resume: Option<&str>,
+) -> String {
+    let exe = crate::providers::for_provider(provider)
+        .map(|adapter| adapter.executable())
+        .unwrap_or_default();
     let mut parts = vec![
         format!("cd {}", super::shell_escape(cwd)),
         "&&".to_string(),
         "exec".to_string(),
-        "claude".to_string(),
+        exe.to_string(),
     ];
     parts.extend(
-        super::build_claude_args(prompt, resume)
+        super::build_agent_args(provider, prompt, resume)
             .into_iter()
             .map(|arg| super::shell_escape(&arg)),
     );
@@ -30,6 +38,7 @@ fn build_wsl_command(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> S
 }
 
 fn build_cmd_args(
+    provider: crate::provider::AgentProvider,
     cwd: &str,
     prompt: Option<&str>,
     resume: Option<&str>,
@@ -53,14 +62,25 @@ fn build_cmd_args(
 
     args.push("bash".to_string());
     args.push("-lc".to_string());
-    args.push(build_wsl_command(cwd, prompt, resume));
+    args.push(build_wsl_command(provider, cwd, prompt, resume));
     args
 }
 
-pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<String, String> {
+pub fn launch(
+    provider: crate::provider::AgentProvider,
+    cwd: &str,
+    prompt: Option<&str>,
+    resume: Option<&str>,
+) -> Result<String, String> {
     let distro = std::env::var("WSL_DISTRO_NAME").ok();
     let output = std::process::Command::new("cmd.exe")
-        .args(build_cmd_args(cwd, prompt, resume, distro.as_deref()))
+        .args(build_cmd_args(
+            provider,
+            cwd,
+            prompt,
+            resume,
+            distro.as_deref(),
+        ))
         .output()
         .map_err(|e| format!("cmd.exe /c wt.exe new-tab failed: {e}"))?;
 
@@ -82,7 +102,12 @@ mod tests {
 
     #[test]
     fn build_wsl_command_shell_escapes_cwd_and_args() {
-        let command = build_wsl_command("/tmp/ship it", Some("say 'hi'"), Some("session-7"));
+        let command = build_wsl_command(
+            crate::provider::AgentProvider::Claude,
+            "/tmp/ship it",
+            Some("say 'hi'"),
+            Some("session-7"),
+        );
 
         assert_eq!(
             command,
@@ -92,7 +117,13 @@ mod tests {
 
     #[test]
     fn build_cmd_args_targets_current_window_and_distro() {
-        let args = build_cmd_args("/work/repo", None, None, Some("Ubuntu"));
+        let args = build_cmd_args(
+            crate::provider::AgentProvider::Claude,
+            "/work/repo",
+            None,
+            None,
+            Some("Ubuntu"),
+        );
 
         assert_eq!(
             args,

@@ -24,8 +24,13 @@ fn spawn_argv(cwd: &str, command: &str) -> Vec<String> {
         .to_vec()
 }
 
-pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<String, String> {
-    let command = super::build_claude_command(prompt, resume);
+pub fn launch(
+    provider: crate::provider::AgentProvider,
+    cwd: &str,
+    prompt: Option<&str>,
+    resume: Option<&str>,
+) -> Result<String, String> {
+    let command = super::build_agent_command(provider, prompt, resume);
 
     let output = std::process::Command::new("tmux")
         .args(["new-window", "-c", cwd, &command])

@@ -237,7 +237,12 @@ pub fn execute(result: &RuleMatch, session: &AgentSession) -> Result<String, Str
         RuleAction::Spawn {
             ref prompt,
             ref cwd,
-        } => match terminals::launch_session(cwd, Some(prompt), None) {
+        } => match terminals::launch_session(
+            crate::provider::AgentProvider::Claude,
+            cwd,
+            Some(prompt),
+            None,
+        ) {
             Ok(msg) => Ok(format!(
                 "Rule '{}': spawned new session for {} — {msg}",
                 result.rule_name, name

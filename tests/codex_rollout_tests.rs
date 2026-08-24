@@ -145,3 +145,33 @@ fn the_two_products_never_claim_each_others_processes() {
     assert!(claude.matches_process("claude") && !codex.matches_process("claude"));
     assert!(codex.matches_process("codex") && !claude.matches_process("codex"));
 }
+
+/// The two products' launch invocations must not be interchangeable.
+///
+/// Claude takes `--resume <id>` and `-p <prompt>`; Codex takes `resume` as a
+/// subcommand with both id and prompt POSITIONAL. Verified against
+/// `codex --help` and `codex resume --help` on codex-cli 0.148.0. Emitting one
+/// product's shape for the other produces a command that looks plausible and
+/// fails, or worse, reads the prompt as a session id.
+#[test]
+fn each_product_emits_its_own_launch_shape() {
+    let claude = for_provider(AgentProvider::Claude).expect("Claude adapter");
+    let codex = for_provider(AgentProvider::Codex).expect("Codex adapter");
+
+    assert_eq!(
+        claude.launch_args(Some("ship it"), Some("id-1")),
+        vec!["--resume", "id-1", "-p", "ship it"]
+    );
+    assert_eq!(
+        codex.launch_args(Some("ship it"), Some("id-1")),
+        vec!["resume", "id-1", "ship it"],
+        "codex resume <SESSION_ID> <PROMPT>, all positional"
+    );
+
+    // A bare prompt: Claude flags it, Codex passes it positionally.
+    assert_eq!(claude.launch_args(Some("hi"), None), vec!["-p", "hi"]);
+    assert_eq!(codex.launch_args(Some("hi"), None), vec!["hi"]);
+
+    assert!(claude.launch_args(None, None).is_empty());
+    assert!(codex.launch_args(None, None).is_empty());
+}

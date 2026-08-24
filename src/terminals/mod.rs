@@ -9,6 +9,7 @@ mod warp;
 mod wezterm;
 mod windows_terminal;
 
+use crate::provider::AgentProvider;
 use crate::session::{AgentSession, HostTerminalTarget};
 use sandbox_terminal_bridge::{BridgeError, BridgeTarget, BridgeTerminal, BridgeVerb};
 use std::collections::HashMap;
@@ -268,29 +269,36 @@ fn supported_actions(terminal: &Terminal) -> Vec<TerminalAction> {
     }
 }
 
-pub(crate) fn build_claude_args(prompt: Option<&str>, resume: Option<&str>) -> Vec<String> {
-    let mut args = Vec::new();
-    if let Some(resume_id) = resume {
-        args.push("--resume".to_string());
-        args.push(resume_id.to_string());
-    }
-    if let Some(prompt_text) = prompt {
-        args.push("-p".to_string());
-        args.push(prompt_text.to_string());
-    }
-    args
+/// Arguments following the product's executable.
+///
+/// Delegates to the adapter rather than hardcoding Claude's flags: Codex takes
+/// `resume` as a subcommand and its prompt positionally, so a shared arg
+/// builder would launch one of the two products wrongly.
+pub(crate) fn build_agent_args(
+    provider: AgentProvider,
+    prompt: Option<&str>,
+    resume: Option<&str>,
+) -> Vec<String> {
+    crate::providers::for_provider(provider)
+        .map(|adapter| adapter.launch_args(prompt, resume))
+        .unwrap_or_default()
 }
 
 /// A `claude …` invocation as a single shell command string, each argument
 /// shell-quoted (so a prompt with spaces or quotes stays one argument). Used by
 /// the launch backends that run a command string rather than an argv — tmux and
 /// the macOS AppleScript terminals.
-pub(crate) fn build_claude_command(prompt: Option<&str>, resume: Option<&str>) -> String {
-    let adapter = crate::providers::for_provider(crate::provider::AgentProvider::Claude)
-        .expect("Claude adapter is always present");
+pub(crate) fn build_agent_command(
+    provider: AgentProvider,
+    prompt: Option<&str>,
+    resume: Option<&str>,
+) -> String {
+    let Some(adapter) = crate::providers::for_provider(provider) else {
+        return String::new();
+    };
     let mut parts = vec![adapter.executable().to_string()];
     parts.extend(
-        build_claude_args(prompt, resume)
+        build_agent_args(provider, prompt, resume)
             .iter()
             .map(|arg| shell_escape(arg)),
     );
@@ -1256,17 +1264,18 @@ pub fn format_doctor_report(report: &DoctorReport) -> String {
 }
 
 pub fn launch_session(
+    provider: AgentProvider,
     cwd: &str,
     prompt: Option<&str>,
     resume: Option<&str>,
 ) -> Result<String, String> {
     let terminal = detect_terminal();
     match terminal {
-        Terminal::Gnome => gnome_terminal::launch(cwd, prompt, resume),
-        Terminal::Kitty => kitty::launch(cwd, prompt, resume),
-        Terminal::Tmux => tmux::launch(cwd, prompt, resume),
-        Terminal::WezTerm => wezterm::launch(cwd, prompt, resume),
-        Terminal::WindowsTerm => windows_terminal::launch(cwd, prompt, resume),
+        Terminal::Gnome => gnome_terminal::launch(provider, cwd, prompt, resume),
+        Terminal::Kitty => kitty::launch(provider, cwd, prompt, resume),
+        Terminal::Tmux => tmux::launch(provider, cwd, prompt, resume),
+        Terminal::WezTerm => wezterm::launch(provider, cwd, prompt, resume),
+        Terminal::WindowsTerm => windows_terminal::launch(provider, cwd, prompt, resume),
         // macOS terminals reuse the AppleScript spawn backends, running the
         // built `claude …` command in a fresh window (same path restore uses).
         // Gated to a macOS host so a Linux/sandbox build — where `detect_terminal`
@@ -1274,11 +1283,15 @@ pub fn launch_session(
         // `other` arm's "not supported" message instead of the osa-bridge path,
         // matching `supported_actions`/`spawn_window_supported`.
         #[cfg(target_os = "macos")]
-        Terminal::Ghostty => ghostty::spawn_window(cwd, &build_claude_command(prompt, resume)),
+        Terminal::Ghostty => {
+            ghostty::spawn_window(cwd, &build_agent_command(provider, prompt, resume))
+        }
         #[cfg(target_os = "macos")]
-        Terminal::ITerm2 => iterm2::spawn_window(cwd, &build_claude_command(prompt, resume)),
+        Terminal::ITerm2 => {
+            iterm2::spawn_window(cwd, &build_agent_command(provider, prompt, resume))
+        }
         #[cfg(target_os = "macos")]
-        Terminal::Apple => apple::spawn_window(cwd, &build_claude_command(prompt, resume)),
+        Terminal::Apple => apple::spawn_window(cwd, &build_agent_command(provider, prompt, resume)),
         other => Err(format!(
             "Visible session launch is not supported in {}. Start `claude` manually, use Ghostty/iTerm2/Apple Terminal on macOS or tmux/Kitty/WezTerm/GNOME Terminal/Windows Terminal on Linux/WSL, or run `claudectl --doctor` for setup guidance.",
             terminal_name(&other)
@@ -1716,18 +1729,21 @@ mod tests {
     }
 
     #[test]
-    fn build_claude_command_shell_escapes_every_arg() {
+    fn build_agent_command_shell_escapes_every_arg() {
         // Each argument is single-quoted, so a prompt with spaces stays one arg.
         assert_eq!(
-            build_claude_command(Some("ship it"), Some("abc-123")),
+            build_agent_command(AgentProvider::Claude, Some("ship it"), Some("abc-123")),
             "claude '--resume' 'abc-123' '-p' 'ship it'"
         );
         // A quote in the prompt is escaped, never terminates the argument.
         assert_eq!(
-            build_claude_command(Some("don't"), None),
+            build_agent_command(AgentProvider::Claude, Some("don't"), None),
             r#"claude '-p' 'don'"'"'t'"#
         );
-        assert_eq!(build_claude_command(None, None), "claude");
+        assert_eq!(
+            build_agent_command(AgentProvider::Claude, None, None),
+            "claude"
+        );
     }
 
     #[test]
@@ -1944,5 +1960,25 @@ mod tests {
             terminal_from_term_program("something-else"),
             Terminal::Unknown(_)
         ));
+    }
+
+    /// The terminal layer must dispatch on the provider, not assume Claude.
+    ///
+    /// Asserting the adapters differ is not enough: `build_agent_args` could
+    /// ignore its `provider` argument and every adapter test would still pass,
+    /// while every Codex launch emitted Claude's flags.
+    #[test]
+    fn the_command_builder_dispatches_on_the_provider() {
+        let claude = build_agent_args(AgentProvider::Claude, Some("hi"), Some("id"));
+        let codex = build_agent_args(AgentProvider::Codex, Some("hi"), Some("id"));
+        assert_ne!(claude, codex, "the provider argument must be honoured");
+        assert_eq!(claude, vec!["--resume", "id", "-p", "hi"]);
+        assert_eq!(codex, vec!["resume", "id", "hi"]);
+
+        assert!(
+            build_agent_command(AgentProvider::Codex, None, Some("id")).starts_with("codex "),
+            "the command string must use the product's own executable"
+        );
+        assert!(build_agent_command(AgentProvider::Claude, None, None).starts_with("claude"));
     }
 }

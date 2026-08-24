@@ -4,6 +4,9 @@ use crate::terminals;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchRequest {
+    /// Which product to start. Defaults to Claude at every current call site;
+    /// carried on the request so a Codex launch is a field, not a new function.
+    pub provider: crate::provider::AgentProvider,
     pub cwd_path: PathBuf,
     pub prompt: Option<String>,
     pub resume: Option<String>,
@@ -57,6 +60,7 @@ pub fn prepare(
         .map(ToOwned::to_owned);
 
     Ok(LaunchRequest {
+        provider: crate::provider::AgentProvider::Claude,
         cwd_path,
         prompt,
         resume,
@@ -65,6 +69,7 @@ pub fn prepare(
 
 pub fn launch(request: &LaunchRequest) -> Result<String, String> {
     terminals::launch_session(
+        request.provider,
         request.cwd_path.to_string_lossy().as_ref(),
         request.prompt.as_deref(),
         request.resume.as_deref(),

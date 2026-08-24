@@ -32,10 +32,15 @@ fn spawn_argv(cwd: &str, command: &str) -> Vec<String> {
     .to_vec()
 }
 
-pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<String, String> {
+pub fn launch(
+    provider: crate::provider::AgentProvider,
+    cwd: &str,
+    prompt: Option<&str>,
+    resume: Option<&str>,
+) -> Result<String, String> {
     let mut cmd = std::process::Command::new("wezterm");
     cmd.args(["cli", "spawn", "--cwd", cwd, "--", "claude"]);
-    for arg in super::build_claude_args(prompt, resume) {
+    for arg in super::build_agent_args(provider, prompt, resume) {
         cmd.arg(arg);
     }
 
