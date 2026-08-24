@@ -31,8 +31,20 @@ impl AgentProviderAdapter for ClaudeProvider {
         crate::process::is_claude_process(command)
     }
 
+    /// `claude [--resume <id>] [-p <prompt>]`, the order the terminals have
+    /// always emitted. Moved here from `terminals` so the arg shape lives with
+    /// the product rather than in the layer that spawns it.
     fn launch_args(&self, prompt: Option<&str>, resume: Option<&str>) -> Vec<String> {
-        crate::terminals::build_claude_args(prompt, resume)
+        let mut args = Vec::new();
+        if let Some(id) = resume {
+            args.push("--resume".to_string());
+            args.push(id.to_string());
+        }
+        if let Some(text) = prompt {
+            args.push("-p".to_string());
+            args.push(text.to_string());
+        }
+        args
     }
 
     fn supports_rename(&self) -> bool {

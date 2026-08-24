@@ -33,19 +33,31 @@ impl AgentProviderAdapter for CodexProvider {
         crate::process::argv0_token_count(command, self.executable()).is_some()
     }
 
-    /// `codex resume <id>` — a subcommand, not Claude's `--resume` flag.
+    /// `codex [resume <id>] [PROMPT]` — verified against `codex --help` and
+    /// `codex resume --help` on codex-cli 0.148.0.
     ///
-    /// A prompt is not passed positionally here: Codex takes it on stdin or via
-    /// `exec`, and guessing an argv shape would produce a command that looks
-    /// right and fails at run time. Task 7 settles it against the real CLI.
-    fn launch_args(&self, _prompt: Option<&str>, resume: Option<&str>) -> Vec<String> {
-        match resume {
-            Some(id) => vec!["resume".to_string(), id.to_string()],
-            None => Vec::new(),
+    /// Resume is a subcommand, not Claude's `--resume` flag, and the prompt is
+    /// POSITIONAL on both forms rather than behind `-p`. Order matters:
+    /// `codex resume [SESSION_ID] [PROMPT]`, so a prompt without a resume id
+    /// would be read as the id.
+    fn launch_args(&self, prompt: Option<&str>, resume: Option<&str>) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(id) = resume {
+            args.push("resume".to_string());
+            args.push(id.to_string());
         }
+        if let Some(text) = prompt {
+            args.push(text.to_string());
+        }
+        args
     }
 
-    /// Codex has no in-place session rename.
+    /// Codex exposes no rename.
+    ///
+    /// `codex --help` on 0.148.0 offers `archive`, `unarchive`, `delete` and
+    /// `fork`, but nothing that renames a session. Writing a name into the
+    /// rollout ourselves would mean agentctl mutating a file the product owns,
+    /// which the ownership model forbids.
     fn supports_rename(&self) -> bool {
         false
     }
