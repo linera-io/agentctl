@@ -71,3 +71,40 @@ impl AgentProviderAdapter for CodexProvider {
         None
     }
 }
+
+/// The agent's working root from a `codex` command line, if it set one.
+///
+/// `codex -C/--cd <DIR>` moves the agent's root WITHOUT changing the process's
+/// own cwd, so `/proc/<pid>/cwd` reports where the shell was, while the rollout
+/// records `<DIR>`. Correlating on the process cwd alone therefore misses every
+/// session started that way — silently, as an absent row rather than a wrong
+/// one. Verified against `codex --help` on codex-cli 0.148.0.
+///
+/// Both the separate form (`-C dir`) and the joined forms (`--cd=dir`, `-Cdir`)
+/// are accepted, because all three reach the same clap argument.
+pub fn working_root_override(args: &str) -> Option<String> {
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i];
+        if let Some(dir) = token.strip_prefix("--cd=") {
+            return non_empty(dir);
+        }
+        if token == "--cd" || token == "-C" {
+            return tokens.get(i + 1).and_then(|d| non_empty(d));
+        }
+        if let Some(dir) = token.strip_prefix("-C") {
+            // clap accepts `-C=dir` as well as `-Cdir`.
+            let dir = dir.strip_prefix('=').unwrap_or(dir);
+            if !dir.starts_with('-') {
+                return non_empty(dir);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}

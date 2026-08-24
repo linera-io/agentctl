@@ -346,7 +346,16 @@ fn scan_codex_sessions() -> Vec<AgentSession> {
     let mut out = Vec::new();
     let mut used: HashSet<String> = HashSet::new();
     for (pid, proc) in procs {
-        let Some(cwd) = proc_cwd(pid) else { continue };
+        // `-C/--cd` moves the agent's root without moving the process, so the
+        // flag wins over `/proc/<pid>/cwd` when present — otherwise every
+        // session started that way is silently never discovered.
+        let cwd = match crate::providers::codex::working_root_override(&proc.args) {
+            Some(dir) => dir,
+            None => match proc_cwd(pid) {
+                Some(dir) => dir,
+                None => continue,
+            },
+        };
         let Some(summary) = by_cwd.get(&cwd) else {
             continue;
         };

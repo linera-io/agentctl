@@ -353,6 +353,9 @@ pub fn record_live_sessions(check: &crate::terminal_owner::OwnerCheck) -> io::Re
                 None => (None, None),
             };
             crate::sandbox_registry::SessionEntry {
+                // Only Claude Code fires our hooks, so a hook-written
+                // entry is Claude by construction.
+                provider: crate::provider::AgentProvider::Claude,
                 session_id: session.session_id,
                 cwd: session.cwd,
                 transcript,

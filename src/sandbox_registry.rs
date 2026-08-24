@@ -88,7 +88,16 @@ fn current_version() -> u32 {
 /// still has to be answered for where it actually matters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEntry {
-    /// Claude Code session id — the argument to `sc --resume <id>`.
+    /// Which product the session belongs to.
+    ///
+    /// `#[serde(default)]` so every registry file already on disk — all of them
+    /// written before this field existed, all of them Claude — keeps parsing and
+    /// keeps meaning the same thing. The file is shared between the laptop and
+    /// every sandbox, so an older binary must still read a newer file; serde
+    /// ignores unknown fields by default, which it does.
+    #[serde(default)]
+    pub provider: crate::provider::AgentProvider,
+    /// Session id — the argument the product resumes by.
     pub session_id: String,
     /// Host working directory the session was launched from, so restore can
     /// reopen it in the right place. Empty if the hook payload omitted `cwd`.
