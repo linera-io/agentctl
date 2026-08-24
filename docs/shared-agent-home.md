@@ -58,10 +58,30 @@ wanted it belongs in a separate, explicit operation.
 **Applying a plan and re-planning yields nothing.** That idempotence is what
 makes it safe on every hook event, and it is asserted directly.
 
+## When do you re-run it?
+
+Whenever the shared content changes. Running it when nothing has changed prints
+"up to date" and does nothing, so it is safe on a hook, in a shell alias, or by
+hand.
+
+Edit `~/.agents/instructions/global.md` and the next `--apply` pushes it to
+every provider's adapter. That propagation is the point of the tool.
+
 ## Drift
 
-A generated adapter a human has since edited is reported, never overwritten.
-Silently replacing it is how someone loses instructions they wrote themselves.
+Each render records the bytes it wrote, under `adapters/`. That stamp is what
+separates *we wrote this and the source has since moved on* — ours to re-render
+— from *a human changed it* — theirs, reported and never overwritten.
+
+Without the stamp the two are indistinguishable: both show an adapter whose
+content differs from the shared source. Treating them alike breaks whichever one
+you guess wrong, and guessing "drift" breaks the main use case, because then
+editing the shared instructions reaches nobody.
+
+A file we never rendered is theirs by the same rule — no stamp, no claim on it,
+even where we would have put ours. Silently replacing it is how someone loses
+instructions they wrote themselves.
+
 Replacing an adapter we *do* own still writes a `.bak` first, with a numeric
 suffix so two renders in the same second cannot have the second discard the
 first backup.

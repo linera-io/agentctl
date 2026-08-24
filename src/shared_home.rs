@@ -113,6 +113,10 @@ pub struct Observed {
     /// Generated adapters a human has since edited. These are reported, never
     /// overwritten.
     pub drifted: Vec<PathBuf>,
+    /// Adapters we rendered, unchanged since, whose shared source has moved on.
+    /// These are ours to re-render — that is how an edit to the shared
+    /// instructions reaches each provider.
+    pub stale: Vec<PathBuf>,
     /// An established Claude auto-memory directory, if one was found. Adopted by
     /// reference rather than copied.
     pub claude_memory: Option<PathBuf>,
@@ -217,6 +221,21 @@ impl SharedAgentHome {
         self.root.join("adapters")
     }
 
+    /// Where the bytes last rendered to `target` are recorded.
+    ///
+    /// Without this, "the adapter differs from the shared source" is
+    /// indistinguishable between *you edited the adapter* and *the source moved
+    /// on* — which need opposite responses. The stamp is the memory that tells
+    /// them apart.
+    fn stamp_for(&self, target: &Path) -> PathBuf {
+        let flattened = target
+            .strip_prefix(&self.home)
+            .unwrap_or(target)
+            .to_string_lossy()
+            .replace(['/', '\\'], "_");
+        self.adapters().join(format!("{flattened}.rendered"))
+    }
+
     pub fn session_index(&self) -> PathBuf {
         self.root.join("sessions/index.jsonl")
     }
@@ -262,7 +281,8 @@ impl SharedAgentHome {
                 });
                 continue;
             }
-            if !exists(&target) {
+            let is_stale = observed.stale.iter().any(|p| p == &target);
+            if !exists(&target) || is_stale {
                 actions.push(Action::RenderAdapter {
                     target,
                     from: self.global_instructions(),
@@ -298,19 +318,28 @@ impl SharedAgentHome {
         // against it rather than merely counted as present.
         let rendered = std::fs::read(self.global_instructions()).ok();
         let mut drifted = Vec::new();
+        let mut stale = Vec::new();
         for relative in INSTRUCTION_ADAPTER_TARGETS {
             let target = self.home.join(relative);
             if !target.exists() {
                 continue;
             }
-            existing.push(target.clone());
-            // Only a readable source makes drift decidable. With no source
-            // there is nothing to render, so nothing can have diverged from it.
-            if let (Some(source), Ok(current)) = (&rendered, std::fs::read(&target)) {
-                if &current != source {
-                    drifted.push(target);
+            let Ok(current) = std::fs::read(&target) else {
+                existing.push(target);
+                continue;
+            };
+            match std::fs::read(self.stamp_for(&target)) {
+                // We rendered it and it still matches: ours to update.
+                Ok(stamp) if stamp == current => {
+                    if rendered.as_ref().is_some_and(|source| source != &current) {
+                        stale.push(target.clone());
+                    }
                 }
+                // Either a file we never wrote, or one we wrote and a human has
+                // since changed. Both are theirs; report, never overwrite.
+                _ => drifted.push(target.clone()),
             }
+            existing.push(target);
         }
 
         // The adopt pointer is a plan target too. Omitting it here is what made
@@ -324,6 +353,7 @@ impl SharedAgentHome {
         Observed {
             existing,
             drifted,
+            stale,
             claude_memory: self.discover_claude_memory(),
         }
     }
@@ -387,6 +417,13 @@ impl SharedAgentHome {
                     let temp = target.with_extension("agentctl-tmp");
                     std::fs::write(&temp, &content)?;
                     std::fs::rename(&temp, target)?;
+                    // Record what we wrote, so a later run can tell its own
+                    // output from a human's edit.
+                    let stamp = self.stamp_for(target);
+                    if let Some(parent) = stamp.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(stamp, &content)?;
                 }
                 Action::AdoptInPlace { target, source } => {
                     if let Some(parent) = target.parent() {

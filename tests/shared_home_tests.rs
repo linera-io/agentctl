@@ -399,3 +399,63 @@ fn rendering_the_registry_is_deterministic() {
         "servers render in a stable order regardless of input order"
     );
 }
+
+/// Editing the shared instructions must reach every provider.
+///
+/// This is the reason the tool exists, and it was broken: drift was computed as
+/// "adapter differs from source", which is equally true when the source moved
+/// on. Every adapter reported DRIFT and refused to update, so an edit reached
+/// nobody. A render stamp is what separates "we wrote this" from "a human did".
+#[test]
+fn editing_the_shared_source_re_renders_every_adapter() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = SharedAgentHome::from_home(home.path());
+    std::fs::create_dir_all(layout.global_instructions().parent().unwrap()).unwrap();
+    std::fs::write(layout.global_instructions(), "v1").unwrap();
+    layout.apply(&layout.plan(&layout.observe())).unwrap();
+
+    std::fs::write(layout.global_instructions(), "v2").unwrap();
+    let plan = layout.plan(&layout.observe());
+    assert!(
+        !plan
+            .actions
+            .iter()
+            .any(|a| matches!(a, Action::ReportDrift { .. })),
+        "our own unmodified output is not drift: {:?}",
+        plan.actions
+    );
+    layout.apply(&plan).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(home.path().join(".claude/CLAUDE.md")).unwrap(),
+        "v2"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.path().join(".codex/AGENTS.md")).unwrap(),
+        "v2"
+    );
+    assert!(
+        layout.plan(&layout.observe()).is_empty(),
+        "and then settles"
+    );
+}
+
+/// A file we never rendered is the user's, even where we would have put ours.
+#[test]
+fn a_pre_existing_adapter_we_never_wrote_is_never_clobbered() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = SharedAgentHome::from_home(home.path());
+    std::fs::create_dir_all(layout.global_instructions().parent().unwrap()).unwrap();
+    std::fs::write(layout.global_instructions(), "shared").unwrap();
+    let adapter = home.path().join(".claude/CLAUDE.md");
+    std::fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+    std::fs::write(&adapter, "instructions I wrote myself").unwrap();
+
+    layout.apply(&layout.plan(&layout.observe())).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&adapter).unwrap(),
+        "instructions I wrote myself",
+        "a file with no stamp is not ours to overwrite"
+    );
+}
