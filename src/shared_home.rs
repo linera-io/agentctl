@@ -294,15 +294,36 @@ impl SharedAgentHome {
                 existing.push(path);
             }
         }
+        // What `RenderAdapter` would write, so an adapter can be compared
+        // against it rather than merely counted as present.
+        let rendered = std::fs::read(self.global_instructions()).ok();
+        let mut drifted = Vec::new();
         for relative in INSTRUCTION_ADAPTER_TARGETS {
             let target = self.home.join(relative);
-            if target.exists() {
-                existing.push(target);
+            if !target.exists() {
+                continue;
+            }
+            existing.push(target.clone());
+            // Only a readable source makes drift decidable. With no source
+            // there is nothing to render, so nothing can have diverged from it.
+            if let (Some(source), Ok(current)) = (&rendered, std::fs::read(&target)) {
+                if &current != source {
+                    drifted.push(target);
+                }
             }
         }
+
+        // The adopt pointer is a plan target too. Omitting it here is what made
+        // `AdoptInPlace` re-plan on every run: `plan()` tests for this exact
+        // path, so an observation that can never contain it can never settle.
+        let adopted = self.memory().join("adopted-graph");
+        if adopted.exists() {
+            existing.push(adopted);
+        }
+
         Observed {
             existing,
-            drifted: Vec::new(),
+            drifted,
             claude_memory: self.discover_claude_memory(),
         }
     }

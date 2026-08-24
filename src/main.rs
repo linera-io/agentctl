@@ -144,6 +144,9 @@ pub(crate) struct Cli {
     /// restart-to-update — spawning one window per session that was live,
     /// each running `claude --resume <id>` in its recorded directory. No
     /// argument; pair with --dry-run to preview.
+    #[arg(long = "restore-sessions", help_heading = "Session Management")]
+    pub(crate) restore_sessions: bool,
+
     /// Reconcile the shared agent home (`~/.agents`) and the provider adapters
     /// rendered from it. Prints the plan and exits; pass --apply to execute it.
     #[arg(long = "shared-home", help_heading = "Session Management")]
@@ -156,9 +159,6 @@ pub(crate) struct Cli {
         help_heading = "Session Management"
     )]
     pub(crate) apply: bool,
-
-    #[arg(long = "restore-sessions", help_heading = "Session Management")]
-    pub(crate) restore_sessions: bool,
 
     /// Restore sandbox Claude sessions after `sbx rm`: spawn one window per
     /// session that was live at teardown, each running `sc --resume <id>` in

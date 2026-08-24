@@ -266,13 +266,46 @@ fn applying_twice_is_a_no_op() {
     std::fs::create_dir_all(layout.global_instructions().parent().unwrap()).unwrap();
     std::fs::write(layout.global_instructions(), "shared").unwrap();
 
+    // Stage a Claude memory directory so the adoption branch actually runs.
+    // Without it `discover_claude_memory` returns None, the branch is skipped,
+    // and this test passes while `AdoptInPlace` re-plans forever in production
+    // — which is exactly what it did.
+    let claude_memory = home.path().join(".claude/projects/-p/memory");
+    std::fs::create_dir_all(&claude_memory).unwrap();
+    std::fs::write(claude_memory.join("MEMORY.md"), "index").unwrap();
+
     layout.apply(&layout.plan(&layout.observe())).unwrap();
     let after_first = layout.observe();
     layout.apply(&layout.plan(&after_first)).unwrap();
 
     assert!(
         layout.plan(&layout.observe()).is_empty(),
-        "a settled home plans nothing"
+        "a settled home plans nothing, adoption included"
+    );
+}
+
+/// An adapter edited by hand must be observed as drifted, not merely as
+/// present. `observe()` hardcoding an empty `drifted` made the whole
+/// report-don't-overwrite guarantee unreachable in production while the pure
+/// planning test still passed.
+#[test]
+fn a_hand_edited_adapter_is_observed_as_drifted() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = SharedAgentHome::from_home(home.path());
+    std::fs::create_dir_all(layout.global_instructions().parent().unwrap()).unwrap();
+    std::fs::write(layout.global_instructions(), "generated content").unwrap();
+    layout.apply(&layout.plan(&layout.observe())).unwrap();
+
+    let adapter = home.path().join(".claude/CLAUDE.md");
+    std::fs::write(&adapter, "a human wrote this").unwrap();
+
+    let plan = layout.plan(&layout.observe());
+    assert!(
+        plan.actions
+            .iter()
+            .any(|a| matches!(a, Action::ReportDrift { target, .. } if target == &adapter)),
+        "hand-edited adapter must be reported: {:?}",
+        plan.actions
     );
 }
 
