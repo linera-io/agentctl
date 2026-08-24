@@ -12,6 +12,8 @@ use crate::provider::AgentProvider;
 use crate::transcript::TranscriptEvent;
 
 pub mod claude;
+pub mod codex;
+pub mod codex_rollout;
 
 /// What agentctl needs to know about a product to drive it.
 pub trait AgentProviderAdapter {
@@ -39,16 +41,16 @@ pub trait AgentProviderAdapter {
 
 /// The adapter for a product, if one exists yet.
 ///
-/// `None` for a product with no adapter, rather than a stand-in: falling back
-/// to Claude would parse a foreign transcript with the wrong schema and launch
-/// the wrong binary, reporting success either way. Callers must decide what to
-/// do about a product they cannot drive.
+/// Still `Option` now that both products are covered: a stand-in would parse a
+/// foreign transcript with the wrong schema and launch the wrong binary,
+/// reporting success either way, so a future product must opt in explicitly
+/// rather than inherit someone else's behaviour by default.
 ///
 /// Returns `&'static dyn` rather than a boxed value — adapters are stateless,
 /// so there is nothing to own and no reason to allocate per call.
 pub fn for_provider(provider: AgentProvider) -> Option<&'static dyn AgentProviderAdapter> {
     match provider {
         AgentProvider::Claude => Some(&claude::ClaudeProvider),
-        AgentProvider::Codex => None,
+        AgentProvider::Codex => Some(&codex::CodexProvider),
     }
 }

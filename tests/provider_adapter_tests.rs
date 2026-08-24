@@ -22,13 +22,22 @@ fn the_registry_never_returns_the_wrong_products_adapter() {
     }
 }
 
-/// Codex has no adapter yet, and must not silently borrow Claude's.
+/// Codex has its own adapter, and does not borrow Claude's.
 ///
-/// Task 6 adds it; this assertion is the tripwire that forces this test to be
-/// updated then, instead of a Codex session quietly being parsed as Claude.
+/// This replaces the not-yet-wired tripwire from the adapter extraction; the
+/// property it guarded — no silent fallback to Claude — is now asserted
+/// positively, and again in `codex_rollout_tests`.
 #[test]
-fn codex_has_no_adapter_yet_and_does_not_fall_back_to_claude() {
-    assert!(for_provider(AgentProvider::Codex).is_none());
+fn codex_has_its_own_adapter_rather_than_claudes() {
+    let codex = for_provider(AgentProvider::Codex).expect("Codex adapter");
+    assert_eq!(codex.provider(), AgentProvider::Codex);
+    assert_ne!(
+        codex.executable(),
+        for_provider(AgentProvider::Claude)
+            .expect("Claude adapter")
+            .executable(),
+        "a Codex session must never be launched with Claude's binary"
+    );
 }
 
 #[test]
