@@ -281,10 +281,20 @@ pub(crate) fn is_claude_process(command: &str) -> bool {
 /// the component after the LAST `/` must be `claude` alone, so
 /// `/usr/bin/env claude` ("env claude") and `grep claude` never match.
 fn claude_argv0_token_count(command: &str) -> Option<usize> {
+    argv0_token_count(command, "claude")
+}
+
+/// How many whitespace-split tokens of `command` make up an argv0 whose
+/// basename is exactly `exe`.
+///
+/// Generalised from the Claude-only version so a second product gets the same
+/// strictness rather than its own looser matcher — the exactness is what keeps
+/// `agentctl`, `grep claude` and `/usr/bin/env claude` from being claimed.
+pub(crate) fn argv0_token_count(command: &str, exe: &str) -> Option<usize> {
     let basename = |s: &str| s.rsplit('/').next().unwrap_or(s).to_string();
     let mut tokens = command.split_whitespace();
     let first = tokens.next()?;
-    if basename(first) == "claude" {
+    if basename(first) == exe {
         return Some(1);
     }
     if !(first.starts_with('/') || first.starts_with('~') || first.starts_with('.')) {
@@ -294,7 +304,7 @@ fn claude_argv0_token_count(command: &str) -> Option<usize> {
     for (extra, token) in tokens.take(7).enumerate() {
         joined.push(' ');
         joined.push_str(token);
-        if basename(&joined) == "claude" {
+        if basename(&joined) == exe {
             return Some(extra + 2);
         }
     }
