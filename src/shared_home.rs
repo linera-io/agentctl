@@ -1,4 +1,4 @@
-//! Provider-neutral paths shared by Claude Code and Codex.
+//! Provider-neutral paths, rendered into each agent product's native home.
 //!
 //! The shared home owns durable, user-authored state. Provider configuration
 //! and transcripts remain in their native homes and are only referenced by
@@ -6,10 +6,51 @@
 
 use std::path::{Path, PathBuf};
 
-/// Instruction adapters rendered into each provider's native home, declared as
-/// data so adding a provider is a registry entry rather than a `classify` arm.
-const INSTRUCTION_ADAPTER_TARGETS: &[&str] =
-    &[".claude/CLAUDE.md", "AGENTS.md", ".codex/AGENTS.md"];
+/// One agent product agentctl renders adapters for.
+///
+/// Every product-specific path lives here, so supporting another one is a row
+/// rather than an edit in `classify`, the adapter list and the plan.
+pub struct Provider {
+    pub name: &'static str,
+    /// Config directory relative to `$HOME`, empty for a product with none.
+    pub home_dir: &'static str,
+    /// Global-instructions file, relative to `$HOME`, rendered from the shared
+    /// source.
+    pub instructions: &'static str,
+    /// Subdirectory of `home_dir` holding immutable transcripts, if any.
+    pub transcripts: Option<&'static str>,
+    /// Where the product keeps a per-project memory graph we can adopt,
+    /// relative to `home_dir`, with `*` standing for the project segment.
+    pub memory: Option<&'static str>,
+}
+
+/// Every product we render for.
+///
+/// `agents-md` is the cross-vendor `~/AGENTS.md` convention rather than one
+/// product, so it has no config directory of its own.
+pub const PROVIDERS: &[Provider] = &[
+    Provider {
+        name: "claude-code",
+        home_dir: ".claude",
+        instructions: ".claude/CLAUDE.md",
+        transcripts: Some("projects"),
+        memory: Some("projects/*/memory"),
+    },
+    Provider {
+        name: "codex",
+        home_dir: ".codex",
+        instructions: ".codex/AGENTS.md",
+        transcripts: Some("sessions"),
+        memory: None,
+    },
+    Provider {
+        name: "agents-md",
+        home_dir: "",
+        instructions: "AGENTS.md",
+        transcripts: None,
+        memory: None,
+    },
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PathOwnership {
@@ -74,31 +115,6 @@ impl McpRegistry {
     pub fn servers(&self) -> &[McpServer] {
         &self.servers
     }
-
-    /// Render Claude Code's `.mcp.json` shape.
-    pub fn render_claude(&self) -> String {
-        let entries: Vec<String> = self
-            .servers
-            .iter()
-            .map(|server| {
-                let env: Vec<String> = server
-                    .env
-                    .iter()
-                    .map(|(k, v)| format!("        {k:?}: {v:?}"))
-                    .collect();
-                format!(
-                    "    {:?}: {{\n      \"command\": {:?},\n      \"env\": {{\n{}\n      }}\n    }}",
-                    server.name,
-                    server.command,
-                    env.join(",\n")
-                )
-            })
-            .collect();
-        format!(
-            "{{\n  \"mcpServers\": {{\n{}\n  }}\n}}\n",
-            entries.join(",\n")
-        )
-    }
 }
 
 /// What a caller read off disk before planning.
@@ -117,9 +133,9 @@ pub struct Observed {
     /// These are ours to re-render — that is how an edit to the shared
     /// instructions reaches each provider.
     pub stale: Vec<PathBuf>,
-    /// An established Claude auto-memory directory, if one was found. Adopted by
-    /// reference rather than copied.
-    pub claude_memory: Option<PathBuf>,
+    /// An established memory graph in some product's tree, if one was found.
+    /// Adopted by reference rather than copied.
+    pub adoptable_memory: Option<PathBuf>,
 }
 
 /// One step of a reconcile. There is deliberately no variant that removes
@@ -272,8 +288,8 @@ impl SharedAgentHome {
             }
         }
 
-        for relative in INSTRUCTION_ADAPTER_TARGETS {
-            let target = self.home.join(relative);
+        for provider in PROVIDERS {
+            let target = self.home.join(provider.instructions);
             if has_drifted(&target) {
                 actions.push(Action::ReportDrift {
                     target,
@@ -290,7 +306,7 @@ impl SharedAgentHome {
             }
         }
 
-        if let Some(source) = &observed.claude_memory {
+        if let Some(source) = &observed.adoptable_memory {
             let target = self.memory().join("adopted-graph");
             if !exists(&target) {
                 actions.push(Action::AdoptInPlace {
@@ -319,8 +335,8 @@ impl SharedAgentHome {
         let rendered = std::fs::read(self.global_instructions()).ok();
         let mut drifted = Vec::new();
         let mut stale = Vec::new();
-        for relative in INSTRUCTION_ADAPTER_TARGETS {
-            let target = self.home.join(relative);
+        for provider in PROVIDERS {
+            let target = self.home.join(provider.instructions);
             if !target.exists() {
                 continue;
             }
@@ -354,23 +370,38 @@ impl SharedAgentHome {
             existing,
             drifted,
             stale,
-            claude_memory: self.discover_claude_memory(),
+            adoptable_memory: self.discover_adoptable_memory(),
         }
     }
 
-    /// The established Claude auto-memory directory, if there is exactly one.
+    /// The one adoptable memory graph across every product, if there is exactly
+    /// one.
     ///
     /// Ambiguity is reported as "none" rather than guessed: adopting the wrong
     /// project's graph would point every provider at someone else's notes, and a
-    /// missed adoption is a no-op the user can correct.
-    fn discover_claude_memory(&self) -> Option<PathBuf> {
-        let projects = self.home.join(".claude/projects");
-        let mut found: Vec<PathBuf> = std::fs::read_dir(projects)
-            .ok()?
-            .flatten()
-            .map(|entry| entry.path().join("memory"))
-            .filter(|path| path.is_dir())
-            .collect();
+    /// missed adoption is a no-op the user can correct. The count spans all
+    /// products, so one graph each in two products is ambiguous, not two
+    /// answers.
+    fn discover_adoptable_memory(&self) -> Option<PathBuf> {
+        let mut found: Vec<PathBuf> = Vec::new();
+        for provider in PROVIDERS {
+            let Some(pattern) = provider.memory else {
+                continue;
+            };
+            let Some((prefix, suffix)) = pattern.split_once("/*/") else {
+                continue;
+            };
+            let root = self.home.join(provider.home_dir).join(prefix);
+            let Ok(entries) = std::fs::read_dir(root) else {
+                continue;
+            };
+            found.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path().join(suffix))
+                    .filter(|path| path.is_dir()),
+            );
+        }
         found.sort();
         match found.len() {
             1 => found.pop(),
@@ -443,9 +474,6 @@ impl SharedAgentHome {
     }
 
     pub fn classify(&self, path: &Path) -> PathOwnership {
-        let claude_home = self.home.join(".claude");
-        let codex_home = self.home.join(".codex");
-
         // Codex discovers and rewrites this catalog implicitly, so agentctl must
         // treat it as provider-owned even though it sits inside the shared home.
         if path.starts_with(self.root.join("plugins")) {
@@ -456,27 +484,36 @@ impl SharedAgentHome {
             return PathOwnership::SharedSource;
         }
 
-        let is_instruction_adapter = INSTRUCTION_ADAPTER_TARGETS
+        if PROVIDERS
             .iter()
-            .any(|relative| path == self.home.join(relative));
-        if is_instruction_adapter {
+            .any(|provider| path == self.home.join(provider.instructions))
+        {
             return PathOwnership::GeneratedAdapter;
         }
 
-        let is_claude_transcript = path.starts_with(claude_home.join("projects"))
-            && path
-                .extension()
-                .is_some_and(|extension| extension == "jsonl");
-        let is_codex_transcript = path.starts_with(codex_home.join("sessions"))
-            && path
-                .extension()
-                .is_some_and(|extension| extension == "jsonl");
-        if is_claude_transcript || is_codex_transcript {
-            return PathOwnership::TranscriptEvidence;
+        // Transcripts before native config: a transcript lives inside the
+        // provider's home, so the broader check would swallow it.
+        for provider in PROVIDERS {
+            let Some(transcripts) = provider.transcripts else {
+                continue;
+            };
+            let dir = self.home.join(provider.home_dir).join(transcripts);
+            if path.starts_with(&dir)
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            {
+                return PathOwnership::TranscriptEvidence;
+            }
         }
 
-        if path.starts_with(claude_home) || path.starts_with(codex_home) {
-            return PathOwnership::ProviderNative;
+        for provider in PROVIDERS {
+            if provider.home_dir.is_empty() {
+                continue;
+            }
+            if path.starts_with(self.home.join(provider.home_dir)) {
+                return PathOwnership::ProviderNative;
+            }
         }
 
         PathOwnership::External

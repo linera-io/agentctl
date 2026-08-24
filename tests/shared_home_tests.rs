@@ -4,66 +4,64 @@ use claudectl::shared_home::{PathOwnership, SharedAgentHome};
 
 #[test]
 fn canonical_layout_lives_under_dot_agents() {
-    let layout = SharedAgentHome::from_home(Path::new("/home/andre"));
+    let layout = SharedAgentHome::from_home(Path::new("/home/u"));
 
-    assert_eq!(layout.root(), Path::new("/home/andre/.agents"));
+    assert_eq!(layout.root(), Path::new("/home/u/.agents"));
     assert_eq!(
         layout.global_instructions(),
-        Path::new("/home/andre/.agents/instructions/global.md")
+        Path::new("/home/u/.agents/instructions/global.md")
     );
-    assert_eq!(layout.skills(), Path::new("/home/andre/.agents/skills"));
-    assert_eq!(layout.memory(), Path::new("/home/andre/.agents/memory"));
+    assert_eq!(layout.skills(), Path::new("/home/u/.agents/skills"));
+    assert_eq!(layout.memory(), Path::new("/home/u/.agents/memory"));
     assert_eq!(
         layout.mcp_registry(),
-        Path::new("/home/andre/.agents/config/mcp.toml")
+        Path::new("/home/u/.agents/config/mcp.toml")
     );
     assert_eq!(
         layout.hook_registry(),
-        Path::new("/home/andre/.agents/config/hooks.toml")
+        Path::new("/home/u/.agents/config/hooks.toml")
     );
     assert_eq!(
         layout.workflow_registry(),
-        Path::new("/home/andre/.agents/workflows")
+        Path::new("/home/u/.agents/workflows")
     );
     assert_eq!(
         layout.session_index(),
-        Path::new("/home/andre/.agents/sessions/index.jsonl")
+        Path::new("/home/u/.agents/sessions/index.jsonl")
     );
 }
 
 #[test]
 fn provider_mutable_state_is_not_owned_by_the_shared_home() {
-    let layout = SharedAgentHome::from_home(Path::new("/home/andre"));
+    let layout = SharedAgentHome::from_home(Path::new("/home/u"));
 
     assert_eq!(
-        layout.classify(Path::new("/home/andre/.agents/memory/decision.md")),
+        layout.classify(Path::new("/home/u/.agents/memory/decision.md")),
         PathOwnership::SharedSource
     );
     assert_eq!(
-        layout.classify(Path::new("/home/andre/.claude/CLAUDE.md")),
+        layout.classify(Path::new("/home/u/.claude/CLAUDE.md")),
         PathOwnership::GeneratedAdapter
     );
     assert_eq!(
-        layout.classify(Path::new("/home/andre/AGENTS.md")),
+        layout.classify(Path::new("/home/u/AGENTS.md")),
         PathOwnership::GeneratedAdapter
     );
     assert_eq!(
-        layout.classify(Path::new("/home/andre/.claude/settings.json")),
+        layout.classify(Path::new("/home/u/.claude/settings.json")),
         PathOwnership::ProviderNative
     );
     assert_eq!(
-        layout.classify(Path::new("/home/andre/.codex/config.toml")),
+        layout.classify(Path::new("/home/u/.codex/config.toml")),
         PathOwnership::ProviderNative
     );
     assert_eq!(
-        layout.classify(Path::new(
-            "/home/andre/.claude/projects/project/session.jsonl"
-        )),
+        layout.classify(Path::new("/home/u/.claude/projects/project/session.jsonl")),
         PathOwnership::TranscriptEvidence
     );
     assert_eq!(
         layout.classify(Path::new(
-            "/home/andre/.codex/sessions/2026/08/20/rollout.jsonl"
+            "/home/u/.codex/sessions/2026/08/20/rollout.jsonl"
         )),
         PathOwnership::TranscriptEvidence
     );
@@ -71,19 +69,19 @@ fn provider_mutable_state_is_not_owned_by_the_shared_home() {
 
 #[test]
 fn adapter_declarations_have_a_slot_in_the_shared_home() {
-    let layout = SharedAgentHome::from_home(Path::new("/home/andre"));
+    let layout = SharedAgentHome::from_home(Path::new("/home/u"));
 
-    assert_eq!(layout.adapters(), Path::new("/home/andre/.agents/adapters"));
+    assert_eq!(layout.adapters(), Path::new("/home/u/.agents/adapters"));
 }
 
 /// Codex reads `$CODEX_HOME/AGENTS.md` as its global instructions, verified
 /// against codex-cli 0.148.0 with `codex debug prompt-input`.
 #[test]
 fn rendered_codex_instruction_adapter_is_a_generated_adapter() {
-    let layout = SharedAgentHome::from_home(Path::new("/home/andre"));
+    let layout = SharedAgentHome::from_home(Path::new("/home/u"));
 
     assert_eq!(
-        layout.classify(Path::new("/home/andre/.codex/AGENTS.md")),
+        layout.classify(Path::new("/home/u/.codex/AGENTS.md")),
         PathOwnership::GeneratedAdapter
     );
 }
@@ -92,18 +90,18 @@ fn rendered_codex_instruction_adapter_is_a_generated_adapter() {
 /// the shared home cannot claim it without agentctl fighting Codex over writes.
 #[test]
 fn codex_plugin_catalog_inside_the_shared_home_stays_provider_native() {
-    let layout = SharedAgentHome::from_home(Path::new("/home/andre"));
+    let layout = SharedAgentHome::from_home(Path::new("/home/u"));
 
     assert_eq!(
-        layout.classify(Path::new("/home/andre/.agents/plugins/marketplace.json")),
+        layout.classify(Path::new("/home/u/.agents/plugins/marketplace.json")),
         PathOwnership::ProviderNative
     );
     assert_eq!(
-        layout.classify(Path::new("/home/andre/.agents/plugins")),
+        layout.classify(Path::new("/home/u/.agents/plugins")),
         PathOwnership::ProviderNative
     );
     assert_eq!(
-        layout.classify(Path::new("/home/andre/.agents/plugins-notes.md")),
+        layout.classify(Path::new("/home/u/.agents/plugins-notes.md")),
         PathOwnership::SharedSource
     );
 }
@@ -116,7 +114,7 @@ use claudectl::shared_home::{Action, Observed};
 /// rules can be tested without arranging a home directory.
 #[test]
 fn a_fresh_home_is_planned_from_nothing_but_the_observation() {
-    let layout = SharedAgentHome::from_home(Path::new("/home/andre"));
+    let layout = SharedAgentHome::from_home(Path::new("/home/u"));
     let plan = layout.plan(&Observed::default());
 
     assert!(
@@ -129,7 +127,7 @@ fn a_fresh_home_is_planned_from_nothing_but_the_observation() {
     assert!(
         plan.actions.iter().any(|a| matches!(
             a,
-            Action::RenderAdapter { target, .. } if target == Path::new("/home/andre/.claude/CLAUDE.md")
+            Action::RenderAdapter { target, .. } if target == Path::new("/home/u/.claude/CLAUDE.md")
         )),
         "and renders the Claude instruction adapter"
     );
@@ -144,8 +142,8 @@ fn a_fresh_home_is_planned_from_nothing_but_the_observation() {
 /// match stops being exhaustive and the compiler makes someone justify it.
 #[test]
 fn planning_over_existing_content_only_adds_what_is_missing() {
-    let layout = SharedAgentHome::from_home(Path::new("/home/andre"));
-    let claude_md = Path::new("/home/andre/.claude/CLAUDE.md").to_path_buf();
+    let layout = SharedAgentHome::from_home(Path::new("/home/u"));
+    let claude_md = Path::new("/home/u/.claude/CLAUDE.md").to_path_buf();
     let observed = Observed {
         existing: vec![claude_md.clone(), layout.skills()],
         ..Observed::default()
@@ -175,8 +173,8 @@ fn planning_over_existing_content_only_adds_what_is_missing() {
 /// wrote themselves.
 #[test]
 fn an_independently_edited_adapter_is_reported_not_replaced() {
-    let layout = SharedAgentHome::from_home(Path::new("/home/andre"));
-    let target = Path::new("/home/andre/.claude/CLAUDE.md").to_path_buf();
+    let layout = SharedAgentHome::from_home(Path::new("/home/u"));
+    let target = Path::new("/home/u/.claude/CLAUDE.md").to_path_buf();
     let observed = Observed {
         existing: vec![target.clone()],
         drifted: vec![target.clone()],
@@ -203,7 +201,7 @@ fn an_independently_edited_adapter_is_reported_not_replaced() {
 /// makes a reconcile safe to run on every hook event.
 #[test]
 fn a_plan_against_its_own_result_is_empty() {
-    let layout = SharedAgentHome::from_home(Path::new("/home/andre"));
+    let layout = SharedAgentHome::from_home(Path::new("/home/u"));
     let first = layout.plan(&Observed::default());
 
     let settled = Observed {
@@ -267,12 +265,12 @@ fn applying_twice_is_a_no_op() {
     std::fs::write(layout.global_instructions(), "shared").unwrap();
 
     // Stage a Claude memory directory so the adoption branch actually runs.
-    // Without it `discover_claude_memory` returns None, the branch is skipped,
+    // Without it `discover_adoptable_memory` returns None, the branch is skipped,
     // and this test passes while `AdoptInPlace` re-plans forever in production
     // — which is exactly what it did.
-    let claude_memory = home.path().join(".claude/projects/-p/memory");
-    std::fs::create_dir_all(&claude_memory).unwrap();
-    std::fs::write(claude_memory.join("MEMORY.md"), "index").unwrap();
+    let adoptable_memory = home.path().join(".claude/projects/-p/memory");
+    std::fs::create_dir_all(&adoptable_memory).unwrap();
+    std::fs::write(adoptable_memory.join("MEMORY.md"), "index").unwrap();
 
     layout.apply(&layout.plan(&layout.observe())).unwrap();
     let after_first = layout.observe();
@@ -315,19 +313,19 @@ fn a_hand_edited_adapter_is_observed_as_drifted() {
 fn an_existing_memory_graph_is_adopted_in_place_not_copied() {
     let home = tempfile::tempdir().unwrap();
     let layout = SharedAgentHome::from_home(home.path());
-    let claude_memory = home.path().join(".claude/projects/-home-andre/memory");
-    std::fs::create_dir_all(&claude_memory).unwrap();
-    std::fs::write(claude_memory.join("MEMORY.md"), "the index").unwrap();
+    let adoptable_memory = home.path().join(".claude/projects/-home-u/memory");
+    std::fs::create_dir_all(&adoptable_memory).unwrap();
+    std::fs::write(adoptable_memory.join("MEMORY.md"), "the index").unwrap();
 
     let plan = layout.plan(&Observed {
-        claude_memory: Some(claude_memory.clone()),
+        adoptable_memory: Some(adoptable_memory.clone()),
         ..layout.observe()
     });
 
     assert!(
         plan.actions.iter().any(|a| matches!(
             a,
-            Action::AdoptInPlace { source, .. } if source == &claude_memory
+            Action::AdoptInPlace { source, .. } if source == &adoptable_memory
         )),
         "the graph is adopted where it lives: {:?}",
         plan.actions
@@ -336,7 +334,7 @@ fn an_existing_memory_graph_is_adopted_in_place_not_copied() {
         !plan
             .actions
             .iter()
-            .any(|a| matches!(a, Action::RenderAdapter { from, .. } if from == &claude_memory)),
+            .any(|a| matches!(a, Action::RenderAdapter { from, .. } if from == &adoptable_memory)),
         "and never copied"
     );
 }
@@ -392,11 +390,11 @@ fn rendering_the_registry_is_deterministic() {
         },
     ];
     let registry = McpRegistry::validated(servers).unwrap();
-    assert_eq!(registry.render_claude(), registry.render_claude());
-    assert!(
-        registry.render_claude().find("alpha").unwrap()
-            < registry.render_claude().find("zeta").unwrap(),
-        "servers render in a stable order regardless of input order"
+    let names: Vec<&str> = registry.servers().iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["alpha", "zeta"],
+        "servers must be sorted at construction"
     );
 }
 
@@ -458,4 +456,63 @@ fn a_pre_existing_adapter_we_never_wrote_is_never_clobbered() {
         "instructions I wrote myself",
         "a file with no stamp is not ours to overwrite"
     );
+}
+
+/// Adding a product must be a row in `PROVIDERS`, nothing more.
+///
+/// This asserts the property by iterating the table rather than naming Claude
+/// and Codex: every provider gets an adapter rendered, every provider's
+/// instruction file classifies as ours, and every provider's transcripts are
+/// evidence. A row added with no other change satisfies all three, and a row
+/// that needs a special case in `classify` fails here.
+#[test]
+fn every_provider_in_the_table_is_handled_without_a_special_case() {
+    use claudectl::shared_home::PROVIDERS;
+
+    let layout = SharedAgentHome::from_home(Path::new("/home/u"));
+    let plan = layout.plan(&Observed::default());
+
+    for provider in PROVIDERS {
+        let adapter = Path::new("/home/u").join(provider.instructions);
+
+        assert!(
+            plan.actions.iter().any(|a| matches!(
+                a,
+                Action::RenderAdapter { target, .. } if target == &adapter
+            )),
+            "{}: no adapter rendered",
+            provider.name
+        );
+        assert_eq!(
+            layout.classify(&adapter),
+            PathOwnership::GeneratedAdapter,
+            "{}: adapter not classified as ours",
+            provider.name
+        );
+
+        if let Some(transcripts) = provider.transcripts {
+            let sample = Path::new("/home/u")
+                .join(provider.home_dir)
+                .join(transcripts)
+                .join("x/y.jsonl");
+            assert_eq!(
+                layout.classify(&sample),
+                PathOwnership::TranscriptEvidence,
+                "{}: transcripts not treated as evidence",
+                provider.name
+            );
+        }
+        if !provider.home_dir.is_empty() {
+            assert_eq!(
+                layout.classify(
+                    &Path::new("/home/u")
+                        .join(provider.home_dir)
+                        .join("cfg.toml")
+                ),
+                PathOwnership::ProviderNative,
+                "{}: native config not left alone",
+                provider.name
+            );
+        }
+    }
 }

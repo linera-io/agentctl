@@ -20,6 +20,15 @@ and the accumulated context survives untouched; that is the whole point.
 └── plugins/                   NOT OURS — see below
 ```
 
+## Which products?
+
+`PROVIDERS` in `shared_home.rs` is the single list — each row gives a product's
+config directory, its global-instructions file, and where it keeps transcripts
+and any adoptable memory graph. Adapter rendering, ownership classification and
+memory discovery all iterate it, so supporting another product is a row rather
+than an edit in five places. A test iterates the table and asserts each of those
+three behaviours, so a row that would need a special case fails there.
+
 ## Ownership
 
 `PathOwnership` is the whole model, and every write decision derives from it:
@@ -106,13 +115,15 @@ It refuses rather than redacting, for the same reason the rest of this codebase
 does: a redacting writer fails open on the one shape it did not anticipate, and
 does it silently.
 
-Rendering is deterministic — servers are sorted at construction, so the same set
-always produces the same bytes and a reconcile diff means a real change rather
-than reordering noise.
+Servers are sorted at construction, so the same set always yields the same order
+and a future reconcile diff means a real change rather than reordering noise.
 
 ## Not yet implemented
 
-- Hook registry rendering (the MCP side is done; hooks reuse the same shape).
+- Rendering the MCP and hook registries into each product's native config.
+  Validation is wired in; the writers are not. Each product wants a different
+  file format, so they belong in `PROVIDERS` alongside the rest, and a renderer
+  named after one vendor is the shape this deliberately avoids.
 - Populating `sessions/index.jsonl` — that arrives with provider discovery.
 - Migrating memory *out* of a provider's tree. Adoption is by reference only;
   an explicit, reversible move is deliberately a separate operation.
