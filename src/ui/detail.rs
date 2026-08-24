@@ -7,10 +7,10 @@ use ratatui::{
 };
 
 use crate::app::App;
-use crate::session::ClaudeSession;
+use crate::session::AgentSession;
 use crate::theme::Theme;
 
-pub fn render_detail_panel(frame: &mut Frame, area: Rect, session: &ClaudeSession, app: &App) {
+pub fn render_detail_panel(frame: &mut Frame, area: Rect, session: &AgentSession, app: &App) {
     let t = &app.theme;
     let pid = session.pid.to_string();
     let status = session.status.to_string();

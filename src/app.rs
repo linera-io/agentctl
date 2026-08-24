@@ -12,7 +12,7 @@ use crate::hooks::{HookEvent, HookRegistry};
 use crate::launch::{self, LaunchRequest};
 use crate::monitor;
 use crate::process;
-use crate::session::{ClaudeSession, SessionStatus};
+use crate::session::{AgentSession, SessionStatus};
 use crate::terminals;
 use crate::theme::Theme;
 
@@ -21,7 +21,7 @@ use crate::theme::Theme;
 /// post-processing. All fields are owned values so the struct is `Send`
 /// and can be returned across `tokio::task::spawn_blocking`.
 pub struct RefreshIoOutput {
-    pub sessions: Vec<ClaudeSession>,
+    pub sessions: Vec<AgentSession>,
     pub new_pids: Vec<u32>,
     pub scan_elapsed: std::time::Duration,
     pub ps_elapsed: std::time::Duration,
@@ -47,14 +47,14 @@ pub struct RefreshIoOutput {
 /// wrong, and pointing at nothing. Treating that as resolved is what left
 /// those rows reading `Unreadable` forever: the recovery path was never
 /// reached because a value was already there.
-fn needs_transcript_resolution(session: &ClaudeSession) -> bool {
+fn needs_transcript_resolution(session: &AgentSession) -> bool {
     match session.jsonl_path.as_ref() {
         None => true,
         Some(path) => !path.exists(),
     }
 }
 
-pub fn do_refresh_io(prev_sessions: Vec<ClaudeSession>) -> RefreshIoOutput {
+pub fn do_refresh_io(prev_sessions: Vec<AgentSession>) -> RefreshIoOutput {
     let scan_start = std::time::Instant::now();
     let discovered = discovery::scan_sessions();
     let scan_elapsed = scan_start.elapsed();
@@ -148,9 +148,9 @@ pub fn do_refresh_io(prev_sessions: Vec<ClaudeSession>) -> RefreshIoOutput {
 /// one session id legitimately appears under two sandbox keys once a session
 /// has been resumed in a newer sandbox, and only one row should render.
 fn foreign_sessions(
-    local: &[ClaudeSession],
+    local: &[AgentSession],
     prev_cpu_samples: &std::collections::HashMap<String, crate::cpu::CpuSample>,
-) -> Vec<ClaudeSession> {
+) -> Vec<AgentSession> {
     let here = crate::sandbox_registry::current_sandbox();
     // Before reading the registry, fold in anything the host can see that the
     // registry lost. A slice is only rewritten when a hook fires inside its
@@ -192,12 +192,12 @@ pub(crate) fn foreign_sessions_from(
     snapshot: &crate::sandbox_registry::SandboxSnapshot,
     running: &RunningFilter,
     here: Option<&str>,
-    local: &[ClaudeSession],
+    local: &[AgentSession],
     now_ms: u64,
     collector_interval: std::time::Duration,
     terminals: Option<&crate::reaper::OpenTerminals>,
     prev_cpu_samples: &std::collections::HashMap<String, crate::cpu::CpuSample>,
-) -> Vec<ClaudeSession> {
+) -> Vec<AgentSession> {
     let vitals = snapshot_vitals_at(snapshot, now_ms, collector_interval);
 
     let mut seen: std::collections::HashSet<String> = local
@@ -240,7 +240,7 @@ pub(crate) fn foreign_sessions_from(
             ) {
                 continue;
             }
-            let Some(mut session) = ClaudeSession::from_registry_entry(name, entry) else {
+            let Some(mut session) = AgentSession::from_registry_entry(name, entry) else {
                 continue;
             };
             if !seen.insert(session.session_id.clone()) {
@@ -512,7 +512,7 @@ pub(crate) fn snapshot_vitals_at(
 /// torn reads are possible because the swap is at the whole-state level.
 #[derive(Default, Clone)]
 pub struct AppData {
-    pub sessions: Vec<ClaudeSession>,
+    pub sessions: Vec<AgentSession>,
     pub ledger_today: crate::usage_ledger::UsageSummary,
     pub ledger_week: crate::usage_ledger::UsageSummary,
     pub ledger_month: crate::usage_ledger::UsageSummary,
@@ -576,10 +576,10 @@ pub fn save_parked_to(path: &std::path::Path, parked: &HashSet<String>) {
 ///
 /// Returns the merged list and the PIDs that are brand new this tick.
 pub fn merge_discovered_sessions(
-    existing: Vec<ClaudeSession>,
-    discovered: Vec<ClaudeSession>,
-) -> (Vec<ClaudeSession>, Vec<u32>) {
-    let mut existing: HashMap<u32, ClaudeSession> =
+    existing: Vec<AgentSession>,
+    discovered: Vec<AgentSession>,
+) -> (Vec<AgentSession>, Vec<u32>) {
+    let mut existing: HashMap<u32, AgentSession> =
         existing.into_iter().map(|s| (s.pid, s)).collect();
     let mut new_pids = Vec::new();
     let merged = discovered
@@ -1054,7 +1054,7 @@ impl App {
     /// AppData, run a mutator on the sessions vec, atomic-swap. Holds
     /// no locks across the closure; safe for the closure body to
     /// reborrow `&self` (e.g. to call `App::apply_sort`).
-    pub fn with_sessions<F: FnOnce(&mut Vec<ClaudeSession>)>(&self, f: F) {
+    pub fn with_sessions<F: FnOnce(&mut Vec<AgentSession>)>(&self, f: F) {
         let snap = self.data_snapshot();
         let mut new_data = (*snap).clone();
         f(&mut new_data.sessions);
@@ -1608,7 +1608,7 @@ impl App {
         }
     }
 
-    fn apply_sort(&self, sessions: &mut [ClaudeSession]) {
+    fn apply_sort(&self, sessions: &mut [AgentSession]) {
         match self.sort_column {
             0 => sessions.sort_by(|a, b| {
                 a.status.sort_key().cmp(&b.status.sort_key()).then_with(|| {
@@ -1641,7 +1641,7 @@ impl App {
             5 => sessions.sort_by(|a, b| {
                 // Last user interaction: most recent first. Sessions with no
                 // recorded user message (ts == 0) sort to the bottom.
-                let key = |s: &ClaudeSession| {
+                let key = |s: &AgentSession| {
                     (
                         s.last_user_message_ts == 0,
                         std::cmp::Reverse(s.last_user_message_ts),
@@ -1653,7 +1653,7 @@ impl App {
                 // Sort key: unnamed sessions last, then ascending
                 // case-insensitive session_name, then project_name as tiebreak
                 // so two sessions with the same name group by project.
-                let key = |s: &ClaudeSession| {
+                let key = |s: &AgentSession| {
                     (
                         s.session_name.is_empty(),
                         s.session_name.to_lowercase(),
@@ -2302,7 +2302,7 @@ impl App {
         self.table_state.select(Some(i));
     }
 
-    pub fn selected_session(&self) -> Option<ClaudeSession> {
+    pub fn selected_session(&self) -> Option<AgentSession> {
         // One snapshot for both the ordering and the lookup. Taking two (as
         // this used to, via `visible_session_indices()` and then
         // `data_snapshot()`) let a refresh land in between and resolve the
@@ -2792,12 +2792,12 @@ impl App {
     }
 
     /// Owned snapshot of the sessions matching the current filters, in render
-    /// order. Returns `Vec<ClaudeSession>` (cloned) instead of references
+    /// order. Returns `Vec<AgentSession>` (cloned) instead of references
     /// because the underlying `AppData` lives behind an `Arc<RwLock<...>>` —
     /// we can't hand out references whose lifetime is tied to `&self` once
     /// the snapshot Arc is dropped at end of call. Callers that just need to
     /// iterate immutably can take `.iter()` on the result.
-    pub fn visible_sessions(&self) -> Vec<ClaudeSession> {
+    pub fn visible_sessions(&self) -> Vec<AgentSession> {
         let snap = self.data_snapshot();
         self.ordered_indices(&snap)
             .into_iter()
@@ -2822,13 +2822,13 @@ impl App {
         }
     }
 
-    fn matches_filters(&self, session: &ClaudeSession) -> bool {
+    fn matches_filters(&self, session: &AgentSession) -> bool {
         self.status_filter.matches(session.status)
             && self.matches_focus_filter(session)
             && self.matches_search_query(session)
     }
 
-    fn matches_focus_filter(&self, session: &ClaudeSession) -> bool {
+    fn matches_focus_filter(&self, session: &AgentSession) -> bool {
         let over_budget = self
             .budget_usd
             .map(|budget| session.has_usage_metrics() && session.cost_usd >= budget)
@@ -2854,7 +2854,7 @@ impl App {
         }
     }
 
-    fn matches_search_query(&self, session: &ClaudeSession) -> bool {
+    fn matches_search_query(&self, session: &AgentSession) -> bool {
         let query = self.search_query.trim();
         if query.is_empty() {
             return true;
@@ -3078,12 +3078,12 @@ impl App {
         // asks this function for the group order, so going through
         // `visible_sessions()` here would recurse. Group stats don't depend on
         // the order sessions arrive in, so nothing is lost.
-        let visible: Vec<&ClaudeSession> = self
+        let visible: Vec<&AgentSession> = self
             .filtered_indices(snap)
             .into_iter()
             .filter_map(|idx| snap.sessions.get(idx))
             .collect();
-        let mut groups: HashMap<String, Vec<&ClaudeSession>> = HashMap::new();
+        let mut groups: HashMap<String, Vec<&AgentSession>> = HashMap::new();
         for s in &visible {
             groups.entry(s.project_name.clone()).or_default().push(s);
         }
@@ -3159,7 +3159,7 @@ mod foreign_session_tests {
         RunningFilter::Known(names.iter().map(|n| (*n).to_string()).collect())
     }
 
-    fn ids(sessions: &[ClaudeSession]) -> Vec<&str> {
+    fn ids(sessions: &[AgentSession]) -> Vec<&str> {
         sessions.iter().map(|s| s.session_id.as_str()).collect()
     }
 
@@ -3784,7 +3784,7 @@ mod foreign_session_tests {
     #[test]
     fn a_locally_discovered_session_is_not_duplicated() {
         let registry = registry_of(&[("linera-agent-live", vec![entry("dup-1", "seen", 7)])]);
-        let mut local = ClaudeSession::from_raw(crate::session::RawSession {
+        let mut local = AgentSession::from_raw(crate::session::RawSession {
             pid: 7,
             session_id: "dup-1".into(),
             cwd: "/tmp".into(),
@@ -4061,7 +4061,7 @@ mod tests {
         cost_usd: f64,
         context_pct: f64,
         telemetry_available: bool,
-    ) -> ClaudeSession {
+    ) -> AgentSession {
         let raw = RawSession {
             pid,
             session_id: format!("session-{pid}"),
@@ -4070,7 +4070,7 @@ mod tests {
             name: None,
             name_source: None,
         };
-        let mut session = ClaudeSession::from_raw(raw);
+        let mut session = AgentSession::from_raw(raw);
         session.project_name = project.to_string();
         session.model = model.to_string();
         session.status = status;
@@ -4393,7 +4393,7 @@ mod tests {
     // apply_sort coverage
     // ------------------------------------------------------------------
 
-    fn named_session(pid: u32, name: &str, project: &str, last_user_ms: u64) -> ClaudeSession {
+    fn named_session(pid: u32, name: &str, project: &str, last_user_ms: u64) -> AgentSession {
         let raw = RawSession {
             pid,
             session_id: format!("s-{pid}"),
@@ -4402,7 +4402,7 @@ mod tests {
             name: None,
             name_source: None,
         };
-        let mut s = ClaudeSession::from_raw(raw);
+        let mut s = AgentSession::from_raw(raw);
         s.project_name = project.into();
         s.session_name = name.into();
         s.last_user_message_ts = last_user_ms;

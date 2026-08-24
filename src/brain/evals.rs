@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::config::BrainConfig;
-use crate::session::{ClaudeSession, RawSession, SessionStatus, TelemetryStatus};
+use crate::session::{AgentSession, RawSession, SessionStatus, TelemetryStatus};
 
 use super::client;
 use super::context;
@@ -173,7 +173,7 @@ fn run_one(config: &BrainConfig, scenario: &EvalScenario) -> EvalResult {
     }
 }
 
-fn build_session_from_eval(eval: &EvalSession) -> ClaudeSession {
+fn build_session_from_eval(eval: &EvalSession) -> AgentSession {
     let raw = RawSession {
         pid: 99999,
         session_id: "eval".into(),
@@ -182,7 +182,7 @@ fn build_session_from_eval(eval: &EvalSession) -> ClaudeSession {
         name: None,
         name_source: None,
     };
-    let mut s = ClaudeSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     s.status = match eval.status.to_lowercase().as_str() {
         "needsinput" | "needs input" => SessionStatus::NeedsInput,
         "waitinginput" | "waiting" => SessionStatus::WaitingInput,

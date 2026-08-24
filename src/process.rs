@@ -1,4 +1,4 @@
-use crate::session::{ClaudeSession, SessionStatus};
+use crate::session::{AgentSession, SessionStatus};
 use std::collections::{HashMap, HashSet};
 
 /// How many enrich ticks a session without any sidecar source is re-probed
@@ -13,7 +13,7 @@ const SIDECAR_PROBE_ATTEMPTS: u8 = 30;
 /// lifetime — observed live on a 30-session dashboard. Retried with a bounded
 /// budget so host-native sessions (which never have a sidecar) still settle
 /// to zero steady-state I/O.
-fn apply_sidecar_probe(session: &mut ClaudeSession, sidecar: Option<TerminalSidecar>) {
+fn apply_sidecar_probe(session: &mut AgentSession, sidecar: Option<TerminalSidecar>) {
     match sidecar {
         Some(s) => {
             if let Some(host_tty) = s.host_tty {
@@ -40,7 +40,7 @@ const CPU_BASELINE_GAP: std::time::Duration = std::time::Duration::from_millis(2
 
 /// Check which PIDs are alive and fetch TTY, CPU, MEM, command args — all via `ps`.
 /// No sysinfo dependency needed.
-pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
+pub fn fetch_and_enrich(sessions: &mut [AgentSession]) {
     if sessions.is_empty() {
         return;
     }
@@ -70,7 +70,7 @@ pub fn fetch_and_enrich(sessions: &mut [ClaudeSession]) {
 /// sidecars and consumes the bounded `sidecar_attempts` retry budget, so running
 /// it twice per tick would halve the number of ticks a session gets to resolve
 /// its terminal.
-fn resample_cpu(sessions: &mut [ClaudeSession]) {
+fn resample_cpu(sessions: &mut [AgentSession]) {
     let pids: Vec<String> = sessions.iter().map(|s| s.pid.to_string()).collect();
     let Ok(output) = std::process::Command::new("ps")
         .args(["-o", "pid=,cputime=", "-p", &pids.join(",")])
@@ -105,7 +105,7 @@ fn resample_cpu(sessions: &mut [ClaudeSession]) {
     }
 }
 
-fn enrich_from_ps(sessions: &mut [ClaudeSession]) {
+fn enrich_from_ps(sessions: &mut [AgentSession]) {
     let pids: Vec<String> = sessions.iter().map(|s| s.pid.to_string()).collect();
     let pid_arg = pids.join(",");
 
@@ -421,7 +421,7 @@ fn read_terminal_sidecar(pid: u32) -> Option<TerminalSidecar> {
 /// straight from its sidecar (falling back to the process environment the
 /// sidecar was written from).
 ///
-/// Deliberately re-probes rather than reading `ClaudeSession::tty`: that field
+/// Deliberately re-probes rather than reading `AgentSession::tty`: that field
 /// holds the host tty only when the sidecar probe happened to succeed, and the
 /// container tty from `ps` otherwise. The two are indistinguishable after the
 /// fact, so inferring from it would sometimes persist a *container* tty into
@@ -625,7 +625,7 @@ fn sidecar_from_env_map(vars: &HashMap<String, String>) -> Option<TerminalSideca
     })
 }
 
-fn extract_session_meta(cmd: &[&str], session: &mut ClaudeSession) {
+fn extract_session_meta(cmd: &[&str], session: &mut AgentSession) {
     // If the session JSON already provided a name (via /rename or auto-name),
     // don't overwrite it from the process command line.
     let name_already_set = !session.session_name.is_empty();
@@ -794,7 +794,7 @@ mod tests {
     fn sidecar_probe_retries_absence_then_settles_and_caches_success() {
         // Regression: absence cached on the FIRST attempt froze a session
         // without terminal routing for the TUI's lifetime.
-        let mut session = crate::session::ClaudeSession::from_raw(crate::session::RawSession {
+        let mut session = crate::session::AgentSession::from_raw(crate::session::RawSession {
             pid: 42,
             session_id: "s".into(),
             cwd: "/w".into(),
@@ -823,7 +823,7 @@ mod tests {
         assert_eq!(session.terminal_id.as_deref(), Some("9B65C6AC"));
 
         // Pure absence settles only after the bounded budget.
-        let mut never = crate::session::ClaudeSession::from_raw(crate::session::RawSession {
+        let mut never = crate::session::AgentSession::from_raw(crate::session::RawSession {
             pid: 43,
             session_id: "n".into(),
             cwd: "/w".into(),

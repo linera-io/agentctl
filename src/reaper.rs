@@ -497,7 +497,7 @@ fn parse_sandbox_procs(text: &str) -> HashMap<u32, SandboxProc> {
 /// onto the host-shared mount, so `session_id`, `cwd` and `name` are always the
 /// current shape — which is the whole point of no longer asking an image-aged
 /// binary for them. An entry with no id is skipped: the renderer drops what it
-/// cannot identify (`ClaudeSession::from_snapshot_value` returns `None`), so
+/// cannot identify (`AgentSession::from_snapshot_value` returns `None`), so
 /// emitting it would only inflate the file.
 ///
 /// A recorded pid that the probe did not return is a departed session. Dropping
@@ -1015,7 +1015,7 @@ fn prune_closed_sessions_after(settle: Duration) {
         return;
     }
 
-    let live_ids = |sessions: Vec<crate::session::ClaudeSession>| -> HashSet<String> {
+    let live_ids = |sessions: Vec<crate::session::AgentSession>| -> HashSet<String> {
         sessions.into_iter().map(|s| s.session_id).collect()
     };
 

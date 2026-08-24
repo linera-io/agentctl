@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::config::BrainConfig;
 use crate::rules::{self, RuleAction, RuleMatch};
-use crate::session::{ClaudeSession, SessionStatus};
+use crate::session::{AgentSession, SessionStatus};
 
 use super::client::BrainSuggestion;
 use super::context;
@@ -63,7 +63,7 @@ impl BrainEngine {
     /// Returns a list of (pid, status_message) for actions taken this tick.
     pub fn tick(
         &mut self,
-        sessions: &[ClaudeSession],
+        sessions: &[AgentSession],
         deny_rules: &[crate::rules::AutoRule],
     ) -> Vec<(u32, String)> {
         let mut actions = Vec::new();
@@ -323,7 +323,7 @@ impl BrainEngine {
         actions
     }
 
-    fn spawn_inference(&mut self, session: &ClaudeSession, all_sessions: &[ClaudeSession]) {
+    fn spawn_inference(&mut self, session: &AgentSession, all_sessions: &[AgentSession]) {
         let pid = session.pid;
         let config = self.config.clone();
         let tx = self.tx.clone();
@@ -371,8 +371,8 @@ impl BrainEngine {
     /// and either send directly (if target is waiting) or queue in mailbox.
     fn execute_route(
         &self,
-        source: &ClaudeSession,
-        target: &ClaudeSession,
+        source: &AgentSession,
+        target: &AgentSession,
     ) -> Result<String, String> {
         // Build source context to get recent transcript
         let source_ctx = context::build_context(
@@ -404,7 +404,7 @@ impl BrainEngine {
     }
 
     /// Accept a pending brain suggestion (user pressed 'b').
-    pub fn accept(&mut self, pid: u32, session: &ClaudeSession) -> Option<String> {
+    pub fn accept(&mut self, pid: u32, session: &AgentSession) -> Option<String> {
         let suggestion = self.pending.remove(&pid)?;
         let rule_match = suggestion_to_rule_match(&suggestion);
         match rules::execute(&rule_match, session) {
@@ -422,7 +422,7 @@ impl BrainEngine {
     /// Saves a checkpoint and spawns a fresh session with the summary as prompt.
     pub fn maybe_restart_saturated(
         &mut self,
-        sessions: &[ClaudeSession],
+        sessions: &[AgentSession],
         lifecycle: &crate::config::LifecycleConfig,
         is_idle: bool,
         // Injected so tests can exercise the restart *decision* without spawning
@@ -506,7 +506,7 @@ impl BrainEngine {
     }
 
     /// Clear pending suggestions for PIDs that are no longer in NeedsInput/WaitingInput.
-    pub fn cleanup(&mut self, sessions: &[ClaudeSession]) {
+    pub fn cleanup(&mut self, sessions: &[AgentSession]) {
         let active_pids: HashSet<u32> = sessions.iter().map(|s| s.pid).collect();
         self.pending.retain(|pid, _| {
             active_pids.contains(pid)
@@ -524,7 +524,7 @@ impl BrainEngine {
     /// Run orchestration evaluation: ask the brain if any cross-session actions
     /// should be taken (spawn, route, terminate). Runs less frequently than
     /// per-session advisory (every orchestrate_interval_secs).
-    pub fn maybe_orchestrate(&mut self, sessions: &[ClaudeSession]) -> Vec<(u32, String)> {
+    pub fn maybe_orchestrate(&mut self, sessions: &[AgentSession]) -> Vec<(u32, String)> {
         if !self.config.orchestrate || !self.config.auto_mode {
             return Vec::new();
         }
@@ -566,7 +566,7 @@ impl BrainEngine {
     pub fn handle_orchestration_result(
         &mut self,
         suggestion: &BrainSuggestion,
-        sessions: &[ClaudeSession],
+        sessions: &[AgentSession],
     ) -> Vec<(u32, String)> {
         self.orchestrate_inflight = false;
         let mut actions = Vec::new();
@@ -660,7 +660,7 @@ impl BrainEngine {
 }
 
 /// Build the orchestration prompt from the prompt library.
-fn build_orchestration_prompt(sessions: &[ClaudeSession], _config: &BrainConfig) -> String {
+fn build_orchestration_prompt(sessions: &[AgentSession], _config: &BrainConfig) -> String {
     let session_map = context::format_global_session_map_public(sessions);
     let template = super::prompts::load(super::prompts::ORCHESTRATION);
     super::prompts::expand(
@@ -675,7 +675,7 @@ fn build_orchestration_prompt(sessions: &[ClaudeSession], _config: &BrainConfig)
 /// Check if a Write/Edit/NotebookEdit tool call targets a file that another
 /// running session has in its `files_modified` map.
 /// Returns a warning message if a conflict is found, or None if clear.
-fn check_file_conflicts(session: &ClaudeSession, all_sessions: &[ClaudeSession]) -> Option<String> {
+fn check_file_conflicts(session: &AgentSession, all_sessions: &[AgentSession]) -> Option<String> {
     let tool = session.pending_tool_name.as_deref()?;
     if !matches!(tool, "Write" | "Edit" | "NotebookEdit") {
         return None;
@@ -734,7 +734,7 @@ fn extract_file_path(input: &str) -> Option<String> {
     None
 }
 
-fn save_checkpoint(session_id: &str, session: &ClaudeSession, summary: &str) -> Result<(), String> {
+fn save_checkpoint(session_id: &str, session: &AgentSession, summary: &str) -> Result<(), String> {
     let home = std::env::var("HOME").map_err(|e| format!("HOME not set: {e}"))?;
     let dir = std::path::PathBuf::from(home)
         .join(".claudectl")
@@ -810,7 +810,7 @@ mod tests {
         }
     }
 
-    fn make_session(pid: u32, status: SessionStatus) -> ClaudeSession {
+    fn make_session(pid: u32, status: SessionStatus) -> AgentSession {
         let raw = RawSession {
             pid,
             session_id: "test".into(),
@@ -819,7 +819,7 @@ mod tests {
             name: None,
             name_source: None,
         };
-        let mut s = ClaudeSession::from_raw(raw);
+        let mut s = AgentSession::from_raw(raw);
         s.status = status;
         s.telemetry_status = TelemetryStatus::Available;
         s.pending_tool_name = Some("Bash".into());

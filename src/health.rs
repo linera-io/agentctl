@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::config::HealthThresholds;
-use crate::session::ClaudeSession;
+use crate::session::AgentSession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -19,7 +19,7 @@ pub struct HealthCheck {
 }
 
 /// Run all health checks against a session. Returns warnings sorted by severity.
-pub fn check_session(session: &ClaudeSession, t: &HealthThresholds) -> Vec<HealthCheck> {
+pub fn check_session(session: &AgentSession, t: &HealthThresholds) -> Vec<HealthCheck> {
     let mut checks = Vec::new();
 
     if let Some(c) = check_cache_health(session, t) {
@@ -64,7 +64,7 @@ pub fn check_session(session: &ClaudeSession, t: &HealthThresholds) -> Vec<Healt
 }
 
 /// Return the most severe health icon for display in the table, or empty string if healthy.
-pub fn status_icon(session: &ClaudeSession, t: &HealthThresholds) -> &'static str {
+pub fn status_icon(session: &AgentSession, t: &HealthThresholds) -> &'static str {
     let checks = check_session(session, t);
     match checks.first() {
         Some(c) if c.severity == Severity::Critical => c.icon,
@@ -74,7 +74,7 @@ pub fn status_icon(session: &ClaudeSession, t: &HealthThresholds) -> &'static st
 }
 
 /// Format a compact health summary for the status bar.
-pub fn format_health_summary(sessions: &[ClaudeSession], t: &HealthThresholds) -> Option<String> {
+pub fn format_health_summary(sessions: &[AgentSession], t: &HealthThresholds) -> Option<String> {
     let mut warnings = 0;
     let mut criticals = 0;
     let mut worst_msg = String::new();
@@ -113,7 +113,7 @@ pub fn format_health_summary(sessions: &[ClaudeSession], t: &HealthThresholds) -
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Detect low cache hit ratio (e.g., cache TTL bug causing 12x cost).
-fn check_cache_health(session: &ClaudeSession, t: &HealthThresholds) -> Option<HealthCheck> {
+fn check_cache_health(session: &AgentSession, t: &HealthThresholds) -> Option<HealthCheck> {
     let total_input = session.total_input_tokens;
     let cache_read = session.cache_read_tokens;
 
@@ -153,7 +153,7 @@ fn check_cache_health(session: &ClaudeSession, t: &HealthThresholds) -> Option<H
 }
 
 /// Detect burn rate spikes — paying more for less output.
-fn check_cost_spike(session: &ClaudeSession, t: &HealthThresholds) -> Option<HealthCheck> {
+fn check_cost_spike(session: &AgentSession, t: &HealthThresholds) -> Option<HealthCheck> {
     if session.cost_usd < 1.0 || session.burn_rate_per_hr <= 0.0 {
         return None;
     }
@@ -196,7 +196,7 @@ fn check_cost_spike(session: &ClaudeSession, t: &HealthThresholds) -> Option<Hea
 }
 
 /// Detect tool error loops — same tool failing repeatedly.
-fn check_loop_detection(session: &ClaudeSession, t: &HealthThresholds) -> Option<HealthCheck> {
+fn check_loop_detection(session: &AgentSession, t: &HealthThresholds) -> Option<HealthCheck> {
     if !session.last_tool_error {
         return None;
     }
@@ -230,7 +230,7 @@ fn check_loop_detection(session: &ClaudeSession, t: &HealthThresholds) -> Option
 }
 
 /// Detect stalled sessions — high cost but no file output.
-fn check_stalled(session: &ClaudeSession, t: &HealthThresholds) -> Option<HealthCheck> {
+fn check_stalled(session: &AgentSession, t: &HealthThresholds) -> Option<HealthCheck> {
     if session.cost_usd < t.stall_min_cost {
         return None;
     }
@@ -254,7 +254,7 @@ fn check_stalled(session: &ClaudeSession, t: &HealthThresholds) -> Option<Health
 }
 
 /// Detect context window saturation.
-fn check_context_saturation(session: &ClaudeSession, t: &HealthThresholds) -> Option<HealthCheck> {
+fn check_context_saturation(session: &AgentSession, t: &HealthThresholds) -> Option<HealthCheck> {
     if session.context_max == 0 {
         return None;
     }
@@ -289,7 +289,7 @@ fn check_context_saturation(session: &ClaudeSession, t: &HealthThresholds) -> Op
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Compute a composite cognitive decay score (0-100) from multiple signals.
-pub fn compute_decay_score(session: &ClaudeSession, _t: &HealthThresholds) -> u32 {
+pub fn compute_decay_score(session: &AgentSession, _t: &HealthThresholds) -> u32 {
     let mut score: f64 = 0.0;
 
     // Context contribution: 0-40 points (linear from 40% to 100%)
@@ -339,7 +339,7 @@ pub fn compute_decay_score(session: &ClaudeSession, _t: &HealthThresholds) -> u3
 }
 
 /// Composite cognitive decay check — wraps the decay score into a HealthCheck.
-fn check_cognitive_decay(session: &ClaudeSession, t: &HealthThresholds) -> Option<HealthCheck> {
+fn check_cognitive_decay(session: &AgentSession, t: &HealthThresholds) -> Option<HealthCheck> {
     let score = compute_decay_score(session, t);
     if score >= 80 {
         Some(HealthCheck {
@@ -377,10 +377,7 @@ fn check_cognitive_decay(session: &ClaudeSession, t: &HealthThresholds) -> Optio
 }
 
 /// Suggest proactive compaction at moderate context usage (before degradation starts).
-fn check_proactive_compaction(
-    session: &ClaudeSession,
-    t: &HealthThresholds,
-) -> Option<HealthCheck> {
+fn check_proactive_compaction(session: &AgentSession, t: &HealthThresholds) -> Option<HealthCheck> {
     if session.context_max == 0 {
         return None;
     }
@@ -402,7 +399,7 @@ fn check_proactive_compaction(
 }
 
 /// Detect token efficiency degradation — spending more tokens per file edit over time.
-fn check_token_efficiency(session: &ClaudeSession, t: &HealthThresholds) -> Option<HealthCheck> {
+fn check_token_efficiency(session: &AgentSession, t: &HealthThresholds) -> Option<HealthCheck> {
     let baseline = session.baseline_tokens_per_edit?;
     if baseline < 100.0 || session.edit_event_count < 8 {
         return None;
@@ -427,7 +424,7 @@ fn check_token_efficiency(session: &ClaudeSession, t: &HealthThresholds) -> Opti
 }
 
 /// Detect error rate acceleration — errors are increasing over time.
-fn check_error_acceleration(session: &ClaudeSession, t: &HealthThresholds) -> Option<HealthCheck> {
+fn check_error_acceleration(session: &AgentSession, t: &HealthThresholds) -> Option<HealthCheck> {
     let baseline = session.baseline_error_rate?;
     if baseline <= 0.0 || session.error_counts_per_window.len() < 4 {
         return None;
@@ -459,7 +456,7 @@ fn check_error_acceleration(session: &ClaudeSession, t: &HealthThresholds) -> Op
 }
 
 /// Detect file re-reads without intervening edits — possible confusion or looping.
-fn check_repetition(session: &ClaudeSession, t: &HealthThresholds) -> Option<HealthCheck> {
+fn check_repetition(session: &AgentSession, t: &HealthThresholds) -> Option<HealthCheck> {
     let max_rereads = session
         .file_reads_since_edit
         .values()
@@ -500,7 +497,7 @@ mod tests {
         HealthThresholds::default()
     }
 
-    fn make_session() -> ClaudeSession {
+    fn make_session() -> AgentSession {
         let raw = RawSession {
             pid: 1,
             session_id: "test".into(),
@@ -509,7 +506,7 @@ mod tests {
             name: None,
             name_source: None,
         };
-        let mut s = ClaudeSession::from_raw(raw);
+        let mut s = AgentSession::from_raw(raw);
         s.status = SessionStatus::Processing;
         s.telemetry_status = TelemetryStatus::Available;
         s.model = "opus".into();

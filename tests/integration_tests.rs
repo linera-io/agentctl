@@ -5,7 +5,7 @@ use std::time::Duration;
 use agentctl::discovery;
 use agentctl::models;
 use agentctl::monitor;
-use agentctl::session::{ClaudeSession, RawSession, SessionStatus, TelemetryStatus};
+use agentctl::session::{AgentSession, RawSession, SessionStatus, TelemetryStatus};
 
 /// Point hook_state at a per-process tempdir before any test reads it. Without
 /// this, infer_status would pick up real `~/.claudectl/state/*.json` files
@@ -24,7 +24,7 @@ fn isolate_hook_state_dir() {
 }
 
 /// Helper: create a minimal session for testing status inference.
-fn make_session(cpu: f32, last_message_age_secs: u64) -> ClaudeSession {
+fn make_session(cpu: f32, last_message_age_secs: u64) -> AgentSession {
     isolate_hook_state_dir();
     let raw = RawSession {
         pid: 1,
@@ -34,7 +34,7 @@ fn make_session(cpu: f32, last_message_age_secs: u64) -> ClaudeSession {
         name: None,
         name_source: None,
     };
-    let mut s = ClaudeSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     s.cpu_rate_percent = Some(cpu);
     s.telemetry_status = TelemetryStatus::Available;
     s.usage_metrics_available = true;
@@ -261,7 +261,7 @@ fn status_no_telemetry_unknown() {
         name: None,
         name_source: None,
     };
-    let mut s = ClaudeSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     monitor::infer_status(&mut s, "", "");
     assert_eq!(s.status, SessionStatus::Unknown);
 }
@@ -272,7 +272,7 @@ fn status_no_telemetry_unknown() {
 
 /// Build a session with a unique `session_id` so each test owns its own
 /// state file and can't be polluted by sibling tests.
-fn session_with_id(id: &str, cpu: f32) -> ClaudeSession {
+fn session_with_id(id: &str, cpu: f32) -> AgentSession {
     isolate_hook_state_dir();
     let raw = RawSession {
         pid: 1,
@@ -282,7 +282,7 @@ fn session_with_id(id: &str, cpu: f32) -> ClaudeSession {
         name: None,
         name_source: None,
     };
-    let mut s = ClaudeSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     s.cpu_rate_percent = Some(cpu);
     s.telemetry_status = TelemetryStatus::Available;
     s.usage_metrics_available = true;
@@ -942,7 +942,7 @@ fn shorten_model_unknown() {
 // JSONL Parsing Integration Tests (using temp files)
 // ────────────────────────────────────────────────────────────────────────────
 
-fn make_session_with_jsonl(content: &str) -> (ClaudeSession, tempfile::NamedTempFile) {
+fn make_session_with_jsonl(content: &str) -> (AgentSession, tempfile::NamedTempFile) {
     let mut file = tempfile::NamedTempFile::new().unwrap();
     file.write_all(content.as_bytes()).unwrap();
     file.flush().unwrap();
@@ -955,7 +955,7 @@ fn make_session_with_jsonl(content: &str) -> (ClaudeSession, tempfile::NamedTemp
         name: None,
         name_source: None,
     };
-    let mut s = ClaudeSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     s.jsonl_path = Some(file.path().to_path_buf());
     (s, file)
 }
@@ -964,7 +964,7 @@ fn make_session_with_paths(
     cwd: String,
     session_id: String,
     jsonl_path: std::path::PathBuf,
-) -> ClaudeSession {
+) -> AgentSession {
     let raw = RawSession {
         pid: 1,
         session_id,
@@ -973,7 +973,7 @@ fn make_session_with_paths(
         name: None,
         name_source: None,
     };
-    let mut s = ClaudeSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     s.jsonl_path = Some(jsonl_path);
     s
 }
@@ -1039,7 +1039,7 @@ fn jsonl_incremental_reads() {
         name: None,
         name_source: None,
     };
-    let mut s = ClaudeSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     s.jsonl_path = Some(file.path().to_path_buf());
 
     // First read
@@ -1087,7 +1087,7 @@ fn regression_rename_does_not_revert_to_stale_scan_name() {
 
     // Tick 2: discovery re-supplies the stale name; no new transcript bytes,
     // so the monitor cannot re-recover — the merge must hold the title.
-    let fresh = ClaudeSession::from_raw(RawSession {
+    let fresh = AgentSession::from_raw(RawSession {
         pid: 1,
         session_id: "test".into(),
         cwd: "/tmp/test".into(),
@@ -1125,7 +1125,7 @@ fn rotation_reestablishes_a_carried_over_title_from_the_new_transcript() {
     // merge test); Claude Code writes the custom-title record near the head
     // of a rotated transcript, and the rotated row re-parses from offset 0,
     // so a carried-over explicit title re-establishes in the same pass.
-    let mut existing = ClaudeSession::from_raw(RawSession {
+    let mut existing = AgentSession::from_raw(RawSession {
         pid: 9,
         session_id: "session-a".into(),
         cwd: "/tmp/test".into(),
@@ -1215,7 +1215,7 @@ fn jsonl_missing_file() {
         name: None,
         name_source: None,
     };
-    let mut s = ClaudeSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     s.jsonl_path = Some(std::path::PathBuf::from("/nonexistent/path.jsonl"));
 
     // Should not panic
@@ -1233,7 +1233,7 @@ fn jsonl_no_path() {
         name: None,
         name_source: None,
     };
-    let mut s = ClaudeSession::from_raw(raw);
+    let mut s = AgentSession::from_raw(raw);
     // jsonl_path is None
 
     monitor::update_tokens(&mut s);
@@ -1633,7 +1633,7 @@ fn resolve_with_layout(
     cwd: &str,
     session_id: &str,
     slug_on_disk: &str,
-) -> (ClaudeSession, tempfile::TempDir) {
+) -> (AgentSession, tempfile::TempDir) {
     let _guard = HOME_LOCK.lock().unwrap();
 
     let home = tempfile::tempdir().unwrap();
@@ -1657,7 +1657,7 @@ fn resolve_with_layout(
         name: None,
         name_source: None,
     };
-    let mut session = ClaudeSession::from_raw(raw);
+    let mut session = AgentSession::from_raw(raw);
     discovery::resolve_jsonl_paths(std::slice::from_mut(&mut session));
 
     // Restore HOME
@@ -1735,7 +1735,7 @@ fn resolve_jsonl_encoding_mismatch_fallback() {
         name: None,
         name_source: None,
     };
-    let mut session = ClaudeSession::from_raw(raw);
+    let mut session = AgentSession::from_raw(raw);
     discovery::resolve_jsonl_paths(std::slice::from_mut(&mut session));
 
     if let Some(h) = original_home {
@@ -2757,7 +2757,7 @@ fn regression_a_blank_cwd_recovers_its_project_and_transcript() {
     .unwrap();
 
     let _guard = EnvGuard::set("HOME", home.path());
-    let mut session = ClaudeSession::from_raw(RawSession {
+    let mut session = AgentSession::from_raw(RawSession {
         pid: 4242,
         session_id: id.into(),
         cwd: String::new(), // blanked by the process-table fallback

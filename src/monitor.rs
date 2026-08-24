@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::hook_state::{self, HookState};
 use crate::models;
-use crate::session::{ClaudeSession, SessionStatus, SubagentRollup, TelemetryStatus};
+use crate::session::{AgentSession, SessionStatus, SubagentRollup, TelemetryStatus};
 use crate::transcript::{TranscriptBlock, TranscriptEvent, TranscriptRole, parse_line};
 
 #[derive(Default)]
@@ -26,7 +26,7 @@ impl UsageRollup {
 }
 
 /// Read new JSONL entries since last offset, accumulate token stats.
-pub fn update_tokens(session: &mut ClaudeSession) {
+pub fn update_tokens(session: &mut AgentSession) {
     // Seed from persisted state so status inference works on ticks with no new JSONL.
     let mut last_type = session.last_msg_type.clone();
     let mut last_stop_reason = session.last_stop_reason.clone();
@@ -348,7 +348,7 @@ pub fn update_tokens(session: &mut ClaudeSession) {
 }
 
 fn finalize_usage(
-    session: &mut ClaudeSession,
+    session: &mut AgentSession,
     last_type: &str,
     last_stop_reason: &str,
     is_waiting_for_task: bool,
@@ -404,7 +404,7 @@ fn finalize_usage(
 /// function of its inputs and can be replayed at any age from fixtures. That
 /// separation is not cosmetic — status defects have repeatedly shipped because
 /// the age-dependent branches were only reachable by waiting in real time.
-pub fn infer_status(session: &mut ClaudeSession, last_msg_type: &str, last_stop_reason: &str) {
+pub fn infer_status(session: &mut AgentSession, last_msg_type: &str, last_stop_reason: &str) {
     let hook_state = if session.session_id.is_empty() {
         None
     } else {
@@ -825,7 +825,7 @@ fn now_ms() -> u64 {
 
 /// Estimate USD cost based on token usage and model.
 #[allow(dead_code)]
-pub fn estimate_cost(session: &ClaudeSession) -> f64 {
+pub fn estimate_cost(session: &AgentSession) -> f64 {
     estimate_cost_components(
         &session.model,
         session.total_input_tokens,
@@ -842,7 +842,7 @@ pub fn model_context_max(model: &str) -> u64 {
 }
 
 /// Extract tool usage stats and file paths from tool_use content blocks.
-fn record_tool_usage(tool_name: &str, input: &Value, session: &mut ClaudeSession) {
+fn record_tool_usage(tool_name: &str, input: &Value, session: &mut AgentSession) {
     if tool_name.is_empty() {
         return;
     }
@@ -885,7 +885,7 @@ pub fn shorten_model(model: &str) -> String {
     models::shorten_model(model)
 }
 
-fn refresh_subagent_rollups(session: &mut ClaudeSession) -> UsageRollup {
+fn refresh_subagent_rollups(session: &mut AgentSession) -> UsageRollup {
     for path in session.active_subagent_jsonl_paths.clone() {
         let rollup = session.subagent_rollups.entry(path.clone()).or_default();
         update_subagent_rollup(&path, rollup, &session.model);

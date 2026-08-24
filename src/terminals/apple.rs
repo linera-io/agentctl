@@ -1,5 +1,5 @@
 use super::{applescript_cd_exec, run_osascript};
-use crate::session::ClaudeSession;
+use crate::session::AgentSession;
 
 /// Open a new Apple Terminal (Terminal.app) window that runs `command` in `cwd`.
 /// A bare `do script` (no `in` target) opens a fresh window, mirroring the
@@ -21,7 +21,7 @@ fn new_window_script(cwd: &str, command: &str) -> String {
     )
 }
 
-pub fn switch(session: &ClaudeSession) -> Result<(), String> {
+pub fn switch(session: &AgentSession) -> Result<(), String> {
     let script = format!(
         r#"
         tell application "Terminal"

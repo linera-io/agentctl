@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
-use crate::session::{ClaudeSession, SessionStatus};
+use crate::session::{AgentSession, SessionStatus};
 use crate::terminals;
 
 /// A message queued for delivery to a session.
@@ -93,7 +93,7 @@ pub fn pending_messages(pid: u32) -> Vec<MailMessage> {
 /// Attempt to deliver pending messages to eligible sessions.
 /// Only delivers when the target is in WaitingInput state (not mid-processing).
 /// Returns a list of (pid, status_message) for deliveries made.
-pub fn deliver_pending(sessions: &[ClaudeSession]) -> Vec<(u32, String)> {
+pub fn deliver_pending(sessions: &[AgentSession]) -> Vec<(u32, String)> {
     let mut delivered = Vec::new();
 
     for session in sessions {

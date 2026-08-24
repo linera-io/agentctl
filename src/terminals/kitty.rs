@@ -1,4 +1,4 @@
-use crate::session::ClaudeSession;
+use crate::session::AgentSession;
 
 /// Open a new Kitty OS window running `command` in `cwd`, via a login shell so
 /// PATH resolves `claude`/`sc`. Needs `allow_remote_control` (like [`launch`]).
@@ -50,7 +50,7 @@ pub fn launch(cwd: &str, prompt: Option<&str>, resume: Option<&str>) -> Result<S
     }
 }
 
-pub fn switch(session: &ClaudeSession) -> Result<(), String> {
+pub fn switch(session: &AgentSession) -> Result<(), String> {
     // Kitty has a powerful remote control protocol via `kitty @ focus-window`.
     // Requires `allow_remote_control yes` or `allow_remote_control socket-only` in kitty.conf.
     // Match by the PID of the foreground process in the window.
@@ -85,7 +85,7 @@ pub fn switch(session: &ClaudeSession) -> Result<(), String> {
     }
 }
 
-pub fn send_input(session: &ClaudeSession, text: &str) -> Result<(), String> {
+pub fn send_input(session: &AgentSession, text: &str) -> Result<(), String> {
     let output = std::process::Command::new("kitty")
         .args([
             "@",
@@ -104,7 +104,7 @@ pub fn send_input(session: &ClaudeSession, text: &str) -> Result<(), String> {
     }
 }
 
-pub fn approve(session: &ClaudeSession) -> Result<(), String> {
+pub fn approve(session: &AgentSession) -> Result<(), String> {
     let output = std::process::Command::new("kitty")
         .args([
             "@",

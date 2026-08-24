@@ -1339,7 +1339,7 @@ pub(crate) fn run_watch(
     }
 }
 
-pub(crate) fn format_session(fmt: &str, s: &session::ClaudeSession) -> String {
+pub(crate) fn format_session(fmt: &str, s: &session::AgentSession) -> String {
     let cost = if s.has_usage_metrics() {
         format!("{:.2}", s.cost_usd)
     } else {
@@ -1509,7 +1509,7 @@ pub(crate) fn run_brain_query(cfg: &config::Config, cli: &Cli) -> io::Result<()>
         .collect();
 
     // Build a minimal synthetic session for rule matching
-    let mut synthetic = session::ClaudeSession::from_raw(session::RawSession {
+    let mut synthetic = session::AgentSession::from_raw(session::RawSession {
         pid: std::process::id(),
         session_id: "brain-query".into(),
         cwd: std::env::current_dir()

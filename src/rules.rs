@@ -1,4 +1,4 @@
-use crate::session::ClaudeSession;
+use crate::session::AgentSession;
 use crate::terminals;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +89,7 @@ pub struct RuleMatch {
 
 /// Evaluate all rules against a session. Deny rules take precedence.
 /// Among non-deny rules, first match in config order wins.
-pub fn evaluate(rules: &[AutoRule], session: &ClaudeSession) -> Option<RuleMatch> {
+pub fn evaluate(rules: &[AutoRule], session: &AgentSession) -> Option<RuleMatch> {
     let mut first_non_deny: Option<RuleMatch> = None;
 
     for rule in rules {
@@ -119,7 +119,7 @@ pub fn evaluate(rules: &[AutoRule], session: &ClaudeSession) -> Option<RuleMatch
 
 /// Check if all of a rule's conditions match the session.
 /// Omitted conditions (empty vec / None) are treated as wildcards.
-fn matches_rule(rule: &AutoRule, session: &ClaudeSession) -> bool {
+fn matches_rule(rule: &AutoRule, session: &AgentSession) -> bool {
     if !rule.match_status.is_empty() {
         let status_str = session.status.to_string().to_lowercase();
         let any_match = rule
@@ -189,7 +189,7 @@ fn matches_rule(rule: &AutoRule, session: &ClaudeSession) -> bool {
 }
 
 /// Execute a rule action on a session. Returns a human-readable status message.
-pub fn execute(result: &RuleMatch, session: &ClaudeSession) -> Result<String, String> {
+pub fn execute(result: &RuleMatch, session: &AgentSession) -> Result<String, String> {
     let name = session.display_name();
     match result.action {
         RuleAction::Approve => {
@@ -260,8 +260,8 @@ pub fn execute(result: &RuleMatch, session: &ClaudeSession) -> Result<String, St
 
 /// Execute a Route action: summarize source output and send to target session.
 pub fn execute_route(
-    source: &ClaudeSession,
-    target: &ClaudeSession,
+    source: &AgentSession,
+    target: &AgentSession,
     summary: &str,
     rule_name: &str,
 ) -> Result<String, String> {
@@ -278,9 +278,9 @@ pub fn execute_route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{ClaudeSession, RawSession, SessionStatus, TelemetryStatus};
+    use crate::session::{AgentSession, RawSession, SessionStatus, TelemetryStatus};
 
-    fn make_session() -> ClaudeSession {
+    fn make_session() -> AgentSession {
         let raw = RawSession {
             pid: 100,
             session_id: "test".into(),
@@ -289,7 +289,7 @@ mod tests {
             name: None,
             name_source: None,
         };
-        let mut s = ClaudeSession::from_raw(raw);
+        let mut s = AgentSession::from_raw(raw);
         s.status = SessionStatus::NeedsInput;
         s.telemetry_status = TelemetryStatus::Available;
         s.pending_tool_name = Some("Bash".into());

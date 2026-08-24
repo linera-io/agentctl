@@ -412,7 +412,7 @@ pub fn record_live_sessions(check: &crate::terminal_owner::OwnerCheck) -> io::Re
 /// not a `ps`, so the zero-fork steady state stands.
 fn resolve_owner(
     known: &[crate::sandbox_registry::SessionEntry],
-    session: &crate::session::ClaudeSession,
+    session: &crate::session::AgentSession,
     in_sandbox: bool,
     check: &crate::terminal_owner::OwnerCheck,
 ) -> Option<crate::terminal_owner::TerminalOwner> {
@@ -1227,7 +1227,7 @@ mod tests {
         // The iTerm2 crash-relaunch shape: the session process survives its
         // recorded terminal. The cache hit must notice the owner is gone and
         // re-resolve instead of freezing the dead owner into the entry forever.
-        let session = crate::session::ClaudeSession::from_raw(crate::session::RawSession {
+        let session = crate::session::AgentSession::from_raw(crate::session::RawSession {
             pid: std::process::id(),
             session_id: "aaa".to_string(),
             cwd: "/work".to_string(),

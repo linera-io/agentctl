@@ -3,7 +3,7 @@ use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
-use crate::session::{ClaudeSession, RawSession};
+use crate::session::{AgentSession, RawSession};
 
 fn sessions_dir() -> PathBuf {
     dirs_home().join(".claude").join("sessions")
@@ -27,7 +27,7 @@ pub fn projects_dir() -> PathBuf {
 /// session files. A session is a live process, not a timestamp: liveness means
 /// its pid is a live `claude` process in this namespace (the snapshot check
 /// inside [`assemble_sessions`]), degrading to bare `kill -0` if `ps` fails.
-pub fn live_sessions() -> Vec<ClaudeSession> {
+pub fn live_sessions() -> Vec<AgentSession> {
     try_live_sessions().unwrap_or_default()
 }
 
@@ -42,7 +42,7 @@ pub fn live_sessions() -> Vec<ClaudeSession> {
 /// skips that one session (a torn mid-write read is momentary, and the reaper's
 /// two-scan window forgives it); only a failure to enumerate the directory at
 /// all is reported as `None`.
-pub fn try_live_sessions() -> Option<Vec<ClaudeSession>> {
+pub fn try_live_sessions() -> Option<Vec<AgentSession>> {
     let entries = fs::read_dir(sessions_dir()).ok()?;
     let mut raw_sessions = Vec::new();
     for entry in entries.flatten() {
@@ -95,7 +95,7 @@ fn snapshot_and_assemble(
     resolve_cwd: &impl Fn(u32) -> Option<String>,
     resolve_name: &impl Fn(&str, &str) -> Option<String>,
     dead_pointers: DeadPointers,
-) -> Vec<ClaudeSession> {
+) -> Vec<AgentSession> {
     let procs = take_snapshot();
     assemble_sessions(
         raw_pointers,
@@ -130,7 +130,7 @@ fn assemble_sessions(
     resolve_cwd: &impl Fn(u32) -> Option<String>,
     resolve_name: &impl Fn(&str, &str) -> Option<String>,
     dead_pointers: DeadPointers,
-) -> Vec<ClaudeSession> {
+) -> Vec<AgentSession> {
     let is_live = |pid: u32| match procs {
         Some(map) => map.contains_key(&pid),
         None => pid_alive_probe(pid),
@@ -150,7 +150,7 @@ fn assemble_sessions(
             }
         };
         if keep {
-            sessions.push(ClaudeSession::from_raw(raw));
+            sessions.push(AgentSession::from_raw(raw));
         }
     }
     merge_pointerless_live(&mut sessions, registry, &is_live, resolve_cwd);
@@ -192,7 +192,7 @@ fn assemble_sessions(
 /// `is_alive`. All side-effecting inputs are injected, so this is
 /// deterministic to unit-test.
 fn merge_pointerless_live(
-    sessions: &mut Vec<ClaudeSession>,
+    sessions: &mut Vec<AgentSession>,
     registry: Vec<crate::sandbox_registry::SessionEntry>,
     is_alive: &impl Fn(u32) -> bool,
     resolve_cwd: &impl Fn(u32) -> Option<String>,
@@ -244,7 +244,7 @@ fn merge_pointerless_live(
         } else {
             entry.cwd
         };
-        sessions.push(ClaudeSession::from_raw(RawSession {
+        sessions.push(AgentSession::from_raw(RawSession {
             pid,
             session_id: entry.session_id,
             cwd,
@@ -276,7 +276,7 @@ pub fn transcript_path(session_id: &str, cwd: &str) -> PathBuf {
         .join(format!("{session_id}.jsonl"))
 }
 
-pub fn scan_sessions() -> Vec<ClaudeSession> {
+pub fn scan_sessions() -> Vec<AgentSession> {
     let dir = sessions_dir();
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
@@ -351,7 +351,7 @@ pub fn scan_sessions() -> Vec<ClaudeSession> {
 /// the session back in the registry, after which the registry supplement
 /// covers it and this pass no longer sees it.
 fn extend_with_ps_live(
-    sessions: &mut Vec<ClaudeSession>,
+    sessions: &mut Vec<AgentSession>,
     procs: Option<&std::collections::HashMap<u32, crate::process::LiveClaudeProc>>,
     resolve_cwd: &impl Fn(u32) -> Option<String>,
     resolve_name: &impl Fn(&str, &str) -> Option<String>,
@@ -390,7 +390,7 @@ fn extend_with_ps_live(
         } else {
             resolve_name(&session_id, &cwd)
         };
-        let mut session = ClaudeSession::from_raw(RawSession {
+        let mut session = AgentSession::from_raw(RawSession {
             pid,
             session_id,
             cwd,
@@ -566,7 +566,7 @@ pub fn transcript_to_record(
         .unwrap_or_default()
 }
 
-pub fn resolve_jsonl_paths(sessions: &mut [ClaudeSession]) {
+pub fn resolve_jsonl_paths(sessions: &mut [AgentSession]) {
     for session in sessions.iter_mut() {
         // A session that lost its cwd cannot name its own project directory,
         // so recover both from the transcript before the slug-based lookups
@@ -575,7 +575,7 @@ pub fn resolve_jsonl_paths(sessions: &mut [ClaudeSession]) {
         if session.cwd.is_empty() {
             if let Some(path) = find_transcript_by_session_id(&session.session_id) {
                 if let Some(cwd) = recover_cwd_from_transcript(&path) {
-                    // Same derivation `ClaudeSession::from_raw` uses, so a
+                    // Same derivation `AgentSession::from_raw` uses, so a
                     // recovered row is indistinguishable from one that never
                     // lost its cwd.
                     session.project_name = cwd.rsplit('/').next().unwrap_or("unknown").to_string();
@@ -714,7 +714,7 @@ fn sole_jsonl(dir: &PathBuf) -> Option<PathBuf> {
 /// Feature #29: Scan for subagent task .jsonl files.
 /// Claude Code spawns sub-agents whose files live in:
 ///   /tmp/claude-{uid}/{project_slug}/{sessionId}/tasks/
-pub fn scan_subagents(sessions: &mut [ClaudeSession]) {
+pub fn scan_subagents(sessions: &mut [AgentSession]) {
     let uid = unsafe { libc::getuid() };
     let tmp_base = PathBuf::from(format!("/tmp/claude-{uid}"));
 
@@ -764,7 +764,7 @@ fn collect_subagent_jsonls(dir: &PathBuf, jsonls: &mut Vec<PathBuf>) {
 /// Resolve git worktree identity for each session (for conflict detection).
 /// Sessions in different worktrees of the same repo get different IDs.
 /// Runs `git rev-parse --show-toplevel` once per unique cwd.
-pub fn resolve_worktree_ids(sessions: &mut [ClaudeSession]) {
+pub fn resolve_worktree_ids(sessions: &mut [AgentSession]) {
     // Cache results to avoid running git multiple times for the same cwd
     let mut cache: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
@@ -839,8 +839,8 @@ mod tests {
         }
     }
 
-    fn session(session_id: &str, pid: u32) -> ClaudeSession {
-        ClaudeSession::from_raw(RawSession {
+    fn session(session_id: &str, pid: u32) -> AgentSession {
+        AgentSession::from_raw(RawSession {
             pid,
             session_id: session_id.to_string(),
             cwd: "/Users/ndr/work".to_string(),
@@ -862,7 +862,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "s1");
         assert_eq!(sessions[0].pid, 4242);
-        // Recorded fields survive the SessionEntry -> RawSession -> ClaudeSession hop.
+        // Recorded fields survive the SessionEntry -> RawSession -> AgentSession hop.
         assert_eq!(sessions[0].session_name, "name-s1");
         assert_eq!(sessions[0].cwd, "/Users/ndr/work");
     }
@@ -1050,7 +1050,7 @@ mod tests {
         }
     }
 
-    fn assembled_ids(sessions: &[ClaudeSession]) -> Vec<(u32, String)> {
+    fn assembled_ids(sessions: &[AgentSession]) -> Vec<(u32, String)> {
         sessions
             .iter()
             .map(|s| (s.pid, s.session_id.clone()))
@@ -1158,7 +1158,7 @@ mod tests {
         std::fs::write(other_slug.join("cccc-elsewhere.jsonl"), "{}").unwrap();
 
         let make = |sid: &str| {
-            ClaudeSession::from_raw(RawSession {
+            AgentSession::from_raw(RawSession {
                 pid: 1,
                 session_id: sid.into(),
                 cwd: "/Users/ndr".into(),

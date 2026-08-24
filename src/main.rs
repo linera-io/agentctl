@@ -38,6 +38,8 @@ mod transcript;
 mod ui;
 mod usage_ledger;
 
+use agentctl::provider;
+
 use std::io;
 use std::time::{Duration, Instant};
 
