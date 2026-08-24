@@ -37,8 +37,7 @@ pub fn expand(template: &str, vars: &[(&str, &str)]) -> String {
 fn user_prompt_path(name: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(
-        PathBuf::from(home)
-            .join(".claudectl")
+        crate::product::home_dot_dir(&PathBuf::from(home))
             .join("brain")
             .join("prompts")
             .join(format!("{name}.md")),

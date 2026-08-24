@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use agentctl::providers::codex_rollout::{
-    discover_rollout_files, discover_sessions, summarize_file,
+    discover_rollout_files, discover_sessions_modified_since, summarize_file,
 };
 
 fn write(path: &Path, body: &str) {
@@ -37,7 +37,7 @@ fn rollouts_are_found_through_the_dated_directory_layout() {
     let found = discover_rollout_files(root.path());
     assert_eq!(found.len(), 2, "both dated days must be reached: {found:?}");
 
-    let sessions = discover_sessions(root.path());
+    let sessions = discover_sessions_modified_since(root.path(), 0);
     let mut ids: Vec<&str> = sessions
         .iter()
         .filter_map(|s| s.thread_id.as_deref())
@@ -52,7 +52,7 @@ fn a_missing_sessions_root_is_empty_not_an_error() {
     let root = tempfile::tempdir().unwrap();
     let absent = root.path().join("nope");
     assert!(discover_rollout_files(&absent).is_empty());
-    assert!(discover_sessions(&absent).is_empty());
+    assert!(discover_sessions_modified_since(&absent, 0).is_empty());
 }
 
 /// Only `.jsonl` files are rollouts.
@@ -112,7 +112,7 @@ fn a_rollout_without_session_meta_is_not_a_session() {
         summarize_file(&path).is_none(),
         "but it yields no session, since it has no thread id"
     );
-    assert!(discover_sessions(root.path()).is_empty());
+    assert!(discover_sessions_modified_since(root.path(), 0).is_empty());
 }
 
 /// `codex -C/--cd <DIR>` moves the agent's root but not the process's cwd.
@@ -191,4 +191,26 @@ fn a_registry_entry_keeps_its_provider_across_a_round_trip() {
     let json = r#"{"session_id":"legacy","cwd":"/w","transcript":"","started_at_ms":0}"#;
     let legacy: SessionEntry = serde_json::from_str(json).expect("legacy entry parses");
     assert_eq!(legacy.provider, AgentProvider::Claude);
+}
+
+/// The per-tick walk must not re-read history that predates every live session.
+///
+/// A rollout is never pruned, so without an age floor the cost of a refresh
+/// grows with total Codex history forever — measured at 263 ms per tick over
+/// 200 files, on a 2-second timer.
+#[test]
+fn rollouts_older_than_every_live_session_are_skipped() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("2026/08/24/old.jsonl");
+    write(&path, &rollout("ancient", "/w/old"));
+
+    // Everything is newer than the epoch.
+    assert_eq!(discover_sessions_modified_since(root.path(), 0).len(), 1);
+
+    // Nothing is newer than the far future, so the file is never opened.
+    let far_future_ms = u64::MAX / 2;
+    assert!(
+        discover_sessions_modified_since(root.path(), far_future_ms).is_empty(),
+        "a rollout older than every live session must be skipped"
+    );
 }

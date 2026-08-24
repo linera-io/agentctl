@@ -178,7 +178,7 @@ impl DecisionStats {
 
 pub(super) fn decisions_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".claudectl").join("brain")
+    crate::product::home_dot_dir(&PathBuf::from(home)).join("brain")
 }
 
 fn decisions_path() -> PathBuf {
