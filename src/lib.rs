@@ -33,6 +33,7 @@ pub mod session;
 #[cfg(test)]
 mod session_lifecycle_tests;
 pub mod session_recorder;
+pub mod shared_home;
 pub mod terminal_owner;
 pub mod terminals;
 pub mod theme;
