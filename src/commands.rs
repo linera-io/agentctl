@@ -45,6 +45,117 @@ pub(crate) fn launch_session(
     }
 }
 
+/// Parse `config/mcp.toml` into servers. A missing or unreadable registry is an
+/// empty one — the shared home is optional, and a first run has no registry yet.
+fn read_mcp_registry(
+    home: &claudectl::shared_home::SharedAgentHome,
+) -> Vec<claudectl::shared_home::McpServer> {
+    let Ok(text) = std::fs::read_to_string(home.mcp_registry()) else {
+        return Vec::new();
+    };
+    let mut servers = Vec::new();
+    let mut current: Option<claudectl::shared_home::McpServer> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(name) = line
+            .strip_prefix("[server.")
+            .and_then(|r| r.strip_suffix(']'))
+        {
+            if let Some(done) = current.take() {
+                servers.push(done);
+            }
+            current = Some(claudectl::shared_home::McpServer {
+                name: name.to_string(),
+                command: String::new(),
+                env: Vec::new(),
+            });
+        } else if let Some(server) = current.as_mut() {
+            if let Some((key, value)) = line.split_once('=') {
+                let key = key.trim();
+                let value = value.trim().trim_matches('"').to_string();
+                match key {
+                    "command" => server.command = value,
+                    _ if key.starts_with("env.") => {
+                        server
+                            .env
+                            .push((key.trim_start_matches("env.").to_string(), value));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    servers.extend(current);
+    servers
+}
+
+/// `--shared-home [--apply]`: reconcile `~/.agents` and the adapters rendered
+/// from it.
+///
+/// Prints the plan by default and writes nothing. Adoption of an existing setup
+/// is the common case, so seeing what would happen before it happens is the
+/// default rather than an opt-in.
+pub(crate) fn reconcile_shared_home(apply: bool) -> io::Result<()> {
+    let Some(home_dir) = std::env::var_os("HOME") else {
+        return Err(io::Error::other("HOME is unset; cannot locate ~/.agents"));
+    };
+    let home = claudectl::shared_home::SharedAgentHome::from_home(std::path::Path::new(&home_dir));
+
+    let plan = home.plan(&home.observe());
+    if plan.is_empty() {
+        println!(
+            "Shared agent home is up to date ({}).",
+            home.root().display()
+        );
+        return Ok(());
+    }
+
+    println!("Shared agent home: {}", home.root().display());
+    for action in &plan.actions {
+        match action {
+            claudectl::shared_home::Action::CreateDir(path) => {
+                println!("  create    {}", path.display());
+            }
+            claudectl::shared_home::Action::RenderAdapter { target, from } => {
+                println!("  render    {}  <- {}", target.display(), from.display());
+            }
+            claudectl::shared_home::Action::AdoptInPlace { target, source } => {
+                println!("  adopt     {}  -> {}", target.display(), source.display());
+            }
+            claudectl::shared_home::Action::ReportDrift { target, reason } => {
+                println!("  DRIFT     {}  ({reason})", target.display());
+            }
+        }
+    }
+
+    // Validating the registry here is the point at which a literal credential
+    // is caught: before anything is rendered into a provider's config, and in
+    // the dry run rather than only on --apply.
+    match claudectl::shared_home::McpRegistry::validated(read_mcp_registry(&home)) {
+        Ok(registry) => {
+            if !registry.servers().is_empty() {
+                println!("\nMCP servers ({}):", registry.servers().len());
+                for server in registry.servers() {
+                    println!("  {}  ({})", server.name, server.command);
+                }
+            }
+        }
+        Err(problem) => {
+            println!();
+            return Err(io::Error::other(problem));
+        }
+    }
+
+    if !apply {
+        println!("\nNothing written. Re-run with --apply to execute.");
+        return Ok(());
+    }
+
+    home.apply(&plan)?;
+    println!("\nApplied {} action(s).", plan.actions.len());
+    Ok(())
+}
+
 /// `--restore-sessions`: bring back your local (laptop) Claude sessions — e.g.
 /// after a Ghostty restart-to-update — spawning one window per session that was
 /// live, each running `claude --resume <id>` in its recorded directory. Reads

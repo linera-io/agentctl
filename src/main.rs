@@ -144,6 +144,19 @@ pub(crate) struct Cli {
     /// restart-to-update — spawning one window per session that was live,
     /// each running `claude --resume <id>` in its recorded directory. No
     /// argument; pair with --dry-run to preview.
+    /// Reconcile the shared agent home (`~/.agents`) and the provider adapters
+    /// rendered from it. Prints the plan and exits; pass --apply to execute it.
+    #[arg(long = "shared-home", help_heading = "Session Management")]
+    pub(crate) shared_home_reconcile: bool,
+
+    /// Execute the `--shared-home` plan instead of only printing it.
+    #[arg(
+        long = "apply",
+        requires = "shared_home_reconcile",
+        help_heading = "Session Management"
+    )]
+    pub(crate) apply: bool,
+
     #[arg(long = "restore-sessions", help_heading = "Session Management")]
     pub(crate) restore_sessions: bool,
 
@@ -567,6 +580,10 @@ fn run_main(cli: Cli) -> io::Result<()> {
 
     if cli.new_session {
         return commands::launch_session(&cli.cwd, cli.prompt.as_deref(), cli.resume.as_deref());
+    }
+
+    if cli.shared_home_reconcile {
+        return commands::reconcile_shared_home(cli.apply);
     }
 
     if cli.restore_sessions {
