@@ -101,7 +101,7 @@ fn home_dir() -> PathBuf {
 }
 
 fn shared_state_dir() -> PathBuf {
-    home_dir().join(".local/share/claudectl/state")
+    crate::product::shared_state_root(&home_dir()).join("state")
 }
 
 /// Where state files lived before they had to be readable from another machine.

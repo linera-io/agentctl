@@ -607,7 +607,7 @@ fn registry_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".local/share/claudectl")
+    crate::product::shared_state_root(&home)
 }
 
 /// Path to the sandbox registry file (`sandbox-sessions.json`). Honors

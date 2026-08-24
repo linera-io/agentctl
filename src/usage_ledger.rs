@@ -64,12 +64,10 @@ pub struct ScanReport {
 }
 
 fn ledger_dir() -> PathBuf {
-    let base = std::env::var_os("HOME")
+    let home = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".local")
-        .join("share");
-    crate::product::data_subdir(&base)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    crate::product::shared_state_root(&home)
 }
 
 fn projects_dir() -> PathBuf {
@@ -1424,5 +1422,33 @@ mod tests {
         }
         std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
         std::fs::write(ledger, body).unwrap();
+    }
+
+    /// The usage ledger must live inside the host-shared, bind-mounted root.
+    ///
+    /// Exercised through the real resolver with `HOME` pinned, not by
+    /// re-deriving the path in the test: the regression this guards against was
+    /// a call site quietly routed to `~/.local/share/agentctl`, which no
+    /// assertion about `product` alone would have caught.
+    #[test]
+    fn ledger_dir_resolves_inside_the_shared_state_root() {
+        let _guard = crate::sandbox_registry::tests::env_guard();
+        let home = tempfile::tempdir().unwrap();
+        let saved = std::env::var_os("HOME");
+        // SAFETY: env access is serialised by the held lock.
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let resolved = ledger_dir();
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_eq!(resolved, crate::product::shared_state_root(home.path()));
+        assert!(
+            resolved.ends_with("claudectl"),
+            "the bind mount is named claudectl, got {}",
+            resolved.display()
+        );
     }
 }
