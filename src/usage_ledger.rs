@@ -64,12 +64,12 @@ pub struct ScanReport {
 }
 
 fn ledger_dir() -> PathBuf {
-    std::env::var_os("HOME")
+    let base = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".local")
-        .join("share")
-        .join("claudectl")
+        .join("share");
+    crate::product::data_subdir(&base)
 }
 
 fn projects_dir() -> PathBuf {

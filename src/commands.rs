@@ -48,13 +48,13 @@ pub(crate) fn launch_session(
 /// Parse `config/mcp.toml` into servers. A missing or unreadable registry is an
 /// empty one — the shared home is optional, and a first run has no registry yet.
 fn read_mcp_registry(
-    home: &claudectl::shared_home::SharedAgentHome,
-) -> Vec<claudectl::shared_home::McpServer> {
+    home: &agentctl::shared_home::SharedAgentHome,
+) -> Vec<agentctl::shared_home::McpServer> {
     let Ok(text) = std::fs::read_to_string(home.mcp_registry()) else {
         return Vec::new();
     };
     let mut servers = Vec::new();
-    let mut current: Option<claudectl::shared_home::McpServer> = None;
+    let mut current: Option<agentctl::shared_home::McpServer> = None;
     for line in text.lines() {
         let line = line.trim();
         if let Some(name) = line
@@ -64,7 +64,7 @@ fn read_mcp_registry(
             if let Some(done) = current.take() {
                 servers.push(done);
             }
-            current = Some(claudectl::shared_home::McpServer {
+            current = Some(agentctl::shared_home::McpServer {
                 name: name.to_string(),
                 command: String::new(),
                 env: Vec::new(),
@@ -99,7 +99,7 @@ pub(crate) fn reconcile_shared_home(apply: bool) -> io::Result<()> {
     let Some(home_dir) = std::env::var_os("HOME") else {
         return Err(io::Error::other("HOME is unset; cannot locate ~/.agents"));
     };
-    let home = claudectl::shared_home::SharedAgentHome::from_home(std::path::Path::new(&home_dir));
+    let home = agentctl::shared_home::SharedAgentHome::from_home(std::path::Path::new(&home_dir));
 
     let plan = home.plan(&home.observe());
     if plan.is_empty() {
@@ -113,16 +113,16 @@ pub(crate) fn reconcile_shared_home(apply: bool) -> io::Result<()> {
     println!("Shared agent home: {}", home.root().display());
     for action in &plan.actions {
         match action {
-            claudectl::shared_home::Action::CreateDir(path) => {
+            agentctl::shared_home::Action::CreateDir(path) => {
                 println!("  create    {}", path.display());
             }
-            claudectl::shared_home::Action::RenderAdapter { target, from } => {
+            agentctl::shared_home::Action::RenderAdapter { target, from } => {
                 println!("  render    {}  <- {}", target.display(), from.display());
             }
-            claudectl::shared_home::Action::AdoptInPlace { target, source } => {
+            agentctl::shared_home::Action::AdoptInPlace { target, source } => {
                 println!("  adopt     {}  -> {}", target.display(), source.display());
             }
-            claudectl::shared_home::Action::ReportDrift { target, reason } => {
+            agentctl::shared_home::Action::ReportDrift { target, reason } => {
                 println!("  DRIFT     {}  ({reason})", target.display());
             }
         }
@@ -131,7 +131,7 @@ pub(crate) fn reconcile_shared_home(apply: bool) -> io::Result<()> {
     // Validating the registry here is the point at which a literal credential
     // is caught: before anything is rendered into a provider's config, and in
     // the dry run rather than only on --apply.
-    match claudectl::shared_home::McpRegistry::validated(read_mcp_registry(&home)) {
+    match agentctl::shared_home::McpRegistry::validated(read_mcp_registry(&home)) {
         Ok(registry) => {
             if !registry.servers().is_empty() {
                 println!("\nMCP servers ({}):", registry.servers().len());
@@ -1360,8 +1360,7 @@ pub(crate) fn format_session(fmt: &str, s: &session::ClaudeSession) -> String {
 /// Path to the brain gate mode state file.
 pub(crate) fn brain_gate_mode_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    std::path::PathBuf::from(home)
-        .join(".claudectl")
+    crate::product::home_dot_dir(&std::path::PathBuf::from(home))
         .join("brain")
         .join("gate-mode")
 }

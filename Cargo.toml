@@ -1,5 +1,5 @@
 [package]
-name = "claudectl"
+name = "agentctl"
 version = "0.33.0"
 edition = "2024"
 description = "Auto-pilot for Claude Code — a local model watches every session and decides what to approve"
@@ -11,8 +11,23 @@ categories = ["command-line-utilities", "development-tools"]
 exclude = ["*.gif", "*.cast", "claude-demo.*", "CLAUDE.md", ".github/"]
 
 [[bin]]
+name = "agentctl"
+path = "src/main.rs"
+
+# Compatibility alias: the product was called claudectl until 0.33, and the
+# name is baked into people's shells, aliases, and hook definitions. Same
+# entry point, so the two binaries can never drift.
+[[bin]]
 name = "claudectl"
 path = "src/main.rs"
+
+[[bin]]
+name = "agentctl-hook"
+path = "src/bin/agentctl-hook.rs"
+
+[[bin]]
+name = "claudectl-hook"
+path = "src/bin/agentctl-hook.rs"
 
 # Side-by-side install target for verifying refactor branches against the
 # stable `claudectl` binary on the same machine. Build the same source
@@ -24,7 +39,7 @@ name = "claudectl_test"
 path = "src/main.rs"
 
 [lib]
-name = "claudectl"
+name = "agentctl"
 path = "src/lib.rs"
 
 [dependencies]

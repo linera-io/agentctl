@@ -23,6 +23,7 @@ pub mod models;
 pub mod monitor;
 pub mod orchestrator;
 pub mod process;
+pub mod product;
 pub mod reaper;
 pub mod recorder;
 pub mod rules;

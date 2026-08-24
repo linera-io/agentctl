@@ -807,7 +807,7 @@ fn cache_path() -> Option<PathBuf> {
     let dir = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| home_dir().ok().map(|h| h.join(".cache")))?;
-    Some(dir.join("claudectl").join("reaper-last-state"))
+    Some(crate::product::data_subdir(&dir).join("reaper-last-state"))
 }
 
 fn read_cache_state(path: &Path) -> Option<(String, Duration)> {

@@ -92,7 +92,7 @@ fn shell_escape(s: &str) -> String {
 }
 
 fn log_agent_output(agent_name: &str, stdout: &str, stderr: &str) {
-    let dir = std::path::PathBuf::from(".claudectl-runs").join("agents");
+    let dir = crate::product::runs_dir(std::path::Path::new(".")).join("agents");
     let _ = std::fs::create_dir_all(&dir);
 
     let ts = std::time::SystemTime::now()

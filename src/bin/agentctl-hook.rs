@@ -48,7 +48,7 @@ fn main() {
     // hit on 2026-08-05, when `claudectl-hook` under `sbx exec` recorded no
     // terminal routing and three separate theories for why were all wrong.
     if let Some(path) = std::env::var_os("CLAUDECTL_HOOK_LOG") {
-        let _ = claudectl::logger::init(&path.to_string_lossy());
+        let _ = agentctl::logger::init(&path.to_string_lossy());
     }
 
     // Mirrors the fast-path in `claudectl`'s `main`. `try_read_hook_payload`
@@ -58,18 +58,18 @@ fn main() {
     // Failures are swallowed on purpose: a hook that errors must never block
     // or slow the Claude Code session it fired from. Nothing is written to
     // stdout, which would corrupt a caller capturing output.
-    match claudectl::hook_state::try_read_hook_payload() {
+    match agentctl::hook_state::try_read_hook_payload() {
         Ok(Some(payload)) => {
             let event = payload
                 .get("hook_event_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
-            claudectl::logger::log("DEBUG", &format!("hook: received {event}"));
-            if let Err(e) = claudectl::hook_state::record_hook_event(&payload) {
-                claudectl::logger::log("ERROR", &format!("hook: {event} failed: {e}"));
+            agentctl::logger::log("DEBUG", &format!("hook: received {event}"));
+            if let Err(e) = agentctl::hook_state::record_hook_event(&payload) {
+                agentctl::logger::log("ERROR", &format!("hook: {event} failed: {e}"));
             }
         }
-        Ok(None) => claudectl::logger::log("DEBUG", "hook: no payload on stdin"),
-        Err(e) => claudectl::logger::log("ERROR", &format!("hook: unreadable payload: {e}")),
+        Ok(None) => agentctl::logger::log("DEBUG", "hook: no payload on stdin"),
+        Err(e) => agentctl::logger::log("ERROR", &format!("hook: unreadable payload: {e}")),
     }
 }

@@ -2,10 +2,10 @@ use std::io::Write;
 use std::sync::Once;
 use std::time::Duration;
 
-use claudectl::discovery;
-use claudectl::models;
-use claudectl::monitor;
-use claudectl::session::{ClaudeSession, RawSession, SessionStatus, TelemetryStatus};
+use agentctl::discovery;
+use agentctl::models;
+use agentctl::monitor;
+use agentctl::session::{ClaudeSession, RawSession, SessionStatus, TelemetryStatus};
 
 /// Point hook_state at a per-process tempdir before any test reads it. Without
 /// this, infer_status would pick up real `~/.claudectl/state/*.json` files
@@ -297,7 +297,7 @@ fn session_with_id(id: &str, cpu: f32) -> ClaudeSession {
 fn hook_permission_prompt_marks_needs_input() {
     isolate_hook_state_dir();
     let sid = "hook-test-permission";
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Notification",
         "session_id": sid,
         "notification_type": "permission_prompt",
@@ -306,9 +306,9 @@ fn hook_permission_prompt_marks_needs_input() {
 
     // Backdate the notification past the 750ms grace period so the
     // suppression doesn't hide it during this test.
-    let mut state = claudectl::hook_state::HookState::load(sid).unwrap();
+    let mut state = agentctl::hook_state::HookState::load(sid).unwrap();
     state.last_notification_ts_ms = state.last_notification_ts_ms.saturating_sub(2_000);
-    let path = claudectl::hook_state::state_dir().join(format!("{sid}.json"));
+    let path = agentctl::hook_state::state_dir().join(format!("{sid}.json"));
     std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
 
     // Low CPU + permission_prompt marker (now older than grace) + JSONL has
@@ -323,13 +323,13 @@ fn hook_permission_prompt_marks_needs_input() {
 fn hook_pretooluse_clears_permission_prompt() {
     isolate_hook_state_dir();
     let sid = "hook-test-approval";
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Notification",
         "session_id": sid,
         "notification_type": "permission_prompt",
     }))
     .unwrap();
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "PreToolUse",
         "session_id": sid,
         "tool_name": "Bash",
@@ -347,7 +347,7 @@ fn hook_pretooluse_clears_permission_prompt() {
 fn hook_precompact_marks_compacting() {
     isolate_hook_state_dir();
     let sid = "hook-test-compacting";
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "PreCompact",
         "session_id": sid,
     }))
@@ -362,7 +362,7 @@ fn hook_precompact_marks_compacting() {
 fn hook_stop_marks_waiting_input() {
     isolate_hook_state_dir();
     let sid = "hook-test-stop";
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Stop",
         "session_id": sid,
     }))
@@ -377,13 +377,13 @@ fn hook_stop_marks_waiting_input() {
 fn hook_userpromptsubmit_after_stop_marks_responding() {
     isolate_hook_state_dir();
     let sid = "hook-test-followup";
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Stop",
         "session_id": sid,
     }))
     .unwrap();
     // User typed a follow-up — is_responding fires immediately, deterministic.
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "UserPromptSubmit",
         "session_id": sid,
     }))
@@ -398,16 +398,16 @@ fn hook_userpromptsubmit_after_stop_marks_responding() {
 fn hook_waiting_input_ages_out_to_idle() {
     isolate_hook_state_dir();
     let sid = "hook-test-waiting-ages-out";
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Stop",
         "session_id": sid,
     }))
     .unwrap();
 
     // Backdate the Stop ts to >10 min ago so the age-out fires.
-    let mut state = claudectl::hook_state::HookState::load(sid).unwrap();
+    let mut state = agentctl::hook_state::HookState::load(sid).unwrap();
     state.last_stop_ts_ms = state.last_stop_ts_ms.saturating_sub(11 * 60 * 1000);
-    let path = claudectl::hook_state::state_dir().join(format!("{sid}.json"));
+    let path = agentctl::hook_state::state_dir().join(format!("{sid}.json"));
     std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
 
     let mut s = session_with_id(sid, 0.5);
@@ -426,7 +426,7 @@ fn hook_waiting_input_ages_out_to_idle() {
 fn hook_waiting_input_recent_stays_waiting() {
     isolate_hook_state_dir();
     let sid = "hook-test-waiting-recent";
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Stop",
         "session_id": sid,
     }))
@@ -451,7 +451,7 @@ fn hook_responding_stable_across_tool_boundaries() {
         "PostToolUse",
         "PreToolUse",
     ] {
-        claudectl::hook_state::record_hook_event(&serde_json::json!({
+        agentctl::hook_state::record_hook_event(&serde_json::json!({
             "hook_event_name": ev,
             "session_id": sid,
             "tool_name": "Bash",
@@ -464,7 +464,7 @@ fn hook_responding_stable_across_tool_boundaries() {
     assert_eq!(s.status, SessionStatus::Processing);
 
     // Stop fires → flips to WaitingInput, also stable.
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Stop",
         "session_id": sid,
     }))
@@ -483,13 +483,13 @@ fn hook_permission_prompt_cleared_by_subsequent_event() {
     // user typed past the dialog; Stop means turn ended. Whichever fires
     // first removes NeedsInput.
     let sid = "hook-test-cleared-by-pretooluse";
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Notification",
         "session_id": sid,
         "notification_type": "permission_prompt",
     }))
     .unwrap();
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "PreToolUse",
         "session_id": sid,
         "tool_name": "Bash",
@@ -508,7 +508,7 @@ fn hook_worker_permission_prompt_marks_needs_input() {
     // of `"permission_prompt"` (verified against Claude Code 2.1.117 binary).
     // Both must classify the session as NeedsInput.
     let sid = "hook-test-worker-permission";
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Notification",
         "session_id": sid,
         "notification_type": "worker_permission_prompt",
@@ -516,9 +516,9 @@ fn hook_worker_permission_prompt_marks_needs_input() {
     .unwrap();
 
     // Backdate past the 750ms grace period.
-    let mut state = claudectl::hook_state::HookState::load(sid).unwrap();
+    let mut state = agentctl::hook_state::HookState::load(sid).unwrap();
     state.last_notification_ts_ms = state.last_notification_ts_ms.saturating_sub(2_000);
-    let path = claudectl::hook_state::state_dir().join(format!("{sid}.json"));
+    let path = agentctl::hook_state::state_dir().join(format!("{sid}.json"));
     std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
 
     let mut s = session_with_id(sid, 0.5);
@@ -533,13 +533,13 @@ fn hook_worker_pretooluse_clears_permission_prompt() {
     // Approval of a subagent's prompt fires PreToolUse with the approved
     // tool — same semantic as the main-agent case.
     let sid = "hook-test-worker-approval";
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Notification",
         "session_id": sid,
         "notification_type": "worker_permission_prompt",
     }))
     .unwrap();
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "PreToolUse",
         "session_id": sid,
         "tool_name": "Bash",
@@ -559,22 +559,22 @@ fn hook_permission_prompt_outranks_compacting() {
     // has been observed to get stuck on sessions where Stop never fires —
     // without this precedence a real prompt would be silently masked.
     let sid = "hook-test-precedence";
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Notification",
         "session_id": sid,
         "notification_type": "permission_prompt",
     }))
     .unwrap();
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "PreCompact",
         "session_id": sid,
     }))
     .unwrap();
 
     // Backdate the notification past the 750ms grace period.
-    let mut state = claudectl::hook_state::HookState::load(sid).unwrap();
+    let mut state = agentctl::hook_state::HookState::load(sid).unwrap();
     state.last_notification_ts_ms = state.last_notification_ts_ms.saturating_sub(2_000);
-    let path = claudectl::hook_state::state_dir().join(format!("{sid}.json"));
+    let path = agentctl::hook_state::state_dir().join(format!("{sid}.json"));
     std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
 
     let mut s = session_with_id(sid, 0.5);
@@ -589,7 +589,7 @@ fn hook_postcompact_clears_compacting_without_stop() {
     // "compaction done" signal and must clear the Compacting status on its
     // own.
     let sid = "hook-test-postcompact";
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "PreCompact",
         "session_id": sid,
     }))
@@ -601,7 +601,7 @@ fn hook_postcompact_clears_compacting_without_stop() {
     assert_eq!(s.status, SessionStatus::Compacting);
 
     // PostCompact arrives. Stop never fires.
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "PostCompact",
         "session_id": sid,
     }))
@@ -614,27 +614,27 @@ fn hook_postcompact_clears_compacting_without_stop() {
 /// Replay a turn that ran and finished, but whose `Stop` hook never reached
 /// claudectl — the 2026-07-28 incident. `mid_turn_age_secs` backdates every
 /// recorded event so the transcript tail can be placed after them.
-fn state_with_lost_stop(sid: &str, mid_turn_age_secs: u64) -> claudectl::hook_state::HookState {
+fn state_with_lost_stop(sid: &str, mid_turn_age_secs: u64) -> agentctl::hook_state::HookState {
     isolate_hook_state_dir();
     for (event, tool) in [
         ("UserPromptSubmit", None),
         ("PreToolUse", Some("Bash")),
         ("PostToolUse", Some("Bash")),
     ] {
-        claudectl::hook_state::record_hook_event(&serde_json::json!({
+        agentctl::hook_state::record_hook_event(&serde_json::json!({
             "hook_event_name": event,
             "session_id": sid,
             "tool_name": tool,
         }))
         .unwrap();
     }
-    let mut state = claudectl::hook_state::HookState::load(sid).unwrap();
+    let mut state = agentctl::hook_state::HookState::load(sid).unwrap();
     let back = mid_turn_age_secs * 1000;
     state.last_promptsubmit_ts_ms = state.last_promptsubmit_ts_ms.saturating_sub(back);
     state.last_pretooluse_ts_ms = state.last_pretooluse_ts_ms.saturating_sub(back);
     state.last_posttooluse_ts_ms = state.last_posttooluse_ts_ms.saturating_sub(back);
     assert_eq!(state.last_stop_ts_ms, 0, "the lost Stop is the whole point");
-    let path = claudectl::hook_state::state_dir().join(format!("{sid}.json"));
+    let path = agentctl::hook_state::state_dir().join(format!("{sid}.json"));
     std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
     state
 }
@@ -692,18 +692,18 @@ fn regression_transcript_veto_never_masks_a_live_turn() {
     // transcript's last (previous-turn) `end_turn` message, so the stale tail
     // must not be read as "this turn is over".
     let sid = "regression-live-turn-not-masked";
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "Stop",
         "session_id": sid,
     }))
     .unwrap();
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "UserPromptSubmit",
         "session_id": sid,
     }))
     .unwrap();
 
-    let state = claudectl::hook_state::HookState::load(sid).unwrap();
+    let state = agentctl::hook_state::HookState::load(sid).unwrap();
     let mut s = session_with_id(sid, 0.5);
     s.last_message_ts = state.last_promptsubmit_ts_ms.saturating_sub(1_000);
     monitor::infer_status(&mut s, "assistant", "end_turn");
@@ -717,14 +717,14 @@ fn regression_transcript_veto_never_masks_an_in_flight_tool() {
     // message (Claude Code writes the tool_use entry, then the tool runs).
     // The tail is older than the hook event, so no veto — still Processing.
     let sid = "regression-in-flight-tool-not-masked";
-    claudectl::hook_state::record_hook_event(&serde_json::json!({
+    agentctl::hook_state::record_hook_event(&serde_json::json!({
         "hook_event_name": "PreToolUse",
         "session_id": sid,
         "tool_name": "Bash",
     }))
     .unwrap();
 
-    let state = claudectl::hook_state::HookState::load(sid).unwrap();
+    let state = agentctl::hook_state::HookState::load(sid).unwrap();
     let mut s = session_with_id(sid, 0.5);
     s.last_message_ts = state.last_pretooluse_ts_ms.saturating_sub(1_000);
     monitor::infer_status(&mut s, "assistant", "end_turn");
@@ -1095,7 +1095,7 @@ fn regression_rename_does_not_revert_to_stale_scan_name() {
         name: Some("ndr-5e".into()),
         name_source: None,
     });
-    let (mut merged, _) = claudectl::app::merge_discovered_sessions(vec![s], vec![fresh]);
+    let (mut merged, _) = agentctl::app::merge_discovered_sessions(vec![s], vec![fresh]);
     assert_eq!(merged.len(), 1);
     monitor::update_tokens(&mut merged[0]);
     assert_eq!(
@@ -1141,7 +1141,7 @@ fn rotation_reestablishes_a_carried_over_title_from_the_new_transcript() {
     fresh.session_id = "session-b".into();
     fresh.session_name = "registry-name".into();
 
-    let (mut merged, _) = claudectl::app::merge_discovered_sessions(vec![existing], vec![fresh]);
+    let (mut merged, _) = agentctl::app::merge_discovered_sessions(vec![existing], vec![fresh]);
     assert_eq!(merged[0].session_name, "registry-name");
     assert!(
         !merged[0].name_is_explicit,
@@ -1413,22 +1413,22 @@ fn json_export_includes_subagent_breakdown() {
     )];
     s.subagent_rollups.insert(
         std::path::PathBuf::from("/tmp/claude-1/-tmp-project/session-1/tasks/agent-1.jsonl"),
-        claudectl::session::SubagentRollup {
+        agentctl::session::SubagentRollup {
             input_tokens: 20_000,
             output_tokens: 2_000,
             cost_usd: 0.4,
             usage_metrics_available: true,
-            ..claudectl::session::SubagentRollup::default()
+            ..agentctl::session::SubagentRollup::default()
         },
     );
     s.subagent_rollups.insert(
         std::path::PathBuf::from("/tmp/claude-1/-tmp-project/session-1/tasks/agent-2.jsonl"),
-        claudectl::session::SubagentRollup {
+        agentctl::session::SubagentRollup {
             input_tokens: 10_000,
             output_tokens: 1_000,
             cost_usd: 0.2,
             usage_metrics_available: true,
-            ..claudectl::session::SubagentRollup::default()
+            ..agentctl::session::SubagentRollup::default()
         },
     );
     s.subagent_count = 2;
@@ -1484,7 +1484,7 @@ fn context_bar_formatting() {
 
 #[test]
 fn session_recorder_produces_highlight_reel() {
-    use claudectl::session_recorder::SessionRecorder;
+    use agentctl::session_recorder::SessionRecorder;
 
     // Create empty JSONL first, then create recorder (which seeks to end),
     // then write events to simulate live session activity
@@ -1563,7 +1563,7 @@ fn session_recorder_produces_highlight_reel() {
 
 #[test]
 fn session_recorder_empty_jsonl() {
-    use claudectl::session_recorder::SessionRecorder;
+    use agentctl::session_recorder::SessionRecorder;
 
     let jsonl_file = tempfile::NamedTempFile::new().unwrap();
     let output_file = tempfile::NamedTempFile::new().unwrap();
@@ -1588,7 +1588,7 @@ fn session_recorder_empty_jsonl() {
 
 #[test]
 fn recorder_cast_file_creation() {
-    use claudectl::recorder::Recorder;
+    use agentctl::recorder::Recorder;
 
     let output_file = tempfile::NamedTempFile::new().unwrap();
     let output_path = output_file.path().to_str().unwrap().to_string() + ".cast";
@@ -1784,7 +1784,7 @@ fn a_foreign_session_derives_the_same_transcript_values_as_a_local_one() {
 
     let (mut local, _f1) = make_session_with_jsonl(jsonl);
     let (mut foreign, _f2) = make_session_with_jsonl(jsonl);
-    foreign.origin = claudectl::session::SessionOrigin::Sandbox("linera-agent-4759da86c2f4".into());
+    foreign.origin = agentctl::session::SessionOrigin::Sandbox("linera-agent-4759da86c2f4".into());
 
     monitor::update_tokens(&mut local);
     monitor::update_tokens(&mut foreign);
@@ -1830,8 +1830,8 @@ fn a_foreign_session_derives_the_same_transcript_values_as_a_local_one() {
 // blocked on them.
 // ────────────────────────────────────────────────────────────────────────────
 
-use claudectl::hook_state::HookState;
-use claudectl::monitor::{StatusInputs, decide_status};
+use agentctl::hook_state::HookState;
+use agentctl::monitor::{StatusInputs, decide_status};
 
 /// Fixed epoch for every fixture. Any value works — the point is that the
 /// tests choose it rather than reading a clock.
@@ -2590,7 +2590,7 @@ fn property_processing_is_eventually_released_without_corroboration() {
         let tool_in_flight = scenario
             .state
             .as_ref()
-            .is_some_and(claudectl::hook_state::tool_in_flight);
+            .is_some_and(agentctl::hook_state::tool_in_flight);
         if tool_in_flight {
             continue; // Licensed to run indefinitely — asserted above.
         }

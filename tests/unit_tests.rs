@@ -3,7 +3,7 @@ use std::time::Duration;
 // Test session status display and sorting
 #[test]
 fn test_session_status_sort_order() {
-    use claudectl::session::SessionStatus;
+    use agentctl::session::SessionStatus;
     assert!(SessionStatus::NeedsInput.sort_key() < SessionStatus::Processing.sort_key());
     assert!(SessionStatus::Processing.sort_key() < SessionStatus::WaitingInput.sort_key());
     assert!(SessionStatus::WaitingInput.sort_key() < SessionStatus::Unknown.sort_key());
@@ -13,7 +13,7 @@ fn test_session_status_sort_order() {
 
 #[test]
 fn test_session_status_display() {
-    use claudectl::session::SessionStatus;
+    use agentctl::session::SessionStatus;
     assert_eq!(SessionStatus::NeedsInput.to_string(), "Needs Input");
     assert_eq!(SessionStatus::Processing.to_string(), "Processing");
     assert_eq!(SessionStatus::WaitingInput.to_string(), "Waiting");
@@ -24,7 +24,7 @@ fn test_session_status_display() {
 
 #[test]
 fn test_session_from_raw() {
-    use claudectl::session::{ClaudeSession, RawSession};
+    use agentctl::session::{ClaudeSession, RawSession};
     let raw = RawSession {
         pid: 12345,
         session_id: "abc-123".to_string(),
@@ -41,7 +41,7 @@ fn test_session_from_raw() {
 
 #[test]
 fn test_session_display_name_prefers_session_name() {
-    use claudectl::session::{ClaudeSession, RawSession};
+    use agentctl::session::{ClaudeSession, RawSession};
     let raw = RawSession {
         pid: 1,
         session_id: "x".to_string(),
@@ -57,7 +57,7 @@ fn test_session_display_name_prefers_session_name() {
 
 #[test]
 fn test_format_elapsed() {
-    use claudectl::session::{ClaudeSession, RawSession};
+    use agentctl::session::{ClaudeSession, RawSession};
     let raw = RawSession {
         pid: 1,
         session_id: "x".to_string(),
@@ -76,7 +76,7 @@ fn test_format_elapsed() {
 
 #[test]
 fn test_format_tokens() {
-    use claudectl::session::{ClaudeSession, RawSession, TelemetryStatus};
+    use agentctl::session::{ClaudeSession, RawSession, TelemetryStatus};
     let raw = RawSession {
         pid: 1,
         session_id: "x".to_string(),
@@ -98,7 +98,7 @@ fn test_format_tokens() {
 
 #[test]
 fn test_format_cost() {
-    use claudectl::session::{ClaudeSession, RawSession, TelemetryStatus};
+    use agentctl::session::{ClaudeSession, RawSession, TelemetryStatus};
     let raw = RawSession {
         pid: 1,
         session_id: "x".to_string(),
@@ -122,7 +122,7 @@ fn test_format_cost() {
 
 #[test]
 fn test_cwd_to_project_name() {
-    use claudectl::session::{ClaudeSession, RawSession};
+    use agentctl::session::{ClaudeSession, RawSession};
     let cases = vec![
         ("/Users/foo/bar/my-project", "my-project"),
         ("/tmp", "tmp"),
@@ -144,7 +144,7 @@ fn test_cwd_to_project_name() {
 
 #[test]
 fn test_session_name_from_raw_name_field() {
-    use claudectl::session::{ClaudeSession, RawSession};
+    use agentctl::session::{ClaudeSession, RawSession};
     // When the session JSON has a `name` field (e.g. from Claude Code's
     // `/rename` slash command or topic auto-naming), it should become the
     // session's display name.
@@ -165,7 +165,7 @@ fn test_session_name_from_raw_name_field() {
 
 #[test]
 fn test_display_name_falls_back_to_cwd_when_name_absent() {
-    use claudectl::session::{ClaudeSession, RawSession};
+    use agentctl::session::{ClaudeSession, RawSession};
     let raw = RawSession {
         pid: 1,
         session_id: "abcd-efgh".into(),
