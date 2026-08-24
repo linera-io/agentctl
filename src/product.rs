@@ -57,6 +57,19 @@ pub fn runs_dir(dir: &Path) -> PathBuf {
     )
 }
 
+/// The host-shared state root, `~/.local/share/claudectl`.
+///
+/// Deliberately NOT product-named and deliberately not resolved: agent-sandbox
+/// bind-mounts this exact path (`sandbox_common.sh`, `mkdir -p
+/// "$HOME/.local/share/claudectl"`) so the usage ledger, session registries and
+/// hook state are one set of files shared by the laptop and every sandbox.
+/// The name is an interop contract with another repo, so renaming it means
+/// changing the mount first; resolving it per-machine would silently put the
+/// ledger outside the mount on any host where the directory does not exist yet.
+pub fn shared_state_root(home: &Path) -> PathBuf {
+    home.join(".local").join("share").join(LEGACY_NAME)
+}
+
 /// The product subdirectory inside an XDG data or state root.
 pub fn data_subdir(root: &Path) -> PathBuf {
     resolve(root.join(NAME), root.join(LEGACY_NAME))
@@ -129,6 +142,30 @@ mod tests {
 
         assert_eq!(resolved, legacy);
         assert!(legacy.join("parked.json").exists(), "legacy data survives");
+    }
+
+    /// The shared root must not follow the product rename.
+    ///
+    /// agent-sandbox bind-mounts `~/.local/share/claudectl` by that literal
+    /// name. Resolving it canonical-first would put the ledger in
+    /// `~/.local/share/agentctl` on any host without the legacy directory —
+    /// outside the mount, invisible to the laptop, silently.
+    #[test]
+    fn the_shared_state_root_is_pinned_to_the_bind_mounted_name() {
+        let home = tmp();
+        assert_eq!(
+            shared_state_root(home.path()),
+            home.path().join(".local/share/claudectl"),
+            "fresh install must still use the bind-mounted name"
+        );
+
+        // Even once the canonical directory exists beside it.
+        std::fs::create_dir_all(home.path().join(".local/share/agentctl")).unwrap();
+        assert_eq!(
+            shared_state_root(home.path()),
+            home.path().join(".local/share/claudectl"),
+            "an agentctl directory must not divert the shared root"
+        );
     }
 
     #[test]
