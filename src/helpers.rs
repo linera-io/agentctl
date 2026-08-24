@@ -106,12 +106,15 @@ pub(crate) fn fire_notification(project: &str) {
     let _ = std::process::Command::new("osascript")
         .args([
             "-e",
-            &format!("display notification \"{safe} needs input\" with title \"claudectl\""),
+            &format!(
+                "display notification \"{safe} needs input\" with title \"{}\"",
+                crate::product::NAME
+            ),
         ])
         .spawn();
     #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("notify-send")
-        .args(["claudectl", &format!("{safe} needs input")])
+        .args([crate::product::NAME, &format!("{safe} needs input")])
         .spawn();
 }
 
@@ -125,7 +128,7 @@ pub(crate) fn dirs_home() -> std::path::PathBuf {
 /// Reject pids that `kill(1)` reads as something other than one process.
 ///
 /// `kill 0` signals every process in the CALLER's process group — for the TUI
-/// that is claudectl and whatever terminal launched it, and `kill_process`
+/// that is agentctl and whatever terminal launched it, and `kill_process`
 /// escalates to `-9`. Zero is not a hypothetical here: a sandbox session's row
 /// is built by `ClaudeSession::from_registry_entry`, which maps an absent pid to
 /// `0` because a foreign pid belongs to another VM's namespace and the host can

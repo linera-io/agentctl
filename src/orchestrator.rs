@@ -929,7 +929,7 @@ fn print_final_summary(tasks: &[TaskRun]) {
 }
 
 fn create_run_dir() -> io::Result<PathBuf> {
-    let base = std::env::current_dir()?.join(".claudectl-runs");
+    let base = crate::product::runs_dir(&std::env::current_dir()?);
     fs::create_dir_all(&base)?;
     let now_ms = now_epoch_ms();
     let run_dir = base.join(format!("run-{now_ms}-{}", std::process::id()));

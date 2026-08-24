@@ -255,8 +255,8 @@ impl Config {
             }
         }
 
-        // Layer 2: Project config (.claudectl.toml in cwd)
-        if let Some(raw) = parse_config_file(&PathBuf::from(".claudectl.toml")) {
+        // Layer 2: project config in cwd
+        if let Some(raw) = parse_config_file(&project_config_path()) {
             config.apply(raw);
         }
 
@@ -399,7 +399,7 @@ impl Config {
         }
     }
 
-    /// Show resolved config and file locations (for `claudectl config`).
+    /// Show resolved config and file locations (for `agentctl config`).
     pub fn print_resolved(&self) {
         println!("Resolved configuration:");
         println!();
@@ -412,11 +412,11 @@ impl Config {
             }
         }
 
-        let project_path = PathBuf::from(".claudectl.toml");
+        let project_path = project_config_path();
         if project_path.exists() {
             println!("  Project config: {}", project_path.display());
         } else {
-            println!("  Project config: .claudectl.toml (not found)");
+            println!("  Project config: {} (not found)", project_path.display());
         }
 
         println!();
@@ -513,10 +513,11 @@ impl Config {
     /// Print an annotated default config template to stdout.
     pub fn print_template() {
         print!(
-            r#"# claudectl configuration
+            r#"# agentctl configuration
 # Place this file at:
-#   Project: .claudectl.toml (in your project root)
-#   Global:  ~/.config/claudectl/config.toml
+#   Project: .agentctl.toml (in your project root)
+#   Global:  ~/.config/agentctl/config.toml
+# Legacy .claudectl paths are still read when no agentctl file exists.
 #
 # Priority: CLI flags > project config > global config > defaults
 # Only set values you want to override — unset keys use defaults.
@@ -678,13 +679,14 @@ impl Config {
     }
 }
 
+/// The per-project config file in the current directory.
+fn project_config_path() -> PathBuf {
+    crate::product::project_config(&std::env::current_dir().unwrap_or_default())
+}
+
 fn global_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("claudectl")
-            .join("config.toml")
-    })
+    std::env::var_os("HOME")
+        .map(|home| crate::product::config_dir(&PathBuf::from(home)).join("config.toml"))
 }
 
 /// Minimal TOML parser — avoids adding a toml crate dependency.
@@ -927,7 +929,7 @@ pub fn load_hooks() -> crate::hooks::HookRegistry {
     if let Some(global) = global_config_path() {
         parse_hooks_from_file(&global, &mut registry);
     }
-    parse_hooks_from_file(&PathBuf::from(".claudectl.toml"), &mut registry);
+    parse_hooks_from_file(&project_config_path(), &mut registry);
 
     registry
 }
@@ -1083,7 +1085,7 @@ mod tests {
         writeln!(
             file,
             r#"
-# Global claudectl config
+# Global agentctl config
 [defaults]
 interval = 1000
 notify = true

@@ -117,12 +117,15 @@ impl HookRegistry {
         }
     }
 
-    /// List all configured hooks (for `claudectl --hooks`).
+    /// List all configured hooks (for `agentctl --hooks`).
     pub fn print_list(&self) {
         if self.hooks.is_empty() {
             println!("No hooks configured.");
             println!();
-            println!("Add hooks in ~/.config/claudectl/config.toml:");
+            println!(
+                "Add hooks in ~/.config/{}/config.toml:",
+                crate::product::NAME
+            );
             println!();
             println!("  [hooks.on_needs_input]");
             println!("  run = \"say 'Claude needs input'\"");

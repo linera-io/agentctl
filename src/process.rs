@@ -260,7 +260,7 @@ fn now_ms() -> u64 {
 }
 
 /// True iff `command`'s argv0, after stripping any leading path, is exactly
-/// `"claude"`. This excludes `claudectl`, `grep claude`, and
+/// `"claude"`. This excludes `agentctl`/`claudectl`, `grep claude`, and
 /// `bash -lc '... claude ...'`.
 ///
 /// Shared with the reaper's cross-sandbox collector so both places decide
@@ -679,8 +679,9 @@ mod tests {
     }
 
     #[test]
-    fn is_claude_process_rejects_claudectl() {
+    fn is_claude_process_rejects_our_own_binaries() {
         assert!(!is_claude_process("claudectl --list"));
+        assert!(!is_claude_process("agentctl --list"));
     }
 
     #[test]

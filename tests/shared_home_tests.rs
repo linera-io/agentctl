@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use claudectl::shared_home::{PathOwnership, SharedAgentHome};
+use agentctl::shared_home::{PathOwnership, SharedAgentHome};
 
 #[test]
 fn canonical_layout_lives_under_dot_agents() {
@@ -108,7 +108,7 @@ fn codex_plugin_catalog_inside_the_shared_home_stays_provider_native() {
 
 // ---- Step 2: adoption planning -------------------------------------------
 
-use claudectl::shared_home::{Action, Observed};
+use agentctl::shared_home::{Action, Observed};
 
 /// A plan is computed from what was observed, never from the filesystem, so the
 /// rules can be tested without arranging a home directory.
@@ -232,7 +232,7 @@ fn replacing_an_adapter_leaves_a_backup() {
     std::fs::write(layout.global_instructions(), "new shared content").unwrap();
 
     layout
-        .apply(&claudectl::shared_home::Plan {
+        .apply(&agentctl::shared_home::Plan {
             actions: vec![Action::RenderAdapter {
                 target: target.clone(),
                 from: layout.global_instructions(),
@@ -341,7 +341,7 @@ fn an_existing_memory_graph_is_adopted_in_place_not_copied() {
 
 // ---- Step 6: provider-neutral MCP registry --------------------------------
 
-use claudectl::shared_home::{McpRegistry, McpServer};
+use agentctl::shared_home::{McpRegistry, McpServer};
 
 /// The canonical registry is shared and version-controllable, so a literal
 /// secret in it is a secret in every provider's rendered config and in whatever
@@ -467,7 +467,7 @@ fn a_pre_existing_adapter_we_never_wrote_is_never_clobbered() {
 /// that needs a special case in `classify` fails here.
 #[test]
 fn every_provider_in_the_table_is_handled_without_a_special_case() {
-    use claudectl::shared_home::PROVIDERS;
+    use agentctl::shared_home::PROVIDERS;
 
     let layout = SharedAgentHome::from_home(Path::new("/home/u"));
     let plan = layout.plan(&Observed::default());

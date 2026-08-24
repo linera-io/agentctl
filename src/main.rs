@@ -24,6 +24,7 @@ mod models;
 mod monitor;
 mod orchestrator;
 mod process;
+mod product;
 mod reaper;
 mod recorder;
 mod rules;
@@ -59,7 +60,7 @@ pub(crate) struct ViewFilters {
 
 #[derive(Parser)]
 #[command(
-    name = "claudectl",
+    name = "agentctl",
     version,
     about = "Monitor and manage Claude Code CLI agents"
 )]
@@ -258,7 +259,7 @@ pub(crate) struct Cli {
     #[arg(long, help_heading = "Orchestration")]
     pub(crate) decompose: Option<String>,
 
-    /// Run tasks from a JSON file (e.g., claudectl --run tasks.json)
+    /// Run tasks from a JSON file (e.g., agentctl --run tasks.json)
     #[arg(long, help_heading = "Orchestration")]
     pub(crate) run: Option<String>,
 
@@ -316,7 +317,7 @@ pub(crate) struct Cli {
     #[arg(
         long = "reaper-interval",
         help_heading = "Cleanup",
-        default_value_t = claudectl::reaper::DEFAULT_INTERVAL_SECONDS
+        default_value_t = agentctl::reaper::DEFAULT_INTERVAL_SECONDS
     )]
     pub(crate) reaper_interval: u64,
 
@@ -354,7 +355,7 @@ pub(crate) struct Cli {
     #[arg(long, help_heading = "Setup")]
     pub(crate) init: bool,
 
-    /// Remove claudectl hooks from .claude/settings.json and exit
+    /// Remove agentctl hooks from .claude/settings.json and exit
     #[arg(long, help_heading = "Setup", conflicts_with = "init")]
     pub(crate) uninstall: bool,
 
@@ -479,7 +480,13 @@ fn run_main(cli: Cli) -> io::Result<()> {
             println!("  {name}: {source}");
         }
         println!();
-        println!("Override: create ~/.claudectl/brain/prompts/<name>.md");
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        if let Some(home) = home {
+            println!(
+                "Override: create {}/brain/prompts/<name>.md",
+                crate::product::home_dot_dir(&home).display()
+            );
+        }
         return Ok(());
     }
 
@@ -772,7 +779,7 @@ fn run_tui<W: io::Write>(
                 );
             } else {
                 app.status_msg = format!(
-                    "Error: Brain endpoint {} not reachable — run `claudectl --doctor` or start ollama",
+                    "Error: Brain endpoint {} not reachable — run `agentctl --doctor` or start ollama",
                     brain_cfg.endpoint
                 );
             }

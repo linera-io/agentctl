@@ -227,8 +227,7 @@ fn format_eval_decision_prompt(eval: &EvalSession) -> String {
 
 fn evals_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home)
-        .join(".claudectl")
+    crate::product::home_dot_dir(&PathBuf::from(home))
         .join("brain")
         .join("evals")
 }

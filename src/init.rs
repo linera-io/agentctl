@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Every entry maps to a deterministic state transition for the matching
 /// session — see `hook_state.rs` for the receiver. The hook command is the
-/// dedicated `claudectl-hook` binary (`src/bin/claudectl-hook.rs`), which does
+/// dedicated `agentctl-hook` binary (`src/bin/agentctl-hook.rs`), which does
 /// nothing but read the payload from stdin and record it. `claudectl` itself
 /// keeps the same fast-path, so settings written by older versions keep
 /// working until `--init` migrates them.
@@ -37,11 +37,11 @@ impl HookSpec {
 
 /// The command Claude Code runs on every hook event.
 ///
-/// `claudectl-hook` rather than `claudectl`: the receiver is a tiny binary of
+/// `agentctl-hook` rather than `agentctl`: the receiver is a tiny binary of
 /// its own so the agent sandbox can ship only that (see
-/// `src/bin/claudectl-hook.rs`). `claudectl` keeps its own hook fast-path, so
+/// `src/bin/agentctl-hook.rs`). `agentctl` keeps its own hook fast-path, so
 /// settings still pointing at the old command keep working.
-const HOOK_CMD: &str = "claudectl-hook 2>/dev/null || true";
+const HOOK_CMD: &str = "agentctl-hook 2>/dev/null || true";
 
 /// Hook commands this tool owns, newest first. `--init` rewrites any of these
 /// to [`HOOK_CMD`], so an existing install migrates by re-running it rather
@@ -54,6 +54,7 @@ const HOOK_CMD: &str = "claudectl-hook 2>/dev/null || true";
 /// `--json` variant is not hypothetical: it was the real installed command in
 /// 5f7fb789, so settings written then still carry it.
 const OWNED_HOOK_CMDS: &[&str] = &[
+    "agentctl-hook 2>/dev/null || true",
     "claudectl-hook 2>/dev/null || true",
     "claudectl 2>/dev/null || true",
     "claudectl --json 2>/dev/null || true",
@@ -635,7 +636,7 @@ mod tests {
                 assert!(entry.get("hooks").is_some());
                 let inner = entry["hooks"].as_array().unwrap();
                 assert_eq!(inner[0]["type"], "command");
-                assert!(inner[0]["command"].as_str().unwrap().contains("claudectl"));
+                assert_eq!(inner[0]["command"], HOOK_CMD);
             }
         }
     }
@@ -1148,5 +1149,54 @@ mod tests {
         let session_start = settings["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(session_start.len(), 1);
         assert_eq!(session_start[0]["hooks"][0]["command"], "echo started");
+    }
+
+    /// A claudectl-era install must carry forward on `--init`, not sit stale.
+    #[test]
+    fn a_legacy_claudectl_hook_migrates_to_agentctl_and_then_stays_put() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Notification": [{
+                    "matcher": "permission_prompt",
+                    "hooks": [{"type": "command", "command": "claudectl-hook 2>/dev/null || true"}]
+                }]
+            }
+        });
+
+        assert_eq!(migrate_owned_hook_commands(&mut settings), 1);
+        assert_eq!(
+            settings["hooks"]["Notification"][0]["hooks"][0]["command"],
+            "agentctl-hook 2>/dev/null || true"
+        );
+
+        // Idempotent: a second --init must not rewrite or duplicate anything.
+        assert_eq!(migrate_owned_hook_commands(&mut settings), 0);
+        assert_eq!(
+            settings["hooks"]["Notification"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// The migration claims only its own historical commands.
+    #[test]
+    fn a_hand_written_hook_that_calls_claudectl_is_left_alone() {
+        let mine = "claudectl --list | wc -l";
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Notification": [{
+                    "matcher": "permission_prompt",
+                    "hooks": [{"type": "command", "command": mine}]
+                }]
+            }
+        });
+
+        assert_eq!(migrate_owned_hook_commands(&mut settings), 0);
+        assert_eq!(
+            settings["hooks"]["Notification"][0]["hooks"][0]["command"],
+            mine
+        );
     }
 }

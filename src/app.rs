@@ -524,7 +524,7 @@ pub const SORT_COLUMNS: &[&str] = &[
 
 /// Default path for the persisted park list.
 pub fn parked_path() -> std::path::PathBuf {
-    dirs_home().join(".claudectl").join("parked.json")
+    crate::product::home_dot_dir(&dirs_home()).join("parked.json")
 }
 
 /// Load the parked-session set from `path`. Returns an empty set on any
