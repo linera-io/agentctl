@@ -162,10 +162,32 @@ pub fn summarize_file(path: &Path) -> Option<RolloutSummary> {
     Some(summary)
 }
 
-/// Every readable Codex session under a sessions root.
-pub fn discover_sessions(root: &Path) -> Vec<RolloutSummary> {
+/// Every readable Codex session under a sessions root, newer than `since_ms`.
+///
+/// A rollout is never pruned, so the tree grows without bound while the live
+/// set stays tiny. Re-reading and re-parsing all of it on every refresh tick
+/// costs time proportional to total history rather than to live sessions — at
+/// 200 files it was measured at 263 ms per tick, on a 2-second timer.
+///
+/// `since_ms` is the oldest live process's start time: a rollout not written
+/// since before every live session began cannot belong to one of them, so it is
+/// skipped on the `mtime` alone, without opening the file. Files whose metadata
+/// cannot be read are kept rather than dropped — an unreadable stat must not
+/// silently hide a live session.
+pub fn discover_sessions_modified_since(root: &Path, since_ms: u64) -> Vec<RolloutSummary> {
     discover_rollout_files(root)
         .iter()
-        .filter_map(|p| summarize_file(p))
+        .filter(|path| modified_since(path, since_ms))
+        .filter_map(|path| summarize_file(path))
         .collect()
+}
+
+fn modified_since(path: &Path, since_ms: u64) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return true;
+    };
+    let Ok(age) = modified.duration_since(std::time::UNIX_EPOCH) else {
+        return true;
+    };
+    age.as_millis() as u64 >= since_ms
 }

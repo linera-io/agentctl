@@ -159,18 +159,31 @@ fn enrich_from_ps(sessions: &mut [AgentSession]) {
         let mem_mb = rss_kb / 1024.0;
         let command = fields[4..].join(" ");
 
-        // Only count this PID as alive if it's actually a claude process.
-        // PIDs get reused on macOS — a dead claude session's PID may belong
+        // Only count this PID as alive if it really is one of our products'
+        // processes. PIDs get reused on macOS — a dead session's PID may belong
         // to an unrelated process now. Match on argv0 basename, not a raw
-        // substring: `claudectl`, `bash -lc '... claude ...'`, and
-        // `grep claude` would all match a substring check.
-        if !is_claude_process(&command) {
+        // substring: `agentctl`, `bash -lc '... claude ...'`, and `grep claude`
+        // would all match a substring check.
+        //
+        // The question is asked PER ROW, against the product that row belongs
+        // to. Asking the Claude-only question for every row marked every live
+        // Codex session Finished on each tick, with 0% CPU, 0 MEM and no
+        // resolved terminal — so Tab, focus and send-input had nothing to
+        // address. A pid with no matching row keeps the Claude test, which is
+        // what `alive_pids` meant before.
+        let matched_idx = pid_to_idx.get(&pid).copied();
+        let is_ours = match matched_idx {
+            Some(idx) => crate::providers::for_provider(sessions[idx].provider)
+                .is_some_and(|adapter| adapter.matches_process(&command)),
+            None => is_claude_process(&command),
+        };
+        if !is_ours {
             continue;
         }
 
         alive_pids.insert(pid);
 
-        let Some(&idx) = pid_to_idx.get(&pid) else {
+        let Some(idx) = matched_idx else {
             continue;
         };
         let session = &mut sessions[idx];

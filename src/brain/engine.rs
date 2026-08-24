@@ -736,8 +736,7 @@ fn extract_file_path(input: &str) -> Option<String> {
 
 fn save_checkpoint(session_id: &str, session: &AgentSession, summary: &str) -> Result<(), String> {
     let home = std::env::var("HOME").map_err(|e| format!("HOME not set: {e}"))?;
-    let dir = std::path::PathBuf::from(home)
-        .join(".claudectl")
+    let dir = crate::product::home_dot_dir(&std::path::PathBuf::from(home))
         .join("brain")
         .join("checkpoints");
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir failed: {e}"))?;

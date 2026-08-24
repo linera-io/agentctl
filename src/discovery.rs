@@ -324,12 +324,22 @@ fn scan_codex_sessions() -> Vec<AgentSession> {
         return Vec::new();
     }
 
+    // Nothing written before the oldest live session started can belong to one,
+    // so the walk never opens those files.
+    let oldest_start_ms = procs
+        .values()
+        .map(|proc| proc.started_at_ms)
+        .min()
+        .unwrap_or(0);
+
     let root = codex_sessions_root();
     let mut by_cwd: std::collections::HashMap<
         String,
         crate::providers::codex_rollout::RolloutSummary,
     > = std::collections::HashMap::new();
-    for summary in crate::providers::codex_rollout::discover_sessions(&root) {
+    for summary in
+        crate::providers::codex_rollout::discover_sessions_modified_since(&root, oldest_start_ms)
+    {
         let Some(cwd) = summary.cwd.clone() else {
             continue;
         };
@@ -345,7 +355,13 @@ fn scan_codex_sessions() -> Vec<AgentSession> {
 
     let mut out = Vec::new();
     let mut used: HashSet<String> = HashSet::new();
-    for (pid, proc) in procs {
+    // Sorted, because `procs` is a HashMap: with two `codex` processes sharing a
+    // cwd, an arbitrary iteration order made a different pid win each tick, and
+    // a row changing identity every refresh re-fires SessionStart. Lowest pid
+    // wins — that is the session leader, and it is stable.
+    let mut ordered: Vec<_> = procs.into_iter().collect();
+    ordered.sort_by_key(|(pid, _)| *pid);
+    for (pid, proc) in ordered {
         // `-C/--cd` moves the agent's root without moving the process, so the
         // flag wins over `/proc/<pid>/cwd` when present — otherwise every
         // session started that way is silently never discovered.
