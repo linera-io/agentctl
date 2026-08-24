@@ -16,7 +16,19 @@ fn dirs_home() -> PathBuf {
 }
 
 pub fn projects_dir() -> PathBuf {
-    dirs_home().join(".claude").join("projects")
+    transcript_root(crate::provider::AgentProvider::Claude)
+}
+
+/// A product's transcript root, via its adapter.
+///
+/// Panics for a product with no adapter yet: scanning one product's
+/// transcripts with another's layout would return plausible-looking wrong
+/// sessions, which is worse than not scanning. Unreachable today — nothing
+/// constructs a session for an unadapted product.
+fn transcript_root(provider: crate::provider::AgentProvider) -> PathBuf {
+    crate::providers::for_provider(provider)
+        .unwrap_or_else(|| panic!("no adapter for {}", provider.label()))
+        .transcript_root(&dirs_home())
 }
 
 /// The live sessions to mirror into the restore registry: every session with a
