@@ -288,7 +288,105 @@ pub fn transcript_path(session_id: &str, cwd: &str) -> PathBuf {
         .join(format!("{session_id}.jsonl"))
 }
 
+/// Both products' sessions, Claude's discovery untouched.
+///
+/// Codex rows are appended, never merged into a Claude row: identity is
+/// `(provider, session_id)`, so the two products' id spaces cannot collide even
+/// if a ULID ever equalled a uuid.
 pub fn scan_sessions() -> Vec<AgentSession> {
+    let mut sessions = scan_claude_sessions();
+    let claimed: HashSet<(crate::provider::AgentProvider, String)> = sessions
+        .iter()
+        .map(|s| (s.provider, s.session_id.clone()))
+        .collect();
+    for session in scan_codex_sessions() {
+        if claimed.contains(&(session.provider, session.session_id.clone())) {
+            continue;
+        }
+        sessions.push(session);
+    }
+    sessions
+}
+
+/// Live Codex sessions, correlated to running processes by cwd.
+///
+/// Liveness is required, not decorative: a rollout file outlives its session
+/// forever, so surfacing every rollout would bury the dashboard under every
+/// Codex conversation ever held. A rollout with no live `codex` process in this
+/// cwd is history, not a session.
+fn scan_codex_sessions() -> Vec<AgentSession> {
+    let Some(procs) =
+        crate::process::live_procs_for(crate::provider::AgentProvider::Codex.executable())
+    else {
+        return Vec::new();
+    };
+    if procs.is_empty() {
+        return Vec::new();
+    }
+
+    let root = codex_sessions_root();
+    let mut by_cwd: std::collections::HashMap<
+        String,
+        crate::providers::codex_rollout::RolloutSummary,
+    > = std::collections::HashMap::new();
+    for summary in crate::providers::codex_rollout::discover_sessions(&root) {
+        let Some(cwd) = summary.cwd.clone() else {
+            continue;
+        };
+        // Newest rollout wins for a cwd: a directory reused across sessions
+        // would otherwise render whichever file the walk happened to reach last.
+        let newer = by_cwd
+            .get(&cwd)
+            .is_none_or(|existing| summary.last_activity > existing.last_activity);
+        if newer {
+            by_cwd.insert(cwd, summary);
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut used: HashSet<String> = HashSet::new();
+    for (pid, proc) in procs {
+        let Some(cwd) = proc_cwd(pid) else { continue };
+        let Some(summary) = by_cwd.get(&cwd) else {
+            continue;
+        };
+        let Some(thread_id) = summary.thread_id.clone() else {
+            continue;
+        };
+        // One process per rollout: two `codex` processes in one directory are
+        // two sessions, but only one has a rollout we can attribute.
+        if !used.insert(thread_id.clone()) {
+            continue;
+        }
+        let mut session = AgentSession::from_raw(RawSession {
+            pid,
+            session_id: thread_id,
+            cwd,
+            started_at: proc.started_at_ms,
+            name: None,
+            name_source: None,
+        });
+        session.provider = crate::provider::AgentProvider::Codex;
+        if let Some(model) = &summary.model {
+            session.model = model.clone();
+        }
+        out.push(session);
+    }
+    out
+}
+
+/// `$CODEX_HOME/sessions`, honouring the override Codex itself reads.
+///
+/// `archived_sessions` is a sibling of this directory, so archived threads are
+/// excluded by scanning here rather than by filtering them back out.
+fn codex_sessions_root() -> PathBuf {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs_home().join(crate::provider::AgentProvider::Codex.home_dir()));
+    home.join(crate::provider::AgentProvider::Codex.transcript_root())
+}
+
+fn scan_claude_sessions() -> Vec<AgentSession> {
     let dir = sessions_dir();
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
