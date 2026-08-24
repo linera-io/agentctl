@@ -286,7 +286,9 @@ pub(crate) fn build_claude_args(prompt: Option<&str>, resume: Option<&str>) -> V
 /// the launch backends that run a command string rather than an argv — tmux and
 /// the macOS AppleScript terminals.
 pub(crate) fn build_claude_command(prompt: Option<&str>, resume: Option<&str>) -> String {
-    let mut parts = vec!["claude".to_string()];
+    let adapter = crate::providers::for_provider(crate::provider::AgentProvider::Claude)
+        .expect("Claude adapter is always present");
+    let mut parts = vec![adapter.executable().to_string()];
     parts.extend(
         build_claude_args(prompt, resume)
             .iter()

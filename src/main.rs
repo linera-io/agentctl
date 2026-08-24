@@ -39,6 +39,7 @@ mod ui;
 mod usage_ledger;
 
 use agentctl::provider;
+use agentctl::providers;
 
 use std::io;
 use std::time::{Duration, Instant};

@@ -25,6 +25,7 @@ pub mod orchestrator;
 pub mod process;
 pub mod product;
 pub mod provider;
+pub mod providers;
 pub mod reaper;
 pub mod recorder;
 pub mod rules;
