@@ -144,7 +144,7 @@ pub(crate) struct Cli {
     #[arg(long, help_heading = "Session Management")]
     pub(crate) resume: Option<String>,
 
-    /// Restore your local (laptop) Claude sessions — e.g. after a Ghostty
+    /// Restore this host's own Claude sessions — e.g. after a Ghostty
     /// restart-to-update — spawning one window per session that was live,
     /// each running `claude --resume <id>` in its recorded directory. No
     /// argument; pair with --dry-run to preview.

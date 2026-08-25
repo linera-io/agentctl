@@ -157,13 +157,22 @@ pub enum SessionOrigin {
     Sandbox(String),
 }
 
+/// What the ORIGIN column shows for a session running outside any sandbox.
+pub const HOST_LABEL: &str = "host";
+
 impl SessionOrigin {
     /// Label for the ORIGIN column. `Local` needs context we don't hold here —
-    /// the caller passes what "here" is called (the sandbox name, or `None` on
-    /// the laptop).
+    /// the caller passes what "here" is called (the sandbox name, or `None`
+    /// when running outside one).
+    ///
+    /// "host" rather than "laptop", which assumed hardware nobody promised, or
+    /// "local", which is not a distinction: a sandbox runs on this same machine
+    /// and is just as local. Host is what the sandbox runs *on*, and it is the
+    /// word the rest of this codebase already uses for that machine —
+    /// `SANDBOX_HOST_TTY`, host-shared, host-side, host-native.
     pub fn label(&self, local_name: Option<&str>) -> String {
         match self {
-            Self::Local => local_name.unwrap_or("laptop").to_string(),
+            Self::Local => local_name.unwrap_or(HOST_LABEL).to_string(),
             Self::Sandbox(name) => name.clone(),
         }
     }
@@ -1178,7 +1187,11 @@ mod origin_tests {
             SessionOrigin::Local.label(Some("linera-agent-a3f1")),
             "linera-agent-a3f1"
         );
-        assert_eq!(SessionOrigin::Local.label(None), "laptop");
+        assert_eq!(
+            SessionOrigin::Local.label(None),
+            "host",
+            "not 'laptop' (assumes hardware) and not 'local' (a sandbox is local too)"
+        );
         assert_eq!(
             SessionOrigin::Sandbox("linera-agent-251d".into()).label(Some("linera-agent-a3f1")),
             "linera-agent-251d"

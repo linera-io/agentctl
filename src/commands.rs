@@ -156,7 +156,7 @@ pub(crate) fn reconcile_shared_home(apply: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// `--restore-sessions`: bring back your local (laptop) Claude sessions — e.g.
+/// `--restore-sessions`: bring back this host's own Claude sessions — e.g.
 /// after a Ghostty restart-to-update — spawning one window per session that was
 /// live, each running `claude --resume <id>` in its recorded directory. Reads
 /// the local registry (`local-sessions.json`), maintained by every host hook.
@@ -736,7 +736,7 @@ fn print_doctor_hook_liveness() {
     }
 }
 
-/// Scope label for the laptop's own (non-sandbox) sessions. Not a sandbox name,
+/// Scope label for the host's own (non-sandbox) sessions. Not a sandbox name,
 /// so it is never run through the running-sandbox filter.
 const HOST_SCOPE: &str = "host";
 
