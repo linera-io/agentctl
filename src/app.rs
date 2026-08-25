@@ -3062,6 +3062,14 @@ pub struct ProjectGroup {
     pub session_count: usize,
     pub active_count: usize,
     pub total_cost: f64,
+    /// How many of `session_count` contributed nothing to `total_cost` because
+    /// their usage is unknown — a Codex row today, or any session whose
+    /// transcript has not been read yet.
+    ///
+    /// Carried so the header can say the total is partial. Summing an unknown
+    /// cost as zero and printing the result unqualified states a total the data
+    /// does not support.
+    pub unmeasured_count: usize,
     pub avg_context_pct: f64,
 }
 
@@ -3102,6 +3110,7 @@ impl App {
                     })
                     .count();
                 let total_cost: f64 = sessions.iter().map(|s| s.cost_usd).sum();
+                let unmeasured_count = sessions.iter().filter(|s| !s.has_usage_metrics()).count();
                 let avg_context_pct = if sessions.is_empty() {
                     0.0
                 } else {
@@ -3113,6 +3122,7 @@ impl App {
                     session_count: sessions.len(),
                     active_count,
                     total_cost,
+                    unmeasured_count,
                     avg_context_pct,
                 }
             })
@@ -4359,6 +4369,34 @@ mod tests {
             app.visible_sessions().len(),
             0,
             "no fixture session is Codex"
+        );
+    }
+
+    /// A group's cost total must know how much of itself is unknown.
+    ///
+    /// `total_cost` sums `cost_usd`, and a session with no usage data
+    /// contributes 0.0 — so without this count the header would print a
+    /// confident figure for a group that is partly unmeasured.
+    #[test]
+    fn a_project_group_counts_its_unmeasured_sessions() {
+        let app = make_test_app();
+        let groups = app.project_groups();
+        assert!(!groups.is_empty(), "fixture must produce groups");
+
+        for group in &groups {
+            assert!(
+                group.unmeasured_count <= group.session_count,
+                "{}: cannot have more unmeasured than sessions",
+                group.name
+            );
+        }
+
+        // The fixture deliberately contains a session with telemetry marked
+        // unavailable, so at least one group must report a nonzero count —
+        // otherwise this test would pass against a hardcoded zero.
+        assert!(
+            groups.iter().any(|g| g.unmeasured_count > 0),
+            "fixture has an unmeasured session; some group must report it"
         );
     }
 

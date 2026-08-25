@@ -47,6 +47,25 @@ fn sort_header_idx(sort_column: usize) -> usize {
     }
 }
 
+/// A cost total, marked when some of the sessions behind it have no usage data.
+///
+/// `>` rather than a bare figure: a session whose cost is unknown contributes
+/// zero to the sum, so the number is a floor, not the total. Printing it
+/// unqualified asserts a precision the data does not have — a fleet of Codex
+/// rows would read as costing nothing.
+fn format_partial_cost(total: f64, unmeasured: usize) -> String {
+    let figure = if total < 1.0 {
+        format!("${total:.2}")
+    } else {
+        format!("${total:.1}")
+    };
+    if unmeasured == 0 {
+        figure
+    } else {
+        format!(">{figure}")
+    }
+}
+
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
     let visible_sessions = app.visible_sessions();
@@ -212,11 +231,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             if current_group != Some(s.project_name.as_str()) {
                 current_group = Some(s.project_name.as_str());
                 if let Some(group) = groups.iter().find(|g| g.name == s.project_name) {
-                    let cost_str = if group.total_cost < 1.0 {
-                        format!("${:.2}", group.total_cost)
-                    } else {
-                        format!("${:.1}", group.total_cost)
-                    };
+                    let cost_str = format_partial_cost(group.total_cost, group.unmeasured_count);
                     let header_text = format!(
                         "{} ({} sessions, {} active, {}, ctx {:.0}%)",
                         group.name,
@@ -313,11 +328,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         .count();
     let selected = app.table_state.selected().map(|i| i + 1).unwrap_or(0);
 
-    let cost_str = if total_cost < 1.0 {
-        format!("${total_cost:.2}")
-    } else {
-        format!("${total_cost:.1}")
-    };
+    let cost_str = format_partial_cost(total_cost, missing_usage);
 
     let tokens_str = format_token_count(total_tokens);
     let partial_str = if missing_usage > 0 {
@@ -1206,5 +1217,30 @@ mod tests {
         );
         assert_eq!(HEADER_NAMES[0], "PID");
         assert_eq!(HEADER_NAMES[2], "Name");
+    }
+
+    /// A cost total must not present itself as complete when part of the
+    /// population has unknown cost.
+    ///
+    /// A session with no usage data contributes 0.0 to the sum, so the figure
+    /// is a floor. Before this, the footer printed it unqualified and put the
+    /// `+N n/a` marker after TOKENS — so the marker read as qualifying the
+    /// token count while the cost beside it looked exact. A dashboard of Codex
+    /// rows would have reported the fleet as costing $0.00.
+    #[test]
+    fn a_cost_total_is_marked_when_some_sessions_are_unmeasured() {
+        assert_eq!(format_partial_cost(12.34, 0), "$12.3");
+        assert_eq!(format_partial_cost(0.5, 0), "$0.50");
+
+        assert_eq!(
+            format_partial_cost(12.34, 3),
+            ">$12.3",
+            "three unmeasured sessions make this a floor, not a total"
+        );
+        assert_eq!(
+            format_partial_cost(0.0, 2),
+            ">$0.00",
+            "all-unmeasured must not read as free"
+        );
     }
 }
