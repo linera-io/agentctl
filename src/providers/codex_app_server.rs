@@ -54,9 +54,21 @@ impl Method {
 pub enum Notification {
     ThreadStatusChanged {
         thread_id: String,
+        /// The `type` tag of `ThreadStatus`: `idle`, `active`, `notLoaded` or
+        /// `systemError`. Required by the schema, and the only reason to
+        /// subscribe — without it we learn that status changed and never what
+        /// it changed to.
+        status: String,
     },
     ThreadTokenUsageUpdated {
         thread_id: String,
+        turn_id: String,
+        /// `tokenUsage.total.totalTokens`, absent only if the breakdown omits
+        /// it. camelCase here; the rollout file spells the same idea
+        /// `total_token_usage.total_tokens`, so the two must not be shared.
+        total_tokens: Option<u64>,
+        /// `tokenUsage.modelContextWindow`, nullable in the schema.
+        context_window: Option<u64>,
     },
     ThreadNameUpdated {
         thread_id: String,
@@ -67,9 +79,11 @@ pub enum Notification {
     },
     TurnStarted {
         thread_id: String,
+        turn_id: String,
     },
     TurnCompleted {
         thread_id: String,
+        turn_id: String,
     },
     /// A method we do not model. Carried rather than dropped so a caller can
     /// log it, and so "unknown" is distinguishable from "not a notification".
@@ -80,9 +94,21 @@ pub enum Notification {
 
 impl Notification {
     fn from_parts(method: &str, params: &serde_json::Value) -> Self {
-        let thread_id = || {
+        let str_field = |key: &str| {
             params
-                .get("threadId")
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let thread_id = || str_field("threadId");
+        // `turn/started` and `turn/completed` carry a whole `Turn`; its `id` is
+        // what correlates the two, and the rest is turn content a dashboard row
+        // does not render.
+        let turn_id = || {
+            params
+                .get("turn")
+                .and_then(|t| t.get("id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string()
@@ -90,9 +116,25 @@ impl Notification {
         match method {
             "thread/status/changed" => Self::ThreadStatusChanged {
                 thread_id: thread_id(),
+                status: params
+                    .get("status")
+                    .and_then(|s| s.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
             },
             "thread/tokenUsage/updated" => Self::ThreadTokenUsageUpdated {
                 thread_id: thread_id(),
+                turn_id: str_field("turnId"),
+                total_tokens: params
+                    .get("tokenUsage")
+                    .and_then(|u| u.get("total"))
+                    .and_then(|t| t.get("totalTokens"))
+                    .and_then(serde_json::Value::as_u64),
+                context_window: params
+                    .get("tokenUsage")
+                    .and_then(|u| u.get("modelContextWindow"))
+                    .and_then(serde_json::Value::as_u64),
             },
             // The wire field is `threadName`, NOT `name`. The *request* side
             // (`ThreadSetNameParams`) does use `name`, which is the trap: the
@@ -107,9 +149,11 @@ impl Notification {
             },
             "turn/started" => Self::TurnStarted {
                 thread_id: thread_id(),
+                turn_id: turn_id(),
             },
             "turn/completed" => Self::TurnCompleted {
                 thread_id: thread_id(),
+                turn_id: turn_id(),
             },
             other => Self::Other {
                 method: other.to_string(),

@@ -65,10 +65,15 @@ fn responses_and_notifications_are_told_apart() {
             result: serde_json::json!({"ok": true})
         })
     );
+    // `turn/started` carries a whole `Turn`; `Turn.id` is what correlates it
+    // with the matching `turn/completed`.
     assert_eq!(
-        decode_line(r#"{"method":"turn/started","params":{"threadId":"t-1"}}"#),
+        decode_line(
+            r#"{"method":"turn/started","params":{"threadId":"t-1","turn":{"id":"turn-7","items":[],"status":"active"}}}"#
+        ),
         Some(Incoming::Notification(Notification::TurnStarted {
-            thread_id: "t-1".to_string()
+            thread_id: "t-1".to_string(),
+            turn_id: "turn-7".to_string()
         }))
     );
     // The wire field is `threadName`. This fixture was hand-written as `name`
@@ -139,8 +144,8 @@ import sys, json
 line = sys.stdin.readline()
 req = json.loads(line)
 # Push state first, exactly as a server with live threads does.
-print(json.dumps({"method": "thread/status/changed", "params": {"threadId": "t-9"}}), flush=True)
-print(json.dumps({"method": "turn/started", "params": {"threadId": "t-9"}}), flush=True)
+print(json.dumps({"method": "thread/status/changed", "params": {"threadId": "t-9", "status": {"type": "active"}}}), flush=True)
+print(json.dumps({"method": "turn/started", "params": {"threadId": "t-9", "turn": {"id": "turn-1", "items": [], "status": "active"}}}), flush=True)
 # A response to an id we never sent must be ignored, not matched.
 print(json.dumps({"id": 999, "result": {"stray": True}}), flush=True)
 print(json.dumps({"id": req["id"], "result": {"userAgent": "codex"}}), flush=True)
@@ -164,10 +169,12 @@ print(json.dumps({"id": req["id"], "result": {"userAgent": "codex"}}), flush=Tru
         early,
         vec![
             Notification::ThreadStatusChanged {
-                thread_id: "t-9".to_string()
+                thread_id: "t-9".to_string(),
+                status: "active".to_string()
             },
             Notification::TurnStarted {
-                thread_id: "t-9".to_string()
+                thread_id: "t-9".to_string(),
+                turn_id: "turn-1".to_string()
             },
         ],
         "notifications preceding the response are kept, in order"
@@ -255,4 +262,65 @@ print(json.dumps({"id": req["id"], "result": {}}), flush=True)
     let err = handshake(&mut reader, &mut stdin, "0.33.0").expect_err("must not silently proceed");
     assert!(err.to_string().contains("applyPatchApproval"), "got: {err}");
     let _ = child.wait();
+}
+
+/// Four of the five modelled notifications carry a required payload, and the
+/// first cut of this client threw all of it away.
+///
+/// Keeping only `threadId` meant the dashboard was told "status changed" and
+/// never what it changed to, "tokens updated" and never how many. Field names
+/// come from the generated schema: `ThreadStatus` is a tagged object, and the
+/// counts are camelCase here (`totalTokens`, `modelContextWindow`) where the
+/// rollout file spells the same idea snake_case — the two must not be shared.
+#[test]
+fn the_notifications_carry_their_payloads_not_just_a_thread_id() {
+    assert_eq!(
+        decode_line(
+            r#"{"method":"thread/status/changed","params":{"threadId":"t-1","status":{"type":"idle"}}}"#
+        ),
+        Some(Incoming::Notification(Notification::ThreadStatusChanged {
+            thread_id: "t-1".to_string(),
+            status: "idle".to_string()
+        })),
+        "status is the whole point of the notification"
+    );
+
+    assert_eq!(
+        decode_line(
+            r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"t-1","turnId":"turn-3","tokenUsage":{"total":{"totalTokens":12800,"inputTokens":12000,"outputTokens":800,"cachedInputTokens":0,"reasoningOutputTokens":0},"last":{"totalTokens":1280,"inputTokens":1200,"outputTokens":80,"cachedInputTokens":0,"reasoningOutputTokens":0},"modelContextWindow":272000}}}"#
+        ),
+        Some(Incoming::Notification(
+            Notification::ThreadTokenUsageUpdated {
+                thread_id: "t-1".to_string(),
+                turn_id: "turn-3".to_string(),
+                total_tokens: Some(12800),
+                context_window: Some(272000)
+            }
+        ))
+    );
+
+    // `modelContextWindow` is nullable, and the counts may be absent.
+    assert_eq!(
+        decode_line(
+            r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"t-1","turnId":"turn-3","tokenUsage":{"modelContextWindow":null}}}"#
+        ),
+        Some(Incoming::Notification(
+            Notification::ThreadTokenUsageUpdated {
+                thread_id: "t-1".to_string(),
+                turn_id: "turn-3".to_string(),
+                total_tokens: None,
+                context_window: None
+            }
+        ))
+    );
+
+    assert_eq!(
+        decode_line(
+            r#"{"method":"turn/completed","params":{"threadId":"t-1","turn":{"id":"turn-9","items":[],"status":"completed"}}}"#
+        ),
+        Some(Incoming::Notification(Notification::TurnCompleted {
+            thread_id: "t-1".to_string(),
+            turn_id: "turn-9".to_string()
+        }))
+    );
 }
