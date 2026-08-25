@@ -695,6 +695,10 @@ fn parse_config_file(path: &PathBuf) -> Option<RawConfig> {
     let content = fs::read_to_string(path).ok()?;
     let mut raw = RawConfig::default();
     let mut section = String::new();
+    // Rules whose `action` parsed. A rule is created the moment its section
+    // header is read — before its action line arrives — so the placeholder in
+    // `ensure_rule` cannot itself say "not set yet".
+    let mut actioned: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for line in content.lines() {
         let line = line.trim();
@@ -825,8 +829,20 @@ fn parse_config_file(path: &PathBuf) -> Option<RawConfig> {
                     "match_last_error" => rule.match_last_error = parse_bool(value),
                     "match_file_conflict" => rule.match_file_conflict = parse_bool(value),
                     "action" => {
-                        if let Some(a) = RuleAction::parse(&unquote(value)) {
-                            rule.action = a;
+                        let raw_action = unquote(value);
+                        match RuleAction::parse(&raw_action) {
+                            Some(a) => {
+                                rule.action = a;
+                                actioned.insert(rule_name.clone());
+                            }
+                            None => crate::logger::log(
+                                "WARN",
+                                &format!(
+                                    "rule '{rule_name}': unrecognised action {raw_action:?} \
+                                     (expected approve, deny, send, terminate or kill); \
+                                     the rule is discarded"
+                                ),
+                            ),
                         }
                     }
                     "message" => rule.message = Some(unquote(value)),
@@ -918,6 +934,22 @@ fn parse_config_file(path: &PathBuf) -> Option<RawConfig> {
             _ => {} // Ignore unknown keys
         }
     }
+
+    // A rule whose action never parsed is not a rule. Keeping it would leave
+    // `ensure_rule`'s `Approve` placeholder in place, so a rule written to block
+    // something would auto-approve it instead — failing in the unsafe direction,
+    // silently. Dropping it makes no automated decision at all, which is what a
+    // config the tool could not understand should produce.
+    raw.rules.retain(|rule| {
+        if actioned.contains(&rule.name) {
+            return true;
+        }
+        crate::logger::log(
+            "WARN",
+            &format!("rule '{}': no valid action; discarded", rule.name),
+        );
+        false
+    });
 
     Some(raw)
 }
@@ -1365,5 +1397,50 @@ auto_deny_file_conflicts = true
         let config = Config::default();
         assert!(config.file_conflicts); // on by default
         assert!(!config.auto_deny_file_conflicts); // off by default
+    }
+
+    /// A rule whose action the parser cannot read must not become an APPROVE.
+    ///
+    /// `ensure_rule` creates every rule with `RuleAction::Approve` as a
+    /// placeholder, because the section header is read before the action line.
+    /// The action arm used to skip silently on an unrecognised value, so
+    /// `action = "block"` — a plausible typo, and the synonym people reach for —
+    /// left the rule sitting at Approve. A rule written to block `rm -rf` would
+    /// have auto-approved it, with nothing logged and nothing to notice.
+    #[test]
+    fn a_rule_whose_action_does_not_parse_is_discarded_not_approved() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"
+[rules.block_destructive]
+match_tool = ["Bash"]
+match_command = ["rm -rf"]
+action = "block"
+
+[rules.no_action_key]
+match_tool = ["Bash"]
+
+[rules.real_deny]
+match_tool = ["Bash"]
+action = "deny"
+"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let raw = parse_config_file(&file.path().to_path_buf()).unwrap();
+        let names: Vec<&str> = raw.rules.iter().map(|r| r.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            ["real_deny"],
+            "only the rule with a valid action survives"
+        );
+        assert!(
+            !raw.rules.iter().any(|r| r.action == RuleAction::Approve),
+            "nothing may reach the config as an unintended Approve"
+        );
     }
 }
