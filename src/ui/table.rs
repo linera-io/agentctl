@@ -288,7 +288,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(5),  // MEM
         Constraint::Length(14), // Tokens
         Constraint::Length(16), // Activity sparkline
-        Constraint::Min(10),    // Origin (sandbox name / laptop)
+        Constraint::Min(10),    // Origin (sandbox name, or "host")
     ];
 
     let count = visible_sessions.len();
