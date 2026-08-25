@@ -56,8 +56,9 @@ pub struct AutoRule {
     pub match_command: Vec<String>,
     pub match_project: Vec<String>,
     /// Product names this rule applies to, matched against
-    /// [`AgentProvider::label`] case-insensitively. Empty means every product,
-    /// so every rule written before this field keeps matching exactly as it did.
+    /// [`crate::provider::AgentProvider::label`] case-insensitively. Empty means
+    /// every product, so every rule written before this field keeps matching
+    /// exactly as it did.
     pub match_provider: Vec<String>,
     pub match_cost_above: Option<f64>,
     pub match_last_error: Option<bool>,
