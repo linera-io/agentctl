@@ -13,6 +13,7 @@ use crate::transcript::TranscriptEvent;
 
 pub mod claude;
 pub mod codex;
+pub mod codex_app_server;
 pub mod codex_rollout;
 
 /// What agentctl needs to know about a product to drive it.
