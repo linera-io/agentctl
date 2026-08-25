@@ -71,13 +71,35 @@ fn responses_and_notifications_are_told_apart() {
             thread_id: "t-1".to_string()
         }))
     );
+    // The wire field is `threadName`. This fixture was hand-written as `name`
+    // — the shape the *request* uses — and the decoder was written to match it,
+    // so the test passed against a payload the server never sends.
     assert_eq!(
         decode_line(
-            r#"{"method":"thread/name/updated","params":{"threadId":"t-1","name":"fix parser"}}"#
+            r#"{"method":"thread/name/updated","params":{"threadId":"t-1","threadName":"fix parser"}}"#
         ),
         Some(Incoming::Notification(Notification::ThreadNameUpdated {
             thread_id: "t-1".to_string(),
-            name: "fix parser".to_string()
+            name: Some("fix parser".to_string())
+        }))
+    );
+    // Nullable and not required: a cleared name must stay distinguishable from
+    // an absent one.
+    assert_eq!(
+        decode_line(r#"{"method":"thread/name/updated","params":{"threadId":"t-1"}}"#),
+        Some(Incoming::Notification(Notification::ThreadNameUpdated {
+            thread_id: "t-1".to_string(),
+            name: None
+        }))
+    );
+    // And the request-side key must NOT be accepted, or the bug comes back.
+    assert_eq!(
+        decode_line(
+            r#"{"method":"thread/name/updated","params":{"threadId":"t-1","name":"wrong"}}"#
+        ),
+        Some(Incoming::Notification(Notification::ThreadNameUpdated {
+            thread_id: "t-1".to_string(),
+            name: None
         }))
     );
 }

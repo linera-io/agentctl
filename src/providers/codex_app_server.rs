@@ -15,11 +15,13 @@ use std::io::{BufRead, Write};
 
 use serde::{Deserialize, Serialize};
 
-/// Protocol version this client was written against.
+/// The client name sent as `clientInfo.name` during `initialize`. The version
+/// alongside it is supplied per call, not fixed here.
 pub const CLIENT_NAME: &str = "agentctl";
 
 /// Requests we send. Names verified against the generated `ClientRequest`
-/// schema, which lists 139 methods; these are the ones a dashboard needs.
+/// schema, whose `oneOf` lists 141 methods; these are the ones a dashboard
+/// needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Initialize,
@@ -58,7 +60,10 @@ pub enum Notification {
     },
     ThreadNameUpdated {
         thread_id: String,
-        name: String,
+        /// `None` when the server cleared the name, which the schema models as
+        /// a nullable, non-required field. Collapsing that to an empty string
+        /// would make "cleared" and "not sent" the same value.
+        name: Option<String>,
     },
     TurnStarted {
         thread_id: String,
@@ -89,13 +94,16 @@ impl Notification {
             "thread/tokenUsage/updated" => Self::ThreadTokenUsageUpdated {
                 thread_id: thread_id(),
             },
+            // The wire field is `threadName`, NOT `name`. The *request* side
+            // (`ThreadSetNameParams`) does use `name`, which is the trap: the
+            // notification does not, and reading `name` here yields an empty
+            // string for every rename.
             "thread/name/updated" => Self::ThreadNameUpdated {
                 thread_id: thread_id(),
                 name: params
-                    .get("name")
+                    .get("threadName")
                     .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
+                    .map(str::to_string),
             },
             "turn/started" => Self::TurnStarted {
                 thread_id: thread_id(),
