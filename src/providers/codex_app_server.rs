@@ -168,7 +168,7 @@ pub enum Incoming {
 /// method. A live server's stream can contain a partially written final line,
 /// and killing the connection over it would drop every session it reports.
 pub fn decode_line(line: &str) -> Option<Incoming> {
-    let mut value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
 
     let method = value.get("method").and_then(|v| v.as_str());
 
