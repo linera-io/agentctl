@@ -52,12 +52,14 @@ impl AgentProviderAdapter for CodexProvider {
         args
     }
 
-    /// Codex exposes no rename.
+    /// Renaming needs the App Server, which agentctl does not yet drive.
     ///
-    /// `codex --help` on 0.148.0 offers `archive`, `unarchive`, `delete` and
-    /// `fork`, but nothing that renames a session. Writing a name into the
-    /// rollout ourselves would mean agentctl mutating a file the product owns,
-    /// which the ownership model forbids.
+    /// The CLI has no rename — `codex --help` offers `archive`, `unarchive`,
+    /// `delete` and `fork` — which is why this said "Codex cannot rename". The
+    /// generated protocol schema corrects that: `thread/name/set` is a real
+    /// request and `thread/name/updated` a real notification. So the capability
+    /// exists and the honest answer is "not over the transport we currently
+    /// use", which flips once the App Server client is wired in.
     fn supports_rename(&self) -> bool {
         false
     }
