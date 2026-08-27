@@ -649,6 +649,19 @@ fn run_main(cli: Cli) -> io::Result<()> {
         Err(e) => Some(format!("Auto-init warning: {e}")),
     };
 
+    // Discarded rules ride the same channel: `eprintln!` from the config parser
+    // is wiped by `EnterAlternateScreen` before anyone can read it, exactly as
+    // the comment above says of plain println.
+    let auto_init_summary = if cfg.rule_warnings.is_empty() {
+        auto_init_summary
+    } else {
+        let discarded = cfg.rule_warnings.join("; ");
+        Some(match auto_init_summary {
+            Some(existing) => format!("{discarded} — {existing}"),
+            None => discarded,
+        })
+    };
+
     let tick_rate = Duration::from_millis(cfg.interval);
     let theme_mode = theme::ThemeMode::detect(cli.theme.as_deref());
     let app_theme = theme::Theme::from_mode(theme_mode);

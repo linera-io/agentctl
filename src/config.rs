@@ -9,6 +9,10 @@ use crate::rules::{AutoRule, RuleAction};
 /// Priority: CLI flags > project config > global config > defaults.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Rules discarded while parsing, across every config layer. Surfaced in
+    /// the TUI's initial status line; other modes have already seen them on
+    /// stderr.
+    pub rule_warnings: Vec<String>,
     pub interval: u64,
     pub notify: bool,
     pub debug: bool,
@@ -177,6 +181,7 @@ impl Default for IdleConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            rule_warnings: Vec::new(),
             interval: 2000,
             notify: false,
             debug: false,
@@ -205,6 +210,11 @@ impl Default for Config {
 /// Raw TOML representation — all fields optional for partial overrides.
 #[derive(Debug, Default)]
 struct RawConfig {
+    /// Rules this file defined that the parser had to discard, already
+    /// formatted for display. Carried out rather than only printed, because in
+    /// the default TUI mode stdout/stderr are wiped by `EnterAlternateScreen`
+    /// before anyone can read them.
+    rule_warnings: Vec<String>,
     interval: Option<u64>,
     notify: Option<bool>,
     debug: Option<bool>,
@@ -354,6 +364,7 @@ impl Config {
         for override_ in raw.model_overrides {
             upsert_model_override(&mut self.model_overrides, override_);
         }
+        self.rule_warnings.extend(raw.rule_warnings);
         for rule in raw.rules {
             // Replace rule with same name, or append
             if let Some(pos) = self.rules.iter().position(|r| r.name == rule.name) {
@@ -695,9 +706,12 @@ fn global_config_path() -> Option<PathBuf> {
 /// leaves a normal run silent — and silence is what made the original bug
 /// dangerous. Discarding a rule is a config error the user has to see, not a
 /// trace to find later. stderr keeps `--json` and `--list` stdout clean.
-fn warn_bad_rule(message: &str) {
-    crate::logger::log("WARN", message);
+fn warn_bad_rule(collected: &mut Vec<String>, message: String) {
+    crate::logger::log("WARN", &message);
+    // Correct for every non-TUI mode; wiped by the alternate screen in the
+    // default one, which is why the message is also carried out in `collected`.
     eprintln!("agentctl: {message}");
+    collected.push(message);
 }
 
 /// Minimal TOML parser — avoids adding a toml crate dependency.
@@ -955,25 +969,31 @@ fn parse_config_file(path: &PathBuf) -> Option<RawConfig> {
     // something would auto-approve it instead — failing in the unsafe direction,
     // silently. Dropping it makes no automated decision at all, which is what a
     // config the tool could not understand should produce.
+    let mut warnings: Vec<String> = Vec::new();
     raw.rules
         .retain(|rule| match action_outcome.get(&rule.name) {
             Some(None) => true,
             Some(Some(bad)) => {
-                warn_bad_rule(&format!(
-                    "rule '{}': unrecognised action {bad:?} (expected approve, deny, send, \
-                 terminate or kill); the rule is discarded",
-                    rule.name
-                ));
+                warn_bad_rule(
+                    &mut warnings,
+                    format!(
+                        "rule '{}': unrecognised action {bad:?} (expected approve, deny, \
+                     send, terminate or kill); the rule is discarded",
+                        rule.name
+                    ),
+                );
                 false
             }
             None => {
-                warn_bad_rule(&format!(
-                    "rule '{}': no action set; the rule is discarded",
-                    rule.name
-                ));
+                warn_bad_rule(
+                    &mut warnings,
+                    format!("rule '{}': no action set; the rule is discarded", rule.name),
+                );
                 false
             }
         });
+
+    raw.rule_warnings = warnings;
 
     Some(raw)
 }
@@ -1532,5 +1552,42 @@ action = "terminate"
         let raw = parse("[rules.guard]\naction = \"block\"\n\n[rules.guard]\naction = \"deny\"\n");
         assert_eq!(raw.rules.len(), 1);
         assert_eq!(raw.rules[0].action, RuleAction::Deny);
+    }
+
+    /// A discarded rule must survive the parse as a message, not only a print.
+    ///
+    /// The default mode is the TUI, and it enters an alternate screen that
+    /// wipes anything already written to the terminal — the file itself says so
+    /// where auto-init's summary is captured. Printing alone therefore means
+    /// the user never learns their deny rule vanished, which is the whole
+    /// failure this change exists to prevent.
+    #[test]
+    fn a_discarded_rule_is_carried_out_of_the_parser_not_just_printed() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "[rules.bad_action]\naction = \"block\"\n\n[rules.no_action]\nmatch_tool = [\"Bash\"]\n"
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let raw = parse_config_file(&file.path().to_path_buf()).unwrap();
+
+        assert_eq!(raw.rule_warnings.len(), 2, "one message per discarded rule");
+        assert!(
+            raw.rule_warnings
+                .iter()
+                .any(|w| w.contains("bad_action") && w.contains("\"block\"")),
+            "the offending value must be named: {:?}",
+            raw.rule_warnings
+        );
+        assert!(
+            raw.rule_warnings
+                .iter()
+                .any(|w| w.contains("no_action") && w.contains("no action set")),
+            "a missing action reads differently from an unparseable one: {:?}",
+            raw.rule_warnings
+        );
     }
 }
