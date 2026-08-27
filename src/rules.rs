@@ -55,6 +55,11 @@ pub struct AutoRule {
     pub match_tool: Vec<String>,
     pub match_command: Vec<String>,
     pub match_project: Vec<String>,
+    /// Product names this rule applies to, matched against
+    /// [`crate::provider::AgentProvider::label`] case-insensitively. Empty means
+    /// every product, so every rule written before this field keeps matching
+    /// exactly as it did.
+    pub match_provider: Vec<String>,
     pub match_cost_above: Option<f64>,
     pub match_last_error: Option<bool>,
     pub match_file_conflict: Option<bool>,
@@ -70,6 +75,7 @@ impl AutoRule {
             match_tool: Vec::new(),
             match_command: Vec::new(),
             match_project: Vec::new(),
+            match_provider: Vec::new(),
             match_cost_above: None,
             match_last_error: None,
             match_file_conflict: None,
@@ -120,6 +126,17 @@ pub fn evaluate(rules: &[AutoRule], session: &AgentSession) -> Option<RuleMatch>
 /// Check if all of a rule's conditions match the session.
 /// Omitted conditions (empty vec / None) are treated as wildcards.
 fn matches_rule(rule: &AutoRule, session: &AgentSession) -> bool {
+    if !rule.match_provider.is_empty() {
+        let provider = session.provider.label().to_lowercase();
+        let any_match = rule
+            .match_provider
+            .iter()
+            .any(|p| provider == p.trim().to_lowercase());
+        if !any_match {
+            return false;
+        }
+    }
+
     if !rule.match_status.is_empty() {
         let status_str = session.status.to_string().to_lowercase();
         let any_match = rule
@@ -484,5 +501,37 @@ mod tests {
         let mut rule = approve_rule("bash");
         rule.match_tool = vec!["Bash".into()];
         assert!(evaluate(&[rule], &s).is_none());
+    }
+
+    /// `match_provider` narrows a rule to one product.
+    ///
+    /// The empty case matters most: every rule written before agentctl had a
+    /// second product omits this field, and must keep matching exactly as it
+    /// did. A predicate that defaulted to "Claude only" would silently stop
+    /// applying to half the fleet.
+    #[test]
+    fn match_provider_narrows_by_product_and_defaults_to_any() {
+        let mut claude = make_session();
+        claude.provider = crate::provider::AgentProvider::Claude;
+        let mut codex = make_session();
+        codex.provider = crate::provider::AgentProvider::Codex;
+
+        let mut rule = AutoRule::new("r".into(), RuleAction::Approve);
+        assert!(
+            matches_rule(&rule, &claude) && matches_rule(&rule, &codex),
+            "omitted match_provider must match every product"
+        );
+
+        rule.match_provider = vec!["Codex".into()];
+        assert!(!matches_rule(&rule, &claude), "must not match Claude");
+        assert!(matches_rule(&rule, &codex), "must match Codex");
+
+        // Case and surrounding whitespace come from hand-written TOML.
+        rule.match_provider = vec!["  codex  ".into()];
+        assert!(matches_rule(&rule, &codex), "case- and space-insensitive");
+
+        // A name for no product we know matches nothing, rather than everything.
+        rule.match_provider = vec!["gemini".into()];
+        assert!(!matches_rule(&rule, &claude) && !matches_rule(&rule, &codex));
     }
 }

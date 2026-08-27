@@ -619,8 +619,10 @@ impl Config {
 # context_max = 200000
 
 # ── Auto-Rules ──────────────────────────────────────────────────────
-# Match sessions by status/tool/command/project/cost, then take action.
+# Match sessions by status/tool/command/project/cost/provider, then act.
 # Deny rules always take precedence regardless of order.
+# Omitting a matcher means "any" — match_provider omitted matches every
+# product, so rules written before agentctl grew a second one still apply.
 #
 # [rules.approve_reads]
 # match_status = ["Needs Input"]
@@ -640,6 +642,10 @@ impl Config {
 # match_status = ["Waiting"]
 # action = "send"
 # message = "continue"
+#
+# [rules.codex_only]
+# match_provider = ["Codex"]
+# action = "deny"
 
 # ── Event Hooks ─────────────────────────────────────────────────────
 # Run shell commands on session events.
@@ -821,6 +827,7 @@ fn parse_config_file(path: &PathBuf) -> Option<RawConfig> {
                     "match_tool" => rule.match_tool = parse_string_array(value),
                     "match_command" => rule.match_command = parse_string_array(value),
                     "match_project" => rule.match_project = parse_string_array(value),
+                    "match_provider" => rule.match_provider = parse_string_array(value),
                     "match_cost_above" => rule.match_cost_above = value.parse().ok(),
                     "match_last_error" => rule.match_last_error = parse_bool(value),
                     "match_file_conflict" => rule.match_file_conflict = parse_bool(value),
