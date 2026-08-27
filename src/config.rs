@@ -1488,36 +1488,37 @@ action = "deny"
         );
     }
 
+    /// README.md documents `[[rules]]` array-of-tables syntax the parser does
+    /// not support, so rules copied from it silently become NO rules.
+    ///
+    /// This pins the gap rather than hiding it. `[[rules]]` never reaches
+    /// `parse_rule_section`, so no rule object is created — meaning the
+    /// discard warnings added here cannot fire either, and the user gets
+    /// nothing at all. The parser and the generated config template both use
+    /// `[rules.<name>]`; the README is the odd one out and is fixed separately.
     #[test]
-    fn readme_array_of_tables_probe() {
+    fn readme_array_of_tables_syntax_yields_no_rules() {
         use std::io::Write;
         let mut file = tempfile::NamedTempFile::new().unwrap();
         write!(
             file,
-            r#"
-[[rules]]
-name = "approve-cargo"
-match_tool = ["Bash"]
-match_command = ["cargo"]
-action = "approve"
-
-[[rules]]
-name = "deny-rm-rf"
-match_command = ["rm -rf"]
-action = "deny"
-
-[[rules]]
-name = "kill-runaway"
-match_cost_above = 20.0
-action = "terminate"
-"#
+            "[[rules]]\nname = \"deny-rm-rf\"\nmatch_command = [\"rm -rf\"]\naction = \"deny\"\n"
         )
         .unwrap();
         file.flush().unwrap();
+
         let raw = parse_config_file(&file.path().to_path_buf()).unwrap();
-        let names: Vec<&str> = raw.rules.iter().map(|r| r.name.as_str()).collect();
-        eprintln!("PROBE rules parsed = {:?}", names);
-        eprintln!("PROBE count = {}", raw.rules.len());
+
+        assert!(
+            raw.rules.is_empty(),
+            "array-of-tables is not supported: {:?}",
+            raw.rules.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            raw.rule_warnings.is_empty(),
+            "and nothing warns, because no rule was ever created — the reason \
+             the README mismatch is worth fixing at the source"
+        );
     }
 
     /// A repeated `[rules.x]` header reuses the same rule, so its action is
