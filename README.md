@@ -175,24 +175,34 @@ claudectl --stats --since 24h            # Aggregated cost statistics
 ## Auto-Rules
 
 ```toml
-[[rules]]
-name = "approve-cargo"
+[rules.approve-cargo]
 match_tool = ["Bash"]
 match_command = ["cargo"]
 action = "approve"
 
-[[rules]]
-name = "deny-rm-rf"
+[rules.deny-rm-rf]
 match_command = ["rm -rf"]
 action = "deny"
 
-[[rules]]
-name = "kill-runaway"
+[rules.kill-runaway]
 match_cost_above = 20.0
 action = "terminate"
+
+[rules.codex-only]
+match_provider = ["Codex"]
+match_tool = ["Bash"]
+action = "deny"
 ```
 
-Rules support matching by tool, command, project, cost, and error state. Deny rules always take precedence.
+The table name is the rule name — `[rules.deny-rm-rf]`, not `[[rules]]` with a
+`name` key, which the config parser does not read.
+
+Rules match by tool, command, project, cost, provider, and error state. An
+omitted matcher means "any". Deny rules always take precedence.
+
+`action` must be one of `approve`, `deny`, `send`, `terminate` or `kill`; a rule
+with any other value is discarded with a warning rather than silently falling
+back to approving.
 
 <details>
 <summary>More features</summary>

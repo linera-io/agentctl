@@ -249,7 +249,9 @@ pub(crate) fn detect_missing_rules(
                     p.sample_count,
                 ),
                 suggestion: Some(format!(
-                    "add to .claudectl.toml: [[rules]] match_tool=\"{}\" match_command=\"{}\" action=\"approve\"",
+                    "add to {}: [rules.approve-{}]\nmatch_tool = [\"{}\"]\nmatch_command = [\"{}\"]\naction = \"approve\"",
+                    crate::product::project_config(std::path::Path::new(".")).display(),
+                    p.tool.to_lowercase(),
                     p.tool,
                     p.command_pattern.as_deref().unwrap_or("*"),
                 )),
@@ -281,7 +283,9 @@ pub(crate) fn detect_missing_rules(
                     p.sample_count,
                 ),
                 suggestion: Some(format!(
-                    "add to .claudectl.toml: [[rules]] match_tool=\"{}\" match_command=\"{}\" action=\"deny\"",
+                    "add to {}: [rules.deny-{}]\nmatch_tool = [\"{}\"]\nmatch_command = [\"{}\"]\naction = \"deny\"",
+                    crate::product::project_config(std::path::Path::new(".")).display(),
+                    p.tool.to_lowercase(),
                     p.tool,
                     p.command_pattern.as_deref().unwrap_or("*"),
                 )),
@@ -601,6 +605,52 @@ mod tests {
         assert_eq!(insights.len(), 2);
         assert!(insights.iter().any(|i| i.summary.contains("cargo test")));
         assert!(insights.iter().any(|i| i.summary.contains("rm -rf")));
+    }
+
+    /// A suggested rule must be in the syntax the config parser actually reads.
+    ///
+    /// These strings are copy-paste instructions. They previously told the user
+    /// to write `[[rules]] match_tool="Bash" action="deny"` — array-of-tables
+    /// the parser ignores entirely, and bare strings where it wants arrays — so
+    /// following the tool's own advice for a DENY rule produced no rule at all,
+    /// with nothing to warn about because no rule object was ever created.
+    #[test]
+    fn a_suggested_rule_uses_syntax_the_parser_accepts() {
+        let prefs = DistilledPreferences {
+            patterns: vec![PreferencePattern {
+                tool: "Bash".to_string(),
+                command_pattern: Some("rm -rf".to_string()),
+                preferred_action: "deny".to_string(),
+                sample_count: 6,
+                accept_rate: 0.0,
+                conditions: Vec::new(),
+                confidence: 1.0,
+            }],
+            tool_accuracy: Vec::new(),
+            total_decisions: 6,
+            overall_accuracy: 0.8,
+            temporal: Vec::new(),
+        };
+
+        let insights = detect_missing_rules(&[], &prefs);
+        let suggestion = insights[0].suggestion.clone().expect("a suggestion");
+
+        assert!(
+            !suggestion.contains("[[rules]]"),
+            "array-of-tables yields no rules: {suggestion}"
+        );
+        assert!(
+            suggestion.contains("[rules.deny-bash]"),
+            "the table name IS the rule name: {suggestion}"
+        );
+        assert!(
+            suggestion.contains("match_tool = [\"Bash\"]"),
+            "matchers are arrays, not bare strings: {suggestion}"
+        );
+        assert!(
+            !suggestion.contains(".claudectl.toml"),
+            "the config file was renamed: {suggestion}"
+        );
     }
 
     #[test]
