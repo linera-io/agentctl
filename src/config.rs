@@ -689,16 +689,33 @@ fn global_config_path() -> Option<PathBuf> {
         .map(|home| crate::product::config_dir(&PathBuf::from(home)).join("config.toml"))
 }
 
+/// Report a rule the parser had to discard, to stderr as well as the log.
+///
+/// The diagnostic log only exists when `--log` was passed, so logging alone
+/// leaves a normal run silent — and silence is what made the original bug
+/// dangerous. Discarding a rule is a config error the user has to see, not a
+/// trace to find later. stderr keeps `--json` and `--list` stdout clean.
+fn warn_bad_rule(message: &str) {
+    crate::logger::log("WARN", message);
+    eprintln!("agentctl: {message}");
+}
+
 /// Minimal TOML parser — avoids adding a toml crate dependency.
 /// Supports: key = value pairs, [sections], # comments, strings, numbers, booleans, arrays.
 fn parse_config_file(path: &PathBuf) -> Option<RawConfig> {
     let content = fs::read_to_string(path).ok()?;
     let mut raw = RawConfig::default();
     let mut section = String::new();
-    // Rules whose `action` parsed. A rule is created the moment its section
-    // header is read — before its action line arrives — so the placeholder in
-    // `ensure_rule` cannot itself say "not set yet".
-    let mut actioned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Per rule name, the outcome of its LAST `action` line: `None` if it parsed,
+    // `Some(value)` if it did not. Absent means no action line was ever seen.
+    //
+    // Last-write-wins, like every other key in this arm: a repeated `[rules.x]`
+    // header reuses the same rule via `ensure_rule`, so the final action is the
+    // one that counts. A rule is created when its section header is read,
+    // before any action line arrives, so `ensure_rule`'s placeholder cannot
+    // itself record "not set yet".
+    let mut action_outcome: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
 
     for line in content.lines() {
         let line = line.trim();
@@ -833,16 +850,14 @@ fn parse_config_file(path: &PathBuf) -> Option<RawConfig> {
                         match RuleAction::parse(&raw_action) {
                             Some(a) => {
                                 rule.action = a;
-                                actioned.insert(rule_name.clone());
+                                action_outcome.insert(rule_name.clone(), None);
                             }
-                            None => crate::logger::log(
-                                "WARN",
-                                &format!(
-                                    "rule '{rule_name}': unrecognised action {raw_action:?} \
-                                     (expected approve, deny, send, terminate or kill); \
-                                     the rule is discarded"
-                                ),
-                            ),
+                            // Recorded, not reported: whether the rule survives
+                            // is decided by the sweep below, and a later line
+                            // for the same rule can still supply a good action.
+                            None => {
+                                action_outcome.insert(rule_name.clone(), Some(raw_action));
+                            }
                         }
                     }
                     "message" => rule.message = Some(unquote(value)),
@@ -940,16 +955,25 @@ fn parse_config_file(path: &PathBuf) -> Option<RawConfig> {
     // something would auto-approve it instead — failing in the unsafe direction,
     // silently. Dropping it makes no automated decision at all, which is what a
     // config the tool could not understand should produce.
-    raw.rules.retain(|rule| {
-        if actioned.contains(&rule.name) {
-            return true;
-        }
-        crate::logger::log(
-            "WARN",
-            &format!("rule '{}': no valid action; discarded", rule.name),
-        );
-        false
-    });
+    raw.rules
+        .retain(|rule| match action_outcome.get(&rule.name) {
+            Some(None) => true,
+            Some(Some(bad)) => {
+                warn_bad_rule(&format!(
+                    "rule '{}': unrecognised action {bad:?} (expected approve, deny, send, \
+                 terminate or kill); the rule is discarded",
+                    rule.name
+                ));
+                false
+            }
+            None => {
+                warn_bad_rule(&format!(
+                    "rule '{}': no action set; the rule is discarded",
+                    rule.name
+                ));
+                false
+            }
+        });
 
     Some(raw)
 }
@@ -1442,5 +1466,71 @@ action = "deny"
             !raw.rules.iter().any(|r| r.action == RuleAction::Approve),
             "nothing may reach the config as an unintended Approve"
         );
+    }
+
+    #[test]
+    fn readme_array_of_tables_probe() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"
+[[rules]]
+name = "approve-cargo"
+match_tool = ["Bash"]
+match_command = ["cargo"]
+action = "approve"
+
+[[rules]]
+name = "deny-rm-rf"
+match_command = ["rm -rf"]
+action = "deny"
+
+[[rules]]
+name = "kill-runaway"
+match_cost_above = 20.0
+action = "terminate"
+"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let raw = parse_config_file(&file.path().to_path_buf()).unwrap();
+        let names: Vec<&str> = raw.rules.iter().map(|r| r.name.as_str()).collect();
+        eprintln!("PROBE rules parsed = {:?}", names);
+        eprintln!("PROBE count = {}", raw.rules.len());
+    }
+
+    /// A repeated `[rules.x]` header reuses the same rule, so its action is
+    /// last-write-wins like every other key — and the message must describe
+    /// what actually happened.
+    ///
+    /// The first cut recorded "an action parsed at some point" as one bit, so a
+    /// good-then-bad pair kept the rule while stderr claimed it was discarded,
+    /// and a bad-then-good pair printed the same false line about a rule that
+    /// survived. Only the sweep decides the outcome, so only the sweep reports.
+    #[test]
+    fn a_repeated_rule_header_takes_its_last_action() {
+        use std::io::Write;
+
+        let parse = |body: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            write!(file, "{body}").unwrap();
+            file.flush().unwrap();
+            parse_config_file(&file.path().to_path_buf()).unwrap()
+        };
+
+        // Good then bad: the last action is the one that counts, so it goes.
+        let raw =
+            parse("[rules.guard]\naction = \"approve\"\n\n[rules.guard]\naction = \"block\"\n");
+        assert!(
+            raw.rules.is_empty(),
+            "a trailing unparseable action discards the rule: {:?}",
+            raw.rules.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+
+        // Bad then good: the good one wins, and it is NOT the Approve placeholder.
+        let raw = parse("[rules.guard]\naction = \"block\"\n\n[rules.guard]\naction = \"deny\"\n");
+        assert_eq!(raw.rules.len(), 1);
+        assert_eq!(raw.rules[0].action, RuleAction::Deny);
     }
 }
