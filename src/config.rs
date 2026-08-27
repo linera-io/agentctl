@@ -9,6 +9,10 @@ use crate::rules::{AutoRule, RuleAction};
 /// Priority: CLI flags > project config > global config > defaults.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Rules discarded while parsing, across every config layer. Surfaced in
+    /// the TUI's initial status line; other modes have already seen them on
+    /// stderr.
+    pub rule_warnings: Vec<String>,
     pub interval: u64,
     pub notify: bool,
     pub debug: bool,
@@ -177,6 +181,7 @@ impl Default for IdleConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            rule_warnings: Vec::new(),
             interval: 2000,
             notify: false,
             debug: false,
@@ -205,6 +210,11 @@ impl Default for Config {
 /// Raw TOML representation — all fields optional for partial overrides.
 #[derive(Debug, Default)]
 struct RawConfig {
+    /// Rules this file defined that the parser had to discard, already
+    /// formatted for display. Carried out rather than only printed, because in
+    /// the default TUI mode stdout/stderr are wiped by `EnterAlternateScreen`
+    /// before anyone can read them.
+    rule_warnings: Vec<String>,
     interval: Option<u64>,
     notify: Option<bool>,
     debug: Option<bool>,
@@ -354,6 +364,7 @@ impl Config {
         for override_ in raw.model_overrides {
             upsert_model_override(&mut self.model_overrides, override_);
         }
+        self.rule_warnings.extend(raw.rule_warnings);
         for rule in raw.rules {
             // Replace rule with same name, or append
             if let Some(pos) = self.rules.iter().position(|r| r.name == rule.name) {
@@ -695,12 +706,36 @@ fn global_config_path() -> Option<PathBuf> {
         .map(|home| crate::product::config_dir(&PathBuf::from(home)).join("config.toml"))
 }
 
+/// Report a rule the parser had to discard, to stderr as well as the log.
+///
+/// The diagnostic log only exists when `--log` was passed, so logging alone
+/// leaves a normal run silent — and silence is what made the original bug
+/// dangerous. Discarding a rule is a config error the user has to see, not a
+/// trace to find later. stderr keeps `--json` and `--list` stdout clean.
+fn warn_bad_rule(collected: &mut Vec<String>, message: String) {
+    crate::logger::log("WARN", &message);
+    // Correct for every non-TUI mode; wiped by the alternate screen in the
+    // default one, which is why the message is also carried out in `collected`.
+    eprintln!("agentctl: {message}");
+    collected.push(message);
+}
+
 /// Minimal TOML parser — avoids adding a toml crate dependency.
 /// Supports: key = value pairs, [sections], # comments, strings, numbers, booleans, arrays.
 fn parse_config_file(path: &PathBuf) -> Option<RawConfig> {
     let content = fs::read_to_string(path).ok()?;
     let mut raw = RawConfig::default();
     let mut section = String::new();
+    // Per rule name, the outcome of its LAST `action` line: `None` if it parsed,
+    // `Some(value)` if it did not. Absent means no action line was ever seen.
+    //
+    // Last-write-wins, like every other key in this arm: a repeated `[rules.x]`
+    // header reuses the same rule via `ensure_rule`, so the final action is the
+    // one that counts. A rule is created when its section header is read,
+    // before any action line arrives, so `ensure_rule`'s placeholder cannot
+    // itself record "not set yet".
+    let mut action_outcome: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
 
     for line in content.lines() {
         let line = line.trim();
@@ -832,8 +867,18 @@ fn parse_config_file(path: &PathBuf) -> Option<RawConfig> {
                     "match_last_error" => rule.match_last_error = parse_bool(value),
                     "match_file_conflict" => rule.match_file_conflict = parse_bool(value),
                     "action" => {
-                        if let Some(a) = RuleAction::parse(&unquote(value)) {
-                            rule.action = a;
+                        let raw_action = unquote(value);
+                        match RuleAction::parse(&raw_action) {
+                            Some(a) => {
+                                rule.action = a;
+                                action_outcome.insert(rule_name.clone(), None);
+                            }
+                            // Recorded, not reported: whether the rule survives
+                            // is decided by the sweep below, and a later line
+                            // for the same rule can still supply a good action.
+                            None => {
+                                action_outcome.insert(rule_name.clone(), Some(raw_action));
+                            }
                         }
                     }
                     "message" => rule.message = Some(unquote(value)),
@@ -925,6 +970,37 @@ fn parse_config_file(path: &PathBuf) -> Option<RawConfig> {
             _ => {} // Ignore unknown keys
         }
     }
+
+    // A rule whose action never parsed is not a rule. Keeping it would leave
+    // `ensure_rule`'s `Approve` placeholder in place, so a rule written to block
+    // something would auto-approve it instead — failing in the unsafe direction,
+    // silently. Dropping it makes no automated decision at all, which is what a
+    // config the tool could not understand should produce.
+    let mut warnings: Vec<String> = Vec::new();
+    raw.rules
+        .retain(|rule| match action_outcome.get(&rule.name) {
+            Some(None) => true,
+            Some(Some(bad)) => {
+                warn_bad_rule(
+                    &mut warnings,
+                    format!(
+                        "rule '{}': unrecognised action {bad:?} (expected approve, deny, \
+                     send, terminate or kill); the rule is discarded",
+                        rule.name
+                    ),
+                );
+                false
+            }
+            None => {
+                warn_bad_rule(
+                    &mut warnings,
+                    format!("rule '{}': no action set; the rule is discarded", rule.name),
+                );
+                false
+            }
+        });
+
+    raw.rule_warnings = warnings;
 
     Some(raw)
 }
@@ -1372,5 +1448,154 @@ auto_deny_file_conflicts = true
         let config = Config::default();
         assert!(config.file_conflicts); // on by default
         assert!(!config.auto_deny_file_conflicts); // off by default
+    }
+
+    /// A rule whose action the parser cannot read must not become an APPROVE.
+    ///
+    /// `ensure_rule` creates every rule with `RuleAction::Approve` as a
+    /// placeholder, because the section header is read before the action line.
+    /// The action arm used to skip silently on an unrecognised value, so
+    /// `action = "block"` — a plausible typo, and the synonym people reach for —
+    /// left the rule sitting at Approve. A rule written to block `rm -rf` would
+    /// have auto-approved it, with nothing logged and nothing to notice.
+    #[test]
+    fn a_rule_whose_action_does_not_parse_is_discarded_not_approved() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"
+[rules.block_destructive]
+match_tool = ["Bash"]
+match_command = ["rm -rf"]
+action = "block"
+
+[rules.no_action_key]
+match_tool = ["Bash"]
+
+[rules.real_deny]
+match_tool = ["Bash"]
+action = "deny"
+"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let raw = parse_config_file(&file.path().to_path_buf()).unwrap();
+        let names: Vec<&str> = raw.rules.iter().map(|r| r.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            ["real_deny"],
+            "only the rule with a valid action survives"
+        );
+        assert!(
+            !raw.rules.iter().any(|r| r.action == RuleAction::Approve),
+            "nothing may reach the config as an unintended Approve"
+        );
+    }
+
+    /// README.md documents `[[rules]]` array-of-tables syntax the parser does
+    /// not support, so rules copied from it silently become NO rules.
+    ///
+    /// This pins the gap rather than hiding it. `[[rules]]` never reaches
+    /// `parse_rule_section`, so no rule object is created — meaning the
+    /// discard warnings added here cannot fire either, and the user gets
+    /// nothing at all. The parser and the generated config template both use
+    /// `[rules.<name>]`; the README is the odd one out and is fixed separately.
+    #[test]
+    fn readme_array_of_tables_syntax_yields_no_rules() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "[[rules]]\nname = \"deny-rm-rf\"\nmatch_command = [\"rm -rf\"]\naction = \"deny\"\n"
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let raw = parse_config_file(&file.path().to_path_buf()).unwrap();
+
+        assert!(
+            raw.rules.is_empty(),
+            "array-of-tables is not supported: {:?}",
+            raw.rules.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            raw.rule_warnings.is_empty(),
+            "and nothing warns, because no rule was ever created — the reason \
+             the README mismatch is worth fixing at the source"
+        );
+    }
+
+    /// A repeated `[rules.x]` header reuses the same rule, so its action is
+    /// last-write-wins like every other key — and the message must describe
+    /// what actually happened.
+    ///
+    /// The first cut recorded "an action parsed at some point" as one bit, so a
+    /// good-then-bad pair kept the rule while stderr claimed it was discarded,
+    /// and a bad-then-good pair printed the same false line about a rule that
+    /// survived. Only the sweep decides the outcome, so only the sweep reports.
+    #[test]
+    fn a_repeated_rule_header_takes_its_last_action() {
+        use std::io::Write;
+
+        let parse = |body: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            write!(file, "{body}").unwrap();
+            file.flush().unwrap();
+            parse_config_file(&file.path().to_path_buf()).unwrap()
+        };
+
+        // Good then bad: the last action is the one that counts, so it goes.
+        let raw =
+            parse("[rules.guard]\naction = \"approve\"\n\n[rules.guard]\naction = \"block\"\n");
+        assert!(
+            raw.rules.is_empty(),
+            "a trailing unparseable action discards the rule: {:?}",
+            raw.rules.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+
+        // Bad then good: the good one wins, and it is NOT the Approve placeholder.
+        let raw = parse("[rules.guard]\naction = \"block\"\n\n[rules.guard]\naction = \"deny\"\n");
+        assert_eq!(raw.rules.len(), 1);
+        assert_eq!(raw.rules[0].action, RuleAction::Deny);
+    }
+
+    /// A discarded rule must survive the parse as a message, not only a print.
+    ///
+    /// The default mode is the TUI, and it enters an alternate screen that
+    /// wipes anything already written to the terminal — the file itself says so
+    /// where auto-init's summary is captured. Printing alone therefore means
+    /// the user never learns their deny rule vanished, which is the whole
+    /// failure this change exists to prevent.
+    #[test]
+    fn a_discarded_rule_is_carried_out_of_the_parser_not_just_printed() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "[rules.bad_action]\naction = \"block\"\n\n[rules.no_action]\nmatch_tool = [\"Bash\"]\n"
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let raw = parse_config_file(&file.path().to_path_buf()).unwrap();
+
+        assert_eq!(raw.rule_warnings.len(), 2, "one message per discarded rule");
+        assert!(
+            raw.rule_warnings
+                .iter()
+                .any(|w| w.contains("bad_action") && w.contains("\"block\"")),
+            "the offending value must be named: {:?}",
+            raw.rule_warnings
+        );
+        assert!(
+            raw.rule_warnings
+                .iter()
+                .any(|w| w.contains("no_action") && w.contains("no action set")),
+            "a missing action reads differently from an unparseable one: {:?}",
+            raw.rule_warnings
+        );
     }
 }
