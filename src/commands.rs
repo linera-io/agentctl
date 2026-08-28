@@ -916,7 +916,7 @@ pub(crate) fn run_clean(
 
     // Collect active PIDs to avoid deleting live sessions
     let active_pids: std::collections::HashSet<u32> = {
-        let app = App::new();
+        let app = App::with_host_state();
         app.data_snapshot().sessions.iter().map(|s| s.pid).collect()
     };
 
@@ -1001,7 +1001,7 @@ pub(crate) fn run_clean(
                 // If --finished only, skip JSONL files whose corresponding session is still active
                 if finished_only {
                     // Check if any active session is using this JSONL
-                    let app = App::new();
+                    let app = App::with_host_state();
                     let is_active = app.data_snapshot().sessions.iter().any(|s| {
                         s.jsonl_path
                             .as_ref()
@@ -1055,7 +1055,7 @@ pub(crate) fn run_clean(
 
 pub(crate) fn print_summary(since: &str) -> io::Result<()> {
     let since_duration = parse_duration_str(since);
-    let app = App::new();
+    let app = App::with_host_state();
     let snap = app.data_snapshot();
 
     if snap.sessions.is_empty() {
@@ -1193,7 +1193,7 @@ fn make_app(demo: bool, filters: &ViewFilters) -> App {
         });
         app
     } else {
-        App::new()
+        App::with_host_state()
     };
     apply_filters(&mut app, filters);
     app
@@ -1273,7 +1273,7 @@ pub(crate) fn run_watch(
     use crate::session::SessionStatus;
     use std::collections::HashMap;
 
-    let mut app = App::new();
+    let mut app = App::with_host_state();
     apply_filters(&mut app, filters);
     let mut prev_statuses: HashMap<u32, SessionStatus> = app
         .data_snapshot()

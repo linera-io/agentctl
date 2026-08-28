@@ -20,6 +20,7 @@ use crate::theme::Theme;
 /// needs to hand back to the main thread for status / conflict / budget
 /// post-processing. All fields are owned values so the struct is `Send`
 /// and can be returned across `tokio::task::spawn_blocking`.
+#[derive(Default)]
 pub struct RefreshIoOutput {
     pub sessions: Vec<AgentSession>,
     pub new_pids: Vec<u32>,
@@ -900,6 +901,10 @@ pub struct App {
     /// duplicates each tick — the next tick reuses the existing
     /// worker's eventual result. Cleared once the result is recv'd.
     pub refresh_in_flight: bool,
+    /// The I/O-heavy pass a refresh runs. Always [`do_refresh_io`] in
+    /// production; a seam so tests can exercise the scheduling and channel
+    /// plumbing without scanning the host's real `~/.claude`.
+    pub(crate) refresh_worker: fn(Vec<AgentSession>) -> RefreshIoOutput,
     pub table_state: TableState,
     pub should_quit: bool,
     pub status_msg: String,
@@ -1061,13 +1066,16 @@ impl App {
         self.replace_data(new_data);
     }
 
+    /// Construct without touching the host: no session scan, no ledger read,
+    /// no background thread. Use [`App::with_host_state`] for a real run.
     pub fn new() -> Self {
         let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = Self {
+        Self {
             data: Arc::new(RwLock::new(Arc::new(AppData::default()))),
             refresh_tx,
             refresh_rx,
             refresh_in_flight: false,
+            refresh_worker: do_refresh_io,
             table_state: TableState::default(),
             should_quit: false,
             status_msg: String::new(),
@@ -1133,7 +1141,13 @@ impl App {
             idle_mode_active: false,
             idle_tasks_launched: Vec::new(),
             idle_report: Vec::new(),
-        };
+        }
+    }
+
+    /// Construct and populate from the host: the session scan, ledger
+    /// rollups, and background usage scan a real run needs.
+    pub fn with_host_state() -> Self {
+        let mut app = Self::new();
         app.refresh();
         // Seed rollups from any rows already in the CSV — instant via
         // the in-memory ledger cache. Don't block startup on
@@ -1169,7 +1183,7 @@ impl App {
         // `do_refresh_io` on a worker and routes the result through a
         // channel, then calls `apply_refresh_output` on the main thread.
         let prev_sessions = self.data_snapshot().sessions.clone();
-        let out = do_refresh_io(prev_sessions);
+        let out = (self.refresh_worker)(prev_sessions);
         self.apply_refresh_output(out, tick_start);
     }
 
@@ -1211,17 +1225,18 @@ impl App {
         // in a runtime context (tests, one-shot CLI), fall back to a
         // synchronous refresh on the calling thread.
         let prev_sessions = self.data_snapshot().sessions.clone();
+        let worker = self.refresh_worker;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let tx = self.refresh_tx.clone();
             handle.spawn_blocking(move || {
-                let out = do_refresh_io(prev_sessions);
+                let out = worker(prev_sessions);
                 let _ = tx.send(out);
             });
             self.refresh_in_flight = true;
         } else if !applied_any {
             // No runtime AND we didn't already apply a result this tick:
             // run synchronously so the caller still gets fresh data.
-            let out = do_refresh_io(prev_sessions);
+            let out = worker(prev_sessions);
             self.apply_refresh_output(out, std::time::Instant::now());
             applied_any = true;
         }
@@ -4253,45 +4268,39 @@ mod tests {
 
     #[test]
     fn refresh_nonblocking_falls_back_to_sync_when_no_runtime() {
-        // No tokio runtime is active in unit tests by default — the
-        // function must therefore run `do_refresh_io` synchronously
-        // and return `true` (work was applied) with refresh_in_flight
-        // cleared, rather than dispatching to a worker that never runs.
+        // With no runtime the work must run on the calling thread and be
+        // applied before the call returns, not dispatched to a worker that
+        // never runs.
         let mut app = app_with_empty_data();
+        app.refresh_worker = |_| RefreshIoOutput::default();
         assert!(app.refresh_nonblocking());
         assert!(!app.refresh_in_flight);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refresh_nonblocking_kicks_worker_under_runtime() {
-        // With a multi-threaded tokio runtime the first call kicks
-        // a `do_refresh_io` worker onto the blocking pool. Subsequent
-        // calls return false until the worker sends its result back
-        // through the channel; once the result is applied,
-        // refresh_nonblocking returns true. We poll on the return
-        // value rather than `refresh_in_flight` because each call
-        // also schedules the NEXT worker, so the flag is true on
+        // We poll the return value rather than `refresh_in_flight` because
+        // each call also schedules the NEXT worker, so the flag is true on
         // exit even after a successful drain.
-        //
-        // Note: `do_refresh_io` reads the real host filesystem
-        // (~/.claude/sessions, ~/.claude/projects). On a heavy box
-        // the cold pass can take seconds; the 60 s deadline is
-        // generous to keep this test reliable on slow CI/sandboxes.
         let mut app = app_with_empty_data();
+        app.refresh_worker = |_| RefreshIoOutput::default();
+
         let kicked = app.refresh_nonblocking();
         assert!(!kicked, "first call only schedules; nothing applied yet");
         assert!(app.refresh_in_flight, "worker must be scheduled");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        // A hang guard, not a performance bound: the worker is in-memory.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             tokio::task::yield_now().await;
             if app.refresh_nonblocking() {
                 break;
             }
-            if std::time::Instant::now() >= deadline {
-                panic!("refresh worker did not complete within 60 s");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker result never arrived through the channel"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     }
 

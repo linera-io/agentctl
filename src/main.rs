@@ -766,7 +766,7 @@ fn run_tui<W: io::Write>(
     max_duration: Option<Duration>,
     auto_init_summary: Option<String>,
 ) -> io::Result<()> {
-    let mut app = App::new();
+    let mut app = App::with_host_state();
     app.notify = cfg.notify;
     app.debug = cfg.debug;
     app.webhook_url = cfg.webhook.clone();
@@ -820,7 +820,7 @@ fn run_tui<W: io::Write>(
                 config::BrainConfig::default(),
             ));
         }
-        // Re-refresh to replace real sessions discovered during App::new()
+        // Replace the real sessions the host scan found with demo ones.
         app.refresh();
     }
 
