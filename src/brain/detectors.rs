@@ -279,13 +279,25 @@ fn rule_suggestion(action: &str, pattern: &PreferencePattern) -> String {
         );
     }
 
-    if let Some(command) = command
-        && command.contains(UNQUOTABLE)
-    {
+    // `distill_preferences` uses "*" when a decision carries no tool, but
+    // `match_tool` is an exact-equality test: nothing is named "*", so the rule
+    // could never fire, and omitting the matcher would match every tool.
+    if pattern.tool == "*" {
         return format!(
-            "add a rule for [{}] matching {command:?} by hand — it contains a \
-             character the config reader cannot round-trip",
-            pattern.tool
+            "seen across tools rather than one — an auto-rule has to name a \
+             single tool, so add this{} by hand",
+            command.map(|c| format!(" for {c:?}")).unwrap_or_default()
+        );
+    }
+
+    if pattern.tool.contains(UNQUOTABLE) || command.is_some_and(|c| c.contains(UNQUOTABLE)) {
+        return format!(
+            "add a rule for [{}]{} by hand — it contains a character the config \
+             reader cannot round-trip",
+            pattern.tool,
+            command
+                .map(|c| format!(" matching {c:?}"))
+                .unwrap_or_default()
         );
     }
 
@@ -974,5 +986,23 @@ mod tests {
             !suggestion.contains("[rules."),
             "a condition auto-rules cannot express must not become a rule: {suggestion}"
         );
+    }
+
+    /// `distill_preferences` writes `"*"` for a decision with no tool, and
+    /// `match_tool` is exact equality — `["*"]` matches nothing, so a pasted
+    /// deny would never fire.
+    #[test]
+    fn a_toolless_pattern_is_not_emitted_as_a_rule() {
+        for command in [None, Some("rm -rf")] {
+            let suggestion = one("*", command, Vec::new());
+            assert!(
+                !suggestion.contains("[rules."),
+                "a tool-less pattern must not become a rule: {suggestion}"
+            );
+            assert!(
+                !suggestion.contains("match_tool"),
+                "and must not print a matcher at all: {suggestion}"
+            );
+        }
     }
 }
