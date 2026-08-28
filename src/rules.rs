@@ -34,7 +34,6 @@ impl RuleAction {
         }
     }
 
-    #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
             Self::Approve => "approve",

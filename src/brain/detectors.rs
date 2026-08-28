@@ -340,61 +340,45 @@ pub(crate) fn detect_missing_rules(
             continue;
         }
 
-        // High-confidence approve patterns
-        if p.accept_rate >= 0.9 {
-            let cmd_part = p
-                .command_pattern
-                .as_ref()
-                .map(|c| format!(" \"{c}\""))
-                .unwrap_or_default();
-
-            insights.push(Insight {
-                fingerprint: format!(
-                    "missing_rule:approve:{}:{}",
-                    p.tool,
-                    p.command_pattern.as_deref().unwrap_or("*")
-                ),
-                generated_at: now,
-                category: InsightCategory::MissingRule,
-                severity: InsightSeverity::Suggestion,
-                summary: format!(
-                    "approve [{}]{cmd_part} (accepted {:.0}%, n={})",
-                    p.tool,
-                    p.accept_rate * 100.0,
-                    p.sample_count,
-                ),
-                suggestion: Some(rule_suggestion("approve", p)),
-                evidence_count: p.sample_count,
-            });
+        // `accept_rate` measures agreement with the BRAIN, not a wish for the
+        // call to proceed — both extremes are decisive, and `preferred_action`
+        // is what they already resolved to.
+        let consistency = p.accept_rate.max(1.0 - p.accept_rate);
+        if consistency < 0.9 {
+            continue;
         }
 
-        // High-confidence deny patterns
-        if p.accept_rate <= 0.1 {
-            let cmd_part = p
-                .command_pattern
-                .as_ref()
-                .map(|c| format!(" \"{c}\""))
-                .unwrap_or_default();
+        // `preferred_action` is the brain's own verb, so it can be
+        // route/spawn/delegate — actions the rule language cannot express.
+        let Some(action) = crate::rules::RuleAction::parse(&p.preferred_action) else {
+            continue;
+        };
+        let action = action.label();
 
-            insights.push(Insight {
-                fingerprint: format!(
-                    "missing_rule:deny:{}:{}",
-                    p.tool,
-                    p.command_pattern.as_deref().unwrap_or("*")
-                ),
-                generated_at: now,
-                category: InsightCategory::MissingRule,
-                severity: InsightSeverity::Suggestion,
-                summary: format!(
-                    "deny [{}]{cmd_part} (rejected {:.0}%, n={})",
-                    p.tool,
-                    (1.0 - p.accept_rate) * 100.0,
-                    p.sample_count,
-                ),
-                suggestion: Some(rule_suggestion("deny", p)),
-                evidence_count: p.sample_count,
-            });
-        }
+        let cmd_part = p
+            .command_pattern
+            .as_ref()
+            .map(|c| format!(" \"{c}\""))
+            .unwrap_or_default();
+
+        insights.push(Insight {
+            fingerprint: format!(
+                "missing_rule:{action}:{}:{}",
+                p.tool,
+                p.command_pattern.as_deref().unwrap_or("*")
+            ),
+            generated_at: now,
+            category: InsightCategory::MissingRule,
+            severity: InsightSeverity::Suggestion,
+            summary: format!(
+                "{action} [{}]{cmd_part} (consistent in {:.0}% of {} decisions)",
+                p.tool,
+                consistency * 100.0,
+                p.sample_count,
+            ),
+            suggestion: Some(rule_suggestion(action, p)),
+            evidence_count: p.sample_count,
+        });
     }
 
     insights
@@ -712,12 +696,6 @@ mod tests {
     }
 
     /// A suggested rule must be in the syntax the config parser actually reads.
-    ///
-    /// These strings are copy-paste instructions. They previously told the user
-    /// to write `[[rules]] match_tool="Bash" action="deny"` — array-of-tables
-    /// the parser ignores entirely, and bare strings where it wants arrays — so
-    /// following the tool's own advice for a DENY rule produced no rule at all,
-    /// with nothing to warn about because no rule object was ever created.
     #[test]
     fn a_suggested_rule_uses_syntax_the_parser_accepts() {
         let prefs = DistilledPreferences {
@@ -1002,6 +980,57 @@ mod tests {
             assert!(
                 !suggestion.contains("match_tool"),
                 "and must not print a matcher at all: {suggestion}"
+            );
+        }
+    }
+
+    fn pattern(preferred_action: &str, accept_rate: f64) -> DistilledPreferences {
+        DistilledPreferences {
+            patterns: vec![PreferencePattern {
+                tool: "Bash".to_string(),
+                command_pattern: Some("rm -rf".to_string()),
+                preferred_action: preferred_action.to_string(),
+                sample_count: 6,
+                accept_rate,
+                conditions: Vec::new(),
+                confidence: 1.0,
+            }],
+            tool_accuracy: Vec::new(),
+            total_decisions: 6,
+            overall_accuracy: 0.8,
+            temporal: Vec::new(),
+        }
+    }
+
+    /// `accept_rate` is agreement with the BRAIN, not a wish to proceed, so a
+    /// unanimous accept_rate over a brain that kept denying means deny.
+    #[test]
+    fn the_suggested_action_follows_the_preference_not_the_accept_rate() {
+        let insights = detect_missing_rules(&[], &pattern("deny", 1.0));
+        assert_eq!(insights.len(), 1);
+        let suggestion = insights[0].suggestion.clone().expect("a suggestion");
+        assert!(
+            !suggestion.contains("action = \"approve\""),
+            "agreeing with 6 denials must not suggest auto-approving it: {suggestion}"
+        );
+
+        let parsed = crate::config::parse_config_file_for_test(&toml_of(&suggestion));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].action, crate::rules::RuleAction::Deny);
+        assert!(
+            insights[0].summary.starts_with("deny "),
+            "{}",
+            insights[0].summary
+        );
+    }
+
+    /// `preferred_action` carries the brain's verb, which may have no rule form.
+    #[test]
+    fn a_preference_the_rule_language_cannot_express_is_not_suggested() {
+        for action in ["route", "spawn", "delegate", ""] {
+            assert!(
+                detect_missing_rules(&[], &pattern(action, 1.0)).is_empty(),
+                "{action:?} has no rule syntax and must not be suggested"
             );
         }
     }
