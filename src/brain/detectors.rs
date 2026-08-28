@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use super::decisions::{DecisionRecord, DistilledPreferences};
 use super::insights::{Insight, InsightCategory, InsightSeverity, epoch_now};
+use super::preferences::PreferencePattern;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Detection algorithms
@@ -260,6 +261,49 @@ fn rule_slug(tool: &str, command: Option<&str>) -> String {
     slug
 }
 
+/// Characters the config reader cannot round-trip: `,` splits an array, `#`
+/// truncates the line, and quotes are stripped.
+const UNQUOTABLE: [char; 4] = [',', '#', '"', '\''];
+
+/// Paste-ready TOML for one detected pattern, or prose where no exact rule can
+/// be produced — the user pastes this verbatim, so a near-miss is worse than none.
+fn rule_suggestion(action: &str, pattern: &PreferencePattern) -> String {
+    let target = crate::product::project_config(std::path::Path::new("."));
+    let command = pattern.command_pattern.as_deref();
+
+    if !pattern.conditions.is_empty() {
+        return format!(
+            "observed only under specific conditions, which auto-rules cannot \
+             express — review before adding a rule for [{}]",
+            pattern.tool
+        );
+    }
+
+    if let Some(command) = command
+        && command.contains(UNQUOTABLE)
+    {
+        return format!(
+            "add a rule for [{}] matching {command:?} by hand — it contains a \
+             character the config reader cannot round-trip",
+            pattern.tool
+        );
+    }
+
+    // The engine's wildcard is an OMITTED matcher; `["*"]` is a live substring
+    // test for an asterisk, so it never fires and a deny would fail open.
+    let command_line = command
+        .map(|c| format!("\nmatch_command = [\"{c}\"]"))
+        .unwrap_or_default();
+
+    format!(
+        "add to {}:\n[rules.{}-{}]\nmatch_tool = [\"{}\"]{command_line}\naction = \"{action}\"",
+        target.display(),
+        action,
+        rule_slug(&pattern.tool, command),
+        pattern.tool,
+    )
+}
+
 /// FNV-1a, four hex chars. Deterministic across runs so a suggestion the user
 /// already pasted keeps the same name; not a security hash.
 fn short_digest(text: &str) -> String {
@@ -307,13 +351,7 @@ pub(crate) fn detect_missing_rules(
                     p.accept_rate * 100.0,
                     p.sample_count,
                 ),
-                suggestion: Some(format!(
-                    "add to {}:\n[rules.approve-{}]\nmatch_tool = [\"{}\"]\nmatch_command = [\"{}\"]\naction = \"approve\"",
-                    crate::product::project_config(std::path::Path::new(".")).display(),
-                    rule_slug(&p.tool, p.command_pattern.as_deref()),
-                    p.tool,
-                    p.command_pattern.as_deref().unwrap_or("*"),
-                )),
+                suggestion: Some(rule_suggestion("approve", p)),
                 evidence_count: p.sample_count,
             });
         }
@@ -341,13 +379,7 @@ pub(crate) fn detect_missing_rules(
                     (1.0 - p.accept_rate) * 100.0,
                     p.sample_count,
                 ),
-                suggestion: Some(format!(
-                    "add to {}:\n[rules.deny-{}]\nmatch_tool = [\"{}\"]\nmatch_command = [\"{}\"]\naction = \"deny\"",
-                    crate::product::project_config(std::path::Path::new(".")).display(),
-                    rule_slug(&p.tool, p.command_pattern.as_deref()),
-                    p.tool,
-                    p.command_pattern.as_deref().unwrap_or("*"),
-                )),
+                suggestion: Some(rule_suggestion("deny", p)),
                 evidence_count: p.sample_count,
             });
         }
@@ -516,6 +548,7 @@ mod tests {
         DecisionContext, DecisionType, DistilledPreferences, PreferencePattern, TemporalPattern,
         ToolAccuracy,
     };
+    use crate::brain::preferences::PreferenceCondition;
 
     fn make_decision(tool: &str, command: &str, user_action: &str, pid: u32) -> DecisionRecord {
         DecisionRecord {
@@ -862,5 +895,84 @@ mod tests {
         let insights = detect_temporal_friction(&prefs);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].category, InsightCategory::TemporalFriction);
+    }
+
+    fn one(tool: &str, command: Option<&str>, conditions: Vec<PreferenceCondition>) -> String {
+        rule_suggestion(
+            "deny",
+            &PreferencePattern {
+                tool: tool.to_string(),
+                command_pattern: command.map(str::to_string),
+                preferred_action: "deny".to_string(),
+                sample_count: 6,
+                accept_rate: 0.0,
+                conditions,
+                confidence: 1.0,
+            },
+        )
+    }
+
+    fn toml_of(suggestion: &str) -> String {
+        suggestion
+            .lines()
+            .skip_while(|l| !l.starts_with('['))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// No command pattern means an omitted matcher, never `["*"]`.
+    #[test]
+    fn a_tool_only_pattern_omits_the_command_matcher() {
+        let suggestion = one("Read", None, Vec::new());
+        assert!(
+            !suggestion.contains("match_command"),
+            "no command means no matcher: {suggestion}"
+        );
+
+        let parsed = crate::config::parse_config_file_for_test(&toml_of(&suggestion));
+        assert_eq!(parsed.len(), 1);
+        assert!(
+            parsed[0].match_command.is_empty(),
+            "an empty matcher is the wildcard; {:?} is not",
+            parsed[0].match_command
+        );
+        assert_eq!(parsed[0].match_tool, vec!["Read".to_string()]);
+    }
+
+    /// `["sort -k1,1"]` parses back as two patterns, the stray `1` matching
+    /// almost anything by substring — so such commands get prose, not TOML.
+    #[test]
+    fn a_command_the_parser_would_mangle_falls_back_to_prose() {
+        for command in ["sort -k1,1", "awk -F,", "open f.html#top", "say \"hi\""] {
+            let suggestion = one("Bash", Some(command), Vec::new());
+            assert!(
+                !suggestion.contains("[rules."),
+                "{command:?} must not be printed as a rule: {suggestion}"
+            );
+            assert!(
+                suggestion.contains("by hand"),
+                "{command:?} should tell the user to write it themselves: {suggestion}"
+            );
+        }
+
+        // A clean command still gets paste-ready TOML, and round-trips exactly.
+        let suggestion = one("Bash", Some("rm -rf"), Vec::new());
+        let parsed = crate::config::parse_config_file_for_test(&toml_of(&suggestion));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].match_command, vec!["rm -rf".to_string()]);
+    }
+
+    /// Dropping the condition would invert the learned behaviour on the deny half.
+    #[test]
+    fn a_conditional_preference_is_not_emitted_as_a_rule() {
+        let suggestion = one(
+            "Bash",
+            Some("cargo test"),
+            vec![PreferenceCondition::CostAbove(1.0)],
+        );
+        assert!(
+            !suggestion.contains("[rules."),
+            "a condition auto-rules cannot express must not become a rule: {suggestion}"
+        );
     }
 }
