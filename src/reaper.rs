@@ -109,11 +109,71 @@ fn detect_running_sandbox_name() -> Option<String> {
     parse_sbx_ls_for_single_running_sandbox(&output)
 }
 
+/// Wall-clock bounds for `sbx`. sbx has no timeouts of its own, and on
+/// 2026-08-27 a wedged control plane made every unbounded call block forever —
+/// `sbx ls` sat for 2h37m and took `sc` and this binary down with it.
+///
+/// The list probe is the cheap one (milliseconds when healthy); the `exec`
+/// probes pay sandbox-wrapper startup, so they get a longer leash.
+const SBX_LIST_TIMEOUT: Duration = Duration::from_secs(30);
+const SBX_EXEC_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// `io::ErrorKind::TimedOut` is how a bounded `sbx` call reports "never
+/// answered", which callers MUST NOT collapse into "answered no". A probe that
+/// times out looks identical for a sandbox full of live sessions and an empty
+/// one, and only one of those is safe to act on.
+fn timed_out(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::TimedOut
+}
+
+/// Run `cmd` and capture its output, killing it if it outlives `limit`.
+///
+/// `std::process::Command::output()` waits forever and std has no bounded
+/// variant, so the wait happens on a thread and the deadline is enforced by
+/// `recv_timeout` here. A poll loop was the obvious alternative and is worse:
+/// it rounds every fast call up to the poll interval, which on a refresh tick
+/// that makes several `sbx` calls is a measurable regression for a case that
+/// never times out.
+///
+/// On timeout the child is killed by pid, which unblocks the waiting thread —
+/// so the child is reaped by that thread's `wait_with_output`, never left a
+/// zombie. The error is `TimedOut` so callers can tell it from a refusal.
+fn output_bounded(mut cmd: Command, limit: Duration) -> io::Result<std::process::Output> {
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let child = cmd.spawn()?;
+    // Captured before the child moves into the thread; this is the only handle
+    // left for killing it once it is in there.
+    let pid = child.id();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+
+    match rx.recv_timeout(limit) {
+        Ok(result) => result,
+        Err(_) => {
+            // SAFETY: `pid` came from a child of this process. The worst case
+            // if it has already exited is ESRCH, or — after a wait — a signal
+            // to a recycled pid; the waiting thread has not returned, so it
+            // has not been reaped yet and the pid is still ours.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("sbx did not answer within {}s", limit.as_secs()),
+            ))
+        }
+    }
+}
+
 /// `sbx ls --json` stdout, or an error. One place so the flag can't drift
 /// between the single-sandbox resolver and the collector — they must agree on
 /// what "running" means, and they only do if they read the same output.
 fn sbx_list_json() -> io::Result<String> {
-    let output = Command::new("sbx").args(["ls", "--json"]).output()?;
+    let mut cmd = Command::new("sbx");
+    cmd.args(["ls", "--json"]);
+    let output = output_bounded(cmd, SBX_LIST_TIMEOUT)?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "sbx ls --json failed: {}",
@@ -333,7 +393,7 @@ fn probe_sandbox_procs(name: &str, pids: &[u32]) -> io::Result<SandboxObservatio
     let mut cmd = Command::new("sbx");
     cmd.args(["exec", name, "bash", "-c", PROC_PROBE_SCRIPT, "--"]);
     cmd.args(pids.iter().map(u32::to_string));
-    let output = cmd.output()?;
+    let output = output_bounded(cmd, SBX_EXEC_TIMEOUT)?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "sbx exec {name} proc-probe failed: {}",
@@ -583,7 +643,20 @@ fn collect_and_write_snapshot(out: &mut impl Write) -> io::Result<()> {
                 // Log which sandbox and why, not just that collection was
                 // partial — a snapshot silently missing an origin looks
                 // identical to a sandbox with no sessions.
-                writeln!(out, "reaper: collect from '{name}' failed: {e}")?;
+                // Name the WEDGE case specifically: a timeout is the one
+                // failure with a standing remedy, and it reads identically to
+                // a refusal unless the log says which fired.
+                if timed_out(&e) {
+                    writeln!(
+                        out,
+                        "reaper: collect from '{name}' TIMED OUT: {e} — sbx is not \
+                         answering; if `sbx ls` also hangs, restart it with \
+                         `sbx daemon stop && sbx daemon start` (this stops the VMs; \
+                         recover with `agentctl --restore-sbx-sessions`)"
+                    )?;
+                } else {
+                    writeln!(out, "reaper: collect from '{name}' failed: {e}")?;
+                }
                 // **Carry the last known session list forward. Do not write an
                 // empty one.** A failed probe means "we could not look", and
                 // an empty list means "we looked and this sandbox is empty" —
@@ -1067,9 +1140,9 @@ fn sbx_available() -> bool {
     // `sbx --help` exits 0 when the binary is in PATH and runnable. We use
     // it instead of `--version` (which sbx doesn't accept) because we just
     // want a "is this binary present and executable" probe.
-    Command::new("sbx")
-        .arg("--help")
-        .output()
+    let mut cmd = Command::new("sbx");
+    cmd.arg("--help");
+    output_bounded(cmd, SBX_LIST_TIMEOUT)
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -1350,9 +1423,9 @@ fn scan_sandbox_sidecars() -> io::Result<Vec<SandboxSidecar>> {
              running, and CLAUDECTL_SANDBOX_NAME is unset",
         ));
     };
-    let output = Command::new("sbx")
-        .args(["exec", &name, "bash", "-c", &script])
-        .output()?;
+    let mut cmd = Command::new("sbx");
+    cmd.args(["exec", &name, "bash", "-c", &script]);
+    let output = output_bounded(cmd, SBX_EXEC_TIMEOUT)?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "sbx exec sidecar-scan failed: {}",
@@ -1477,7 +1550,7 @@ fi
     let mut cmd = Command::new("sbx");
     cmd.args(["exec", &name, "bash", "-c", &script, "--"]);
     cmd.args(&all_args);
-    match cmd.output() {
+    match output_bounded(cmd, SBX_EXEC_TIMEOUT) {
         Ok(o) if !o.status.success() => {
             writeln!(
                 io::stderr(),
@@ -3244,6 +3317,53 @@ notapid 00:00:01  1024 claude
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(parse_sandbox_procs(&String::from_utf8_lossy(&out.stdout)).is_empty());
+    }
+
+    #[test]
+    fn a_command_that_overruns_its_bound_is_killed_and_reported_as_timed_out() {
+        // The 2026-08-27 shape: the child never returns. Before this bound,
+        // `.output()` waited on it forever and took the whole binary with it.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let started = Instant::now();
+        let err = output_bounded(cmd, Duration::from_millis(300))
+            .expect_err("a 30s sleep must not satisfy a 300ms bound");
+
+        assert!(timed_out(&err), "must be TimedOut, got {:?}", err.kind());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the bound must actually cut it short, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_command_that_finishes_returns_its_output_untouched() {
+        // The bound must not change the happy path: same stdout, same status.
+        let mut cmd = Command::new("bash");
+        cmd.args(["-c", "printf hello; exit 0"]);
+        let out = output_bounded(cmd, Duration::from_secs(30)).expect("a fast command succeeds");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+    }
+
+    #[test]
+    fn a_command_that_fails_is_not_reported_as_timed_out() {
+        // A refusal and a non-answer must stay distinguishable — collapsing
+        // them is what lets a caller act on "don't know" as if it were "no".
+        let mut cmd = Command::new("bash");
+        cmd.args(["-c", "printf boom >&2; exit 3"]);
+        let out = output_bounded(cmd, Duration::from_secs(30))
+            .expect("a failing command still returns output");
+        assert!(!out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "boom");
+    }
+
+    #[test]
+    fn a_spawn_failure_is_not_reported_as_timed_out() {
+        let cmd = Command::new("agentctl-no-such-binary-8b21f0");
+        let err = output_bounded(cmd, Duration::from_secs(30)).expect_err("missing binary fails");
+        assert!(!timed_out(&err), "a spawn failure is not a timeout");
     }
 
     #[test]
