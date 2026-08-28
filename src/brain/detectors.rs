@@ -219,24 +219,56 @@ pub(crate) fn detect_context_blowouts(decisions: &[DecisionRecord]) -> Vec<Insig
 /// leaves ONE rule matching only the last, because `ensure_rule` reuses a rule
 /// by name and every matcher is last-write-wins — so two of the three denials
 /// the user believes they added silently do not exist.
+/// Slugifying alone is not enough: it is lossy, so it collides. `rm -rf` and
+/// `rm/rf` both reduce to `bash-rm-rf`, and any all-punctuation command —
+/// realistic, since `command_pattern` is only the first two tokens — reduces to
+/// bare `bash`. A short digest of the untouched command restores uniqueness
+/// while the readable part keeps the name meaningful.
 fn rule_slug(tool: &str, command: Option<&str>) -> String {
-    let mut raw = tool.to_lowercase();
-    if let Some(command) = command {
-        raw.push('-');
-        raw.push_str(&command.to_lowercase());
-    }
-    let mut slug = String::with_capacity(raw.len());
-    let mut pending_dash = false;
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-            pending_dash = false;
-        } else if !pending_dash {
-            slug.push('-');
-            pending_dash = true;
+    let readable = |text: &str| {
+        let mut out = String::with_capacity(text.len());
+        let mut pending_dash = false;
+        for ch in text.to_lowercase().chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch);
+                pending_dash = false;
+            } else if !pending_dash {
+                out.push('-');
+                pending_dash = true;
+            }
         }
+        out.trim_matches('-').to_string()
+    };
+
+    let mut slug = readable(tool);
+    if slug.is_empty() {
+        slug.push_str("rule");
     }
-    slug.trim_matches('-').to_string()
+    let Some(command) = command else {
+        return slug;
+    };
+
+    let stem = readable(command);
+    if !stem.is_empty() {
+        slug.push('-');
+        // Cap the readable part: `command_pattern` is two tokens, but nothing
+        // bounds their length, and a table name is read by a human.
+        slug.push_str(stem.get(..32).unwrap_or(&stem).trim_matches('-'));
+    }
+    slug.push('-');
+    slug.push_str(&short_digest(command));
+    slug
+}
+
+/// FNV-1a, four hex chars. Deterministic across runs so a suggestion the user
+/// already pasted keeps the same name; not a security hash.
+fn short_digest(text: &str) -> String {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in text.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("{:04x}", hash & 0xffff)
 }
 
 /// Detect high-confidence patterns that could become AutoRules.
@@ -686,7 +718,11 @@ mod tests {
             1,
             "the suggestion must produce exactly 1 rule"
         );
-        assert_eq!(parsed[0].name, "deny-bash-rm-rf");
+        assert!(
+            parsed[0].name.starts_with("deny-bash-rm-rf-"),
+            "readable stem plus a digest: {}",
+            parsed[0].name
+        );
         assert_eq!(parsed[0].action, crate::rules::RuleAction::Deny);
         assert_eq!(parsed[0].match_tool, vec!["Bash".to_string()]);
         assert_eq!(parsed[0].match_command, vec!["rm -rf".to_string()]);
@@ -731,6 +767,37 @@ mod tests {
             names[0], names[1],
             "both denials suggested the same table: {names:?}"
         );
+    }
+
+    /// Slugifying is lossy, so the readable part alone is not a unique name.
+    ///
+    /// `rm -rf` and `rm/rf` both reduce to `bash-rm-rf`, and any command made
+    /// only of punctuation reduces to nothing at all — so without a digest,
+    /// distinct denials would still collide onto one table and silently
+    /// overwrite each other.
+    #[test]
+    fn commands_that_slugify_identically_still_get_distinct_names() {
+        let collide = ["rm -rf", "rm/rf"];
+        let empty_stem = ["|", ">", "", "\u{65e5}\u{672c}"];
+
+        let names: Vec<String> = collide
+            .iter()
+            .chain(empty_stem.iter())
+            .map(|c| rule_slug("Bash", Some(c)))
+            .collect();
+
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "names collided: {names:?}");
+        assert!(
+            names.iter().all(|n| !n.is_empty() && !n.ends_with('-')),
+            "no empty or dangling-dash table names: {names:?}"
+        );
+
+        // Stable across calls, so re-running does not rename a rule the user
+        // has already pasted.
+        assert_eq!(rule_slug("Bash", Some("rm -rf")), names[0]);
+        // No command at all stays clean, with no trailing digest.
+        assert_eq!(rule_slug("Bash", None), "bash");
     }
 
     #[test]
