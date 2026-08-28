@@ -212,6 +212,33 @@ pub(crate) fn detect_context_blowouts(decisions: &[DecisionRecord]) -> Vec<Insig
     }]
 }
 
+/// A table name unique to the (tool, command) pair a suggestion describes.
+///
+/// Keying on the tool alone collided: one insight is emitted per pattern, so
+/// three separate Bash denials all suggested `[rules.deny-bash]`. Pasting them
+/// leaves ONE rule matching only the last, because `ensure_rule` reuses a rule
+/// by name and every matcher is last-write-wins — so two of the three denials
+/// the user believes they added silently do not exist.
+fn rule_slug(tool: &str, command: Option<&str>) -> String {
+    let mut raw = tool.to_lowercase();
+    if let Some(command) = command {
+        raw.push('-');
+        raw.push_str(&command.to_lowercase());
+    }
+    let mut slug = String::with_capacity(raw.len());
+    let mut pending_dash = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            pending_dash = false;
+        } else if !pending_dash {
+            slug.push('-');
+            pending_dash = true;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
 /// Detect high-confidence patterns that could become AutoRules.
 pub(crate) fn detect_missing_rules(
     _decisions: &[DecisionRecord],
@@ -249,9 +276,9 @@ pub(crate) fn detect_missing_rules(
                     p.sample_count,
                 ),
                 suggestion: Some(format!(
-                    "add to {}: [rules.approve-{}]\nmatch_tool = [\"{}\"]\nmatch_command = [\"{}\"]\naction = \"approve\"",
+                    "add to {}:\n[rules.approve-{}]\nmatch_tool = [\"{}\"]\nmatch_command = [\"{}\"]\naction = \"approve\"",
                     crate::product::project_config(std::path::Path::new(".")).display(),
-                    p.tool.to_lowercase(),
+                    rule_slug(&p.tool, p.command_pattern.as_deref()),
                     p.tool,
                     p.command_pattern.as_deref().unwrap_or("*"),
                 )),
@@ -283,9 +310,9 @@ pub(crate) fn detect_missing_rules(
                     p.sample_count,
                 ),
                 suggestion: Some(format!(
-                    "add to {}: [rules.deny-{}]\nmatch_tool = [\"{}\"]\nmatch_command = [\"{}\"]\naction = \"deny\"",
+                    "add to {}:\n[rules.deny-{}]\nmatch_tool = [\"{}\"]\nmatch_command = [\"{}\"]\naction = \"deny\"",
                     crate::product::project_config(std::path::Path::new(".")).display(),
-                    p.tool.to_lowercase(),
+                    rule_slug(&p.tool, p.command_pattern.as_deref()),
                     p.tool,
                     p.command_pattern.as_deref().unwrap_or("*"),
                 )),
@@ -636,20 +663,73 @@ mod tests {
         let suggestion = insights[0].suggestion.clone().expect("a suggestion");
 
         assert!(
-            !suggestion.contains("[[rules]]"),
-            "array-of-tables yields no rules: {suggestion}"
-        );
-        assert!(
-            suggestion.contains("[rules.deny-bash]"),
-            "the table name IS the rule name: {suggestion}"
-        );
-        assert!(
-            suggestion.contains("match_tool = [\"Bash\"]"),
-            "matchers are arrays, not bare strings: {suggestion}"
-        );
-        assert!(
             !suggestion.contains(".claudectl.toml"),
             "the config file was renamed: {suggestion}"
+        );
+
+        // Substring-matching the header would pass even when the header is
+        // glued to the prose prefix and so is not a header at all. Parse the
+        // TOML the user would actually paste and assert a rule comes back.
+        let toml: String = suggestion
+            .lines()
+            .skip_while(|line| !line.starts_with('['))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            toml.starts_with("[rules."),
+            "the table header must own its own line: {suggestion:?}"
+        );
+
+        let parsed = crate::config::parse_config_file_for_test(&toml);
+        assert_eq!(
+            parsed.len(),
+            1,
+            "the suggestion must produce exactly 1 rule"
+        );
+        assert_eq!(parsed[0].name, "deny-bash-rm-rf");
+        assert_eq!(parsed[0].action, crate::rules::RuleAction::Deny);
+        assert_eq!(parsed[0].match_tool, vec!["Bash".to_string()]);
+        assert_eq!(parsed[0].match_command, vec!["rm -rf".to_string()]);
+    }
+
+    /// Two denials for the same tool must not collide on one table name.
+    ///
+    /// `ensure_rule` reuses a rule by name and every matcher is
+    /// last-write-wins, so identical headers silently collapse into one rule
+    /// matching only the last pattern — the earlier denials would not exist.
+    #[test]
+    fn two_suggestions_for_one_tool_get_distinct_rule_names() {
+        let pattern = |cmd: &str| PreferencePattern {
+            tool: "Bash".to_string(),
+            command_pattern: Some(cmd.to_string()),
+            preferred_action: "deny".to_string(),
+            sample_count: 6,
+            accept_rate: 0.0,
+            conditions: Vec::new(),
+            confidence: 1.0,
+        };
+        let prefs = DistilledPreferences {
+            patterns: vec![pattern("rm -rf"), pattern("curl | sh")],
+            tool_accuracy: Vec::new(),
+            total_decisions: 12,
+            overall_accuracy: 0.8,
+            temporal: Vec::new(),
+        };
+
+        let names: Vec<String> = detect_missing_rules(&[], &prefs)
+            .iter()
+            .filter_map(|i| i.suggestion.clone())
+            .filter_map(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("[rules."))
+                    .map(str::to_string)
+            })
+            .collect();
+
+        assert_eq!(names.len(), 2);
+        assert_ne!(
+            names[0], names[1],
+            "both denials suggested the same table: {names:?}"
         );
     }
 
