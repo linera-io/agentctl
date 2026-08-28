@@ -1,0 +1,935 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Mission control for Claude Code — supervise, budget, orchestrate, and auto-pilot sessions with a local LLM brain.">
+      
+      
+      
+        <link rel="canonical" href="https://mercurialsolo.github.io/claudectl/plans/2026-08-20-agentctl-multi-provider/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Agentctl Multi-Provider Control Plane Implementation Plan - claudectl</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,700,700i%7CJetBrains+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"JetBrains Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="custom" data-md-color-accent="light-green">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#agentctl-multi-provider-control-plane-implementation-plan" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="claudectl" class="md-header__button md-logo" aria-label="claudectl" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            claudectl
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Agentctl Multi-Provider Control Plane Implementation Plan
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="custom" data-md-color-accent="light-green"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="custom" data-md-color-accent="green"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/mercurialsolo/claudectl" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    mercurialsolo/claudectl
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="claudectl" class="md-nav__button md-logo" aria-label="claudectl" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    claudectl
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/mercurialsolo/claudectl" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    mercurialsolo/claudectl
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../quickstart/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quick Start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../terminal-support/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Terminal Support
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../troubleshooting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Troubleshooting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../contributing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#task-1-canonical-shared-agent-home" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Task 1: Canonical shared agent home
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#task-2-product-identity-with-backward-compatibility" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Task 2: Product identity with backward compatibility
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#task-3-provider-neutral-session-identity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Task 3: Provider-neutral session identity
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#task-4-provider-column-in-the-unchanged-tui" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Task 4: Provider column in the unchanged TUI
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#task-5-provider-adapter-and-claude-extraction" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Task 5: Provider adapter and Claude extraction
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#task-6-passive-codex-rollout-and-process-discovery" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Task 6: Passive Codex rollout and process discovery
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#task-7-codex-launch-resume-rename-focus-and-input" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Task 7: Codex launch, resume, rename, focus, and input
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#task-8-codex-app-server-client-and-live-event-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Task 8: Codex App Server client and live event model
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#task-9-approval-budget-health-orchestration-and-brain-parity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Task 9: Approval, budget, health, orchestration, and brain parity
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#task-10-externally-sandboxed-full-access-mode" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Task 10: Externally sandboxed full-access mode
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#task-11-complete-rename-migration-docs-and-verification" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Task 11: Complete rename, migration docs, and verification
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="agentctl-multi-provider-control-plane-implementation-plan">Agentctl Multi-Provider Control Plane Implementation Plan</h1>
+<blockquote>
+<p><strong>For Codex:</strong> Use <code>${SUPERPOWERS_SKILLS_ROOT}/skills/collaboration/executing-plans/SKILL.md</code> to implement this plan task-by-task.</p>
+</blockquote>
+<p><strong>Goal:</strong> Turn claudectl into agentctl, a single Claude Code and Codex control
+plane with the existing TUI, full provider-aware supervision, and safe
+externally sandboxed Codex full-access mode.</p>
+<p><strong>Architecture:</strong> Keep the existing session data shape during the migration,
+add provider identity and adapter dispatch, then move Claude-only behavior into
+its adapter. Use Codex rollout files for passive discovery and the official
+App Server JSONL protocol for managed live state and controls. Preserve legacy
+commands and paths as read/launch aliases. Treat <code>~/.agents</code> as the canonical
+shared home and render thin Claude/Codex adapters from it; never directly share
+mutable provider-owned configuration or transcript files.</p>
+<p><strong>Tech Stack:</strong> Rust 2024, ratatui, crossterm, serde/serde_json, clap, existing
+Tokio blocking-worker runtime, Codex App Server JSON-RPC over stdio proxy.</p>
+<hr />
+<p>No task below includes a commit step because repository instructions require
+explicit user authorization before commits.</p>
+<h3 id="task-1-canonical-shared-agent-home">Task 1: Canonical shared agent home</h3>
+<p><strong>Files:</strong>
+- Create: <code>src/shared_home.rs</code>
+- Modify: <code>src/lib.rs</code>
+- Modify: <code>src/config.rs</code>
+- Create: <code>tests/shared_home_tests.rs</code>
+- Create: <code>docs/shared-agent-home.md</code></p>
+<ol>
+<li>Write failing tests for the canonical <code>~/.agents</code> layout covering global
+   instructions, skills, durable memory, MCP registry, hook/workflow registry,
+   provider adapters, and unified session index.</li>
+<li>Write failing adoption tests using a temporary home with existing Claude
+   instructions/memory/skills and Codex configuration. Require a dry-run plan,
+   canonical-first resolution, no deletion, and idempotent reconciliation.</li>
+<li>Implement pure discovery and reconciliation planning before any filesystem
+   writes. Classify paths as shared source, generated adapter, native cache, or
+   immutable transcript evidence.</li>
+<li>Implement atomic adapter rendering with backups when replacing an existing
+   generated adapter. Refuse to replace an independently edited native file and
+   report drift instead.</li>
+<li>Adopt the existing Claude memory graph in place through an explicit shared
+   reference; do not copy or move the 1,747 notes. Make Codex's instruction
+   adapter point at the same graph and tool paths.</li>
+<li>Add provider-neutral MCP/hook schemas and deterministic Claude/Codex render
+   plans. Keep credentials out of the canonical files; reference environment or
+   native credential stores.</li>
+<li>Run shared-home tests twice to prove idempotence and document migration,
+   rollback, ownership boundaries, and conflict handling.</li>
+</ol>
+<h3 id="task-2-product-identity-with-backward-compatibility">Task 2: Product identity with backward compatibility</h3>
+<p><strong>Files:</strong>
+- Modify: <code>Cargo.toml</code>
+- Modify: <code>src/lib.rs</code>
+- Modify: <code>src/main.rs</code>
+- Modify: <code>src/config.rs</code>
+- Modify: <code>src/helpers.rs</code>
+- Modify: <code>src/init.rs</code>
+- Modify: <code>src/bin/claudectl-hook.rs</code>
+- Test: co-located tests in <code>src/config.rs</code>, <code>src/helpers.rs</code>, and <code>src/init.rs</code></p>
+<ol>
+<li>Write failing tests that the canonical product name is <code>agentctl</code>, the
+   canonical config/data roots use <code>agentctl</code>, and legacy claudectl files are
+   read when the canonical file is absent.</li>
+<li>Run only those tests and confirm failures mention the old canonical name.</li>
+<li>Rename the package/library and add <code>agentctl</code> plus <code>claudectl</code> compatibility
+   binaries that compile the same entry point.</li>
+<li>Implement canonical-first, legacy-second path resolution and idempotent
+   hook migration; never delete legacy data.</li>
+<li>Run focused tests, then <code>cargo check --all-targets</code>.</li>
+</ol>
+<h3 id="task-3-provider-neutral-session-identity">Task 3: Provider-neutral session identity</h3>
+<p><strong>Files:</strong>
+- Create: <code>src/provider.rs</code>
+- Modify: <code>src/session.rs</code>
+- Modify: <code>src/lib.rs</code>
+- Modify: <code>src/demo.rs</code>
+- Modify: <code>tests/integration_tests.rs</code></p>
+<ol>
+<li>Write failing tests for <code>AgentProvider::{Claude,Codex}</code> labels, executable
+   names, transcript roots, and serde round trips.</li>
+<li>Write a failing test that every constructed session has a provider and that
+   legacy sessions default to Claude.</li>
+<li>Add <code>provider: AgentProvider</code> to the session record. Rename the canonical
+   type to <code>AgentSession</code> and temporarily export <code>ClaudeSession</code> as a deprecated
+   compatibility alias so consumers can migrate in small green steps.</li>
+<li>Update fixtures and constructors without changing existing Claude behavior.</li>
+<li>Run session, demo, and integration tests.</li>
+</ol>
+<h3 id="task-4-provider-column-in-the-unchanged-tui">Task 4: Provider column in the unchanged TUI</h3>
+<p><strong>Files:</strong>
+- Modify: <code>src/ui/table.rs</code>
+- Modify: <code>src/ui/detail.rs</code>
+- Modify: <code>src/app.rs</code>
+- Test: co-located tests in <code>src/ui/table.rs</code></p>
+<ol>
+<li>Write failing row/header tests requiring an <code>Agent</code> column between PID and
+   Name, with compact <code>Claude</code> and <code>Codex</code> values.</li>
+<li>Confirm the tests fail on the current 14-column table.</li>
+<li>Add the column, width constraint, detail-panel provider line, and provider
+   search text while preserving all keyboard behavior and layout priorities.</li>
+<li>Run UI and app tests.</li>
+</ol>
+<h3 id="task-5-provider-adapter-and-claude-extraction">Task 5: Provider adapter and Claude extraction</h3>
+<p><strong>Files:</strong>
+- Create: <code>src/providers/mod.rs</code>
+- Create: <code>src/providers/claude.rs</code>
+- Modify: <code>src/discovery.rs</code>
+- Modify: <code>src/process.rs</code>
+- Modify: <code>src/transcript.rs</code>
+- Modify: <code>src/terminals/mod.rs</code>
+- Modify: <code>src/commands.rs</code>
+- Test: existing co-located tests plus <code>tests/integration_tests.rs</code></p>
+<ol>
+<li>Write failing contract tests for provider discovery, transcript parsing,
+   launch args, resume args, rename support, and process matching.</li>
+<li>Add a synchronous <code>AgentProviderAdapter</code> interface whose results are plain
+   data and whose side effects remain in thin wrappers.</li>
+<li>Move/wrap current Claude behavior behind <code>ClaudeProvider</code> without changing
+   observable output.</li>
+<li>Dispatch discovery, parsing, and terminal actions by <code>AgentProvider</code>.</li>
+<li>Run all existing Claude-focused tests to prove parity.</li>
+</ol>
+<h3 id="task-6-passive-codex-rollout-and-process-discovery">Task 6: Passive Codex rollout and process discovery</h3>
+<p><strong>Files:</strong>
+- Create: <code>src/providers/codex.rs</code>
+- Create: <code>src/providers/codex_rollout.rs</code>
+- Modify: <code>src/process.rs</code>
+- Modify: <code>src/discovery.rs</code>
+- Modify: <code>src/monitor.rs</code>
+- Test: fixtures under <code>tests/fixtures/codex/</code> and co-located module tests</p>
+<ol>
+<li>Add minimal redacted rollout fixtures for <code>session_meta</code>, <code>turn_context</code>,
+   user/assistant messages, token events, compaction, names, active tools, and
+   errors.</li>
+<li>Write failing parser tests for cwd, thread id/name, model, tokens, context,
+   last activity, pending approval, and status.</li>
+<li>Write failing process tests for <code>codex</code>, <code>codex resume &lt;id&gt;</code>, and
+   <code>codex --remote &lt;endpoint&gt;</code> without misclassifying unrelated commands.</li>
+<li>Implement incremental rollout parsing and bounded recursive discovery under
+   <code>$CODEX_HOME/sessions</code>; correlate process cwd/start time when argv lacks an
+   id.</li>
+<li>Merge Codex and Claude discoveries by <code>(provider, session_id)</code> and run
+   focused parser/discovery tests.</li>
+</ol>
+<h3 id="task-7-codex-launch-resume-rename-focus-and-input">Task 7: Codex launch, resume, rename, focus, and input</h3>
+<p><strong>Files:</strong>
+- Modify: <code>src/providers/codex.rs</code>
+- Modify: <code>src/terminals/mod.rs</code>
+- Modify: terminal backends under <code>src/terminals/</code>
+- Modify: <code>src/commands.rs</code>
+- Modify: <code>src/app.rs</code>
+- Test: co-located terminal/provider/app tests</p>
+<ol>
+<li>Write failing command-builder tests for new, resume, remote, prompt, cwd,
+   and externally-sandboxed full-access modes, including shell escaping.</li>
+<li>Write a failing dispatch test proving Claude and Codex receive different
+   launch/resume commands while focus/input reuse the same terminal target.</li>
+<li>Implement provider-aware commands and reuse the existing terminal bridge.</li>
+<li>Implement rename through App Server when managed; use the Codex CLI/thread
+   store fallback only for passive sessions.</li>
+<li>Run terminal, command, and app tests.</li>
+</ol>
+<h3 id="task-8-codex-app-server-client-and-live-event-model">Task 8: Codex App Server client and live event model</h3>
+<p><strong>Files:</strong>
+- Create: <code>src/providers/codex_app_server.rs</code>
+- Modify: <code>src/providers/codex.rs</code>
+- Modify: <code>src/app.rs</code>
+- Modify: <code>src/session.rs</code>
+- Test: fake JSONL server tests in <code>src/providers/codex_app_server.rs</code></p>
+<ol>
+<li>Write failing protocol tests for initialize/initialized, request-id
+   correlation, <code>thread/list</code>, <code>thread/read</code>, <code>thread/resume</code>,
+   <code>thread/name/set</code>, <code>turn/start</code>, status notifications, and approval events.</li>
+<li>Use a fake child process with pipes; do not mock the protocol parser.</li>
+<li>Implement a blocking worker that spawns <code>codex app-server proxy --sock ...</code>
+   (or direct <code>codex app-server --stdio</code> for agentctl-owned instances), sends
+   JSONL requests, and streams notifications to the existing Tokio channel.</li>
+<li>Overlay App Server state on passive rollout/process state, preferring live
+   server status without hiding passive sessions when the server is down.</li>
+<li>Run protocol and app merge tests.</li>
+</ol>
+<h3 id="task-9-approval-budget-health-orchestration-and-brain-parity">Task 9: Approval, budget, health, orchestration, and brain parity</h3>
+<p><strong>Files:</strong>
+- Modify: <code>src/rules.rs</code>
+- Modify: <code>src/health.rs</code>
+- Modify: <code>src/history.rs</code>
+- Modify: <code>src/orchestrator.rs</code>
+- Modify: <code>src/brain/context.rs</code>
+- Modify: <code>src/brain/engine.rs</code>
+- Modify: <code>src/brain/mailbox.rs</code>
+- Modify: <code>src/brain/decisions.rs</code>
+- Test: existing module tests and <code>tests/integration_tests.rs</code></p>
+<ol>
+<li>Write failing tests showing provider identity in rule/brain context and
+   provider-correct approval, deny, terminate, route, spawn, and resume actions.</li>
+<li>Add provider as an optional rule predicate and persisted history dimension.</li>
+<li>Translate Codex App Server approval requests/responses to the existing rule
+   and brain decision model; preserve deny-first behavior.</li>
+<li>Generalize health and budget calculations around provider-supplied usage and
+   context limits; explicitly mark unavailable cost data instead of inventing
+   estimates.</li>
+<li>Let orchestration tasks select <code>provider</code>, defaulting legacy task files to
+   Claude, and dispatch launches/routes accordingly.</li>
+<li>Run focused rule, health, history, orchestration, and brain tests.</li>
+</ol>
+<h3 id="task-10-externally-sandboxed-full-access-mode">Task 10: Externally sandboxed full-access mode</h3>
+<p><strong>Files:</strong>
+- Modify: <code>src/config.rs</code>
+- Modify: <code>src/sandbox_registry.rs</code>
+- Modify: <code>src/terminals/sandbox_terminal_bridge.rs</code>
+- Modify: <code>src/providers/codex.rs</code>
+- Modify: <code>docs/configuration.md</code>
+- Modify: <code>docs/terminal-support.md</code>
+- Test: co-located config/registry/bridge/provider tests</p>
+<ol>
+<li>Write failing tests that full-access launch is rejected without the explicit
+   sandbox marker, rejects a host/out-of-bound endpoint, and succeeds with a
+   validated sandbox-local endpoint.</li>
+<li>Add Codex provider configuration for App Server mode, endpoint/socket,
+   external-sandbox marker, and permission mode.</li>
+<li>Start or connect to the App Server inside the sandbox; launch host-visible
+   <code>codex --remote</code> through the existing bridge using the shared endpoint.</li>
+<li>Ensure loss of the marker or endpoint causes fail-closed ordinary Codex
+   permissions, never silent host full access.</li>
+<li>Run sandbox/bridge/provider tests.</li>
+</ol>
+<h3 id="task-11-complete-rename-migration-docs-and-verification">Task 11: Complete rename, migration docs, and verification</h3>
+<p><strong>Files:</strong>
+- Modify: <code>README.md</code>, <code>AGENTS.md</code>, <code>CLAUDE.md</code>, <code>CHANGELOG.md</code>
+- Modify: <code>docs/**/*.md</code>, <code>plugin/**</code>, <code>scripts/**</code>, <code>.github/**</code>
+- Modify: assets and install metadata that encode the old product name
+- Keep: deliberate compatibility references to <code>claudectl</code></p>
+<ol>
+<li>Write a failing repository identity check that rejects unintended canonical
+   <code>claudectl</code> names while allowing documented compatibility references.</li>
+<li>Update documentation, examples, hooks, install paths, badges, and metadata
+   to agentctl; document legacy migration and both providers.</li>
+<li>Regenerate the indxr index.</li>
+<li>Run <code>cargo fmt --check</code>, <code>cargo test</code>, <code>cargo clippy --all-targets -- -D warnings</code>,
+   debug/release builds, CLI help smoke tests for both names, and App Server fake
+   integration tests.</li>
+<li>Inspect the final structural diff and list any deliberate remaining
+   <code>claudectl</code> references.</li>
+<li>Only after user authorization, rename the GitHub repository and update
+   remotes/distribution metadata; GitHub redirects preserve old clone URLs.</li>
+</ol>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/mercurialsolo/claudectl" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.expand", "navigation.top", "search.suggest", "search.highlight", "content.code.copy", "content.code.annotate", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
