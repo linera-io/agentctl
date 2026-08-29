@@ -214,10 +214,29 @@ fn read_live_session_ids(sessions_dir: &Path) -> std::collections::HashSet<Strin
 /// project subdir's mtime moves (i.e. within ≤30 s of session start)
 /// instead of waiting for a full re-walk timer. Steady-state cost: 1
 /// read_dir of projects_root (~36 entries) + 36 stats = ~10 ms.
+///
+/// That mtime test is necessary but not sufficient: mtime moves for
+/// *direct* children only, while the walk is recursive. A subagent
+/// transcript written to `<project>/<session>/subagents/` leaves the
+/// project subdir's mtime untouched, so a cache keyed on it alone never
+/// sees the file — on a real tree the great majority of transcripts are
+/// nested like that. `REWALK_AFTER_MS` bounds how long such a file can
+/// stay invisible.
 #[derive(Default)]
 struct SubdirCache {
     last_mtime_ms: u64,
+    last_walk_ms: u64,
     files: Vec<PathBuf>,
+}
+
+/// Re-walk a project subdir at least this often, whatever its mtime says.
+/// Bounds the staleness the mtime test cannot see; a full walk of a heavy
+/// tree is ~500 ms, so once a minute per subdir is cheap against a 30 s
+/// scan cadence.
+static REWALK_AFTER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(60_000);
+
+fn rewalk_after_ms() -> u64 {
+    REWALK_AFTER_MS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 type FileListCache = HashMap<PathBuf, SubdirCache>;
@@ -265,12 +284,15 @@ fn find_jsonl_files_cached(root: &Path) -> Vec<PathBuf> {
         let mtime = dir_mtime_ms(&path);
         seen_subdirs.insert(path.clone());
 
+        let now = now_ms();
         let dc = cache.entry(path.clone()).or_default();
-        if dc.last_mtime_ms != mtime {
+        let aged_out = now.saturating_sub(dc.last_walk_ms) >= rewalk_after_ms();
+        if dc.last_mtime_ms != mtime || aged_out {
             let mut walked = Vec::new();
             walk_jsonls_into(&path, &mut walked);
             dc.files = walked;
             dc.last_mtime_ms = mtime;
+            dc.last_walk_ms = now;
         }
         all.extend(dc.files.iter().cloned());
     }
@@ -1133,6 +1155,86 @@ mod tests {
         assert_eq!(summary.output, 12);
     }
 
+    /// A transcript created in a NESTED directory must still be discovered.
+    /// The cache keys on the top-level project subdir's mtime but walks
+    /// recursively, so a file added under `<project>/<session>/subagents/`
+    /// leaves that mtime untouched and was previously invisible until some
+    /// unrelated change moved the parent. Most transcripts on a real tree are
+    /// nested like that.
+    #[test]
+    fn nested_subagent_transcripts_are_discovered_after_the_first_scan() {
+        let _g = rewalk_test_lock();
+        // Force the age-based re-walk rather than sleeping out the interval.
+        let restore = rewalk_after_ms();
+        REWALK_AFTER_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let p = TestPaths::new("nested-discovery");
+        let top = p.projects.join("-test");
+        let nested = top.join("sess-parent/subagents");
+        fs::create_dir_all(&nested).unwrap();
+
+        // First scan establishes the cached listing for `-test`.
+        write_tmp(
+            &top.join("sess-parent.jsonl"),
+            &fixture_assistant_line("2026-04-22T10:00:00.000Z", "claude-opus-5", 10, 0, 0, 5),
+        );
+        let first = p.scan();
+        assert_eq!(first.rows_appended, 1, "parent transcript ingested");
+
+        // A subagent transcript appears in the nested dir. The top-level
+        // `-test` mtime does not change.
+        write_tmp(
+            &nested.join("agent-abc.jsonl"),
+            &fixture_assistant_line("2026-04-22T10:01:00.000Z", "claude-opus-5", 20, 0, 0, 7),
+        );
+        let second = p.scan();
+        REWALK_AFTER_MS.store(restore, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            second.rows_appended, 1,
+            "the nested subagent transcript must be discovered"
+        );
+    }
+
+    /// The re-walk is a bounded backstop, not a replacement for the cache: an
+    /// unchanged subdir inside the interval must still be served from cache.
+    #[test]
+    fn an_unchanged_subdir_is_not_rewalked_within_the_interval() {
+        let _g = rewalk_test_lock();
+        let restore = rewalk_after_ms();
+        REWALK_AFTER_MS.store(60_000, std::sync::atomic::Ordering::Relaxed);
+
+        let p = TestPaths::new("rewalk-fastpath");
+        let top = p.projects.join("-test");
+        let nested = top.join("sess-parent/subagents");
+        fs::create_dir_all(&nested).unwrap();
+        write_tmp(
+            &top.join("sess-parent.jsonl"),
+            &fixture_assistant_line("2026-04-22T10:00:00.000Z", "claude-opus-5", 10, 0, 0, 5),
+        );
+        let _ = find_jsonl_files_cached(&p.projects);
+
+        // Nested addition, parent mtime untouched, well inside the interval.
+        write_tmp(
+            &nested.join("agent-xyz.jsonl"),
+            &fixture_assistant_line("2026-04-22T10:01:00.000Z", "claude-opus-5", 20, 0, 0, 7),
+        );
+        let files = find_jsonl_files_cached(&p.projects);
+        REWALK_AFTER_MS.store(restore, std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            files.len(),
+            1,
+            "cache must still short-circuit inside the interval"
+        );
+    }
+
+    /// Serialize the tests that drive the global re-walk interval.
+    fn rewalk_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn dead_writer_is_drained_once_then_skipped() {
         // First scan: writer is "dead" (no pointer file). Drains the
@@ -1870,6 +1972,14 @@ mod tests {
         // exercised and the test would pass for the wrong reason. Verified:
         // with the ledger lock removed and this set, all 40 responses are lost.
         COMPACT_THRESHOLD_BYTES.store(512, std::sync::atomic::Ordering::Relaxed);
+        // This test asserts nothing is lost, so discovery must not be the
+        // limiting factor: the writer creates hundreds of files per
+        // millisecond, and `dir_mtime_ms` cannot distinguish additions inside
+        // one tick. Re-walk every scan so the assertion is about
+        // append-vs-compaction, which is what it exists to check.
+        let _rw = rewalk_test_lock();
+        let restore_rewalk = rewalk_after_ms();
+        REWALK_AFTER_MS.store(0, std::sync::atomic::Ordering::Relaxed);
         const TOTAL: usize = 400;
         fs::create_dir_all(&p.projects).unwrap();
         for i in 0..40 {
@@ -1895,13 +2005,24 @@ mod tests {
                 for i in 40..TOTAL {
                     let f = p.projects.join(format!("-test/sess-{i}.jsonl"));
                     let _ = fs::create_dir_all(f.parent().unwrap());
-                    let _ = fs::write(
-                        &f,
-                        format!(
-                            "{}\n",
-                            fixture_keyed_line_now(&format!("msg_{i}"), &format!("req_{i}"), 10)
-                        ),
+                    let body = format!(
+                        "{}\n",
+                        fixture_keyed_line_now(&format!("msg_{i}"), &format!("req_{i}"), 10)
                     );
+                    // Write then rename, so a scanner never sees the file
+                    // half-written. `fs::write` truncates first; a scanner that
+                    // reads the empty intermediate state records it as fully
+                    // ingested, and because these fixtures have no live writer
+                    // the drained-skip then never re-reads them — the row is
+                    // gone for good (the contract asserted by
+                    // `dead_writer_is_drained_once_then_skipped`). That is a
+                    // property of writing non-atomically, not of the code under
+                    // test: a real transcript is either held open by a live
+                    // session (writer_alive, never drained) or already complete
+                    // because its writer exited.
+                    let tmp = f.with_extension("jsonl.tmp");
+                    let _ = fs::write(&tmp, body);
+                    let _ = fs::rename(&tmp, &f);
                 }
                 done.store(true, std::sync::atomic::Ordering::Release);
             });
@@ -1918,6 +2039,7 @@ mod tests {
 
         let s = load_summary_at(&p.ledger, 0);
         COMPACT_THRESHOLD_BYTES.store(64 * 1024 * 1024, std::sync::atomic::Ordering::Relaxed);
+        REWALK_AFTER_MS.store(restore_rewalk, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
             s.msg_count, TOTAL as u64,
             "every response must survive concurrent scan+compaction"
