@@ -1066,8 +1066,8 @@ impl App {
         self.replace_data(new_data);
     }
 
-    /// Construct without touching the host: no session scan, no ledger read,
-    /// no background thread. Use [`App::with_host_state`] for a real run.
+    /// No session scan, no ledger read, no background thread — only the
+    /// parked-session file is read. Use [`App::with_host_state`] for a real run.
     pub fn new() -> Self {
         let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
@@ -4163,19 +4163,9 @@ mod tests {
         app
     }
 
-    /// Build an App with empty AppData, bypassing the host-side
-    /// session discovery that `App::new()` does in its constructor.
-    /// The data-helper tests below assert on the post-replace state
-    /// directly, so we don't want real sessions leaking in.
-    fn app_with_empty_data() -> App {
-        let app = App::new();
-        app.replace_data(AppData::default());
-        app
-    }
-
     #[test]
     fn data_snapshot_returns_empty_appdata_after_clear() {
-        let app = app_with_empty_data();
+        let app = App::new();
         let snap = app.data_snapshot();
         assert!(snap.sessions.is_empty());
         assert_eq!(snap.ledger_today.msg_count, 0);
@@ -4185,7 +4175,7 @@ mod tests {
 
     #[test]
     fn replace_data_swaps_atomically_and_takes_effect_for_next_snapshot() {
-        let app = app_with_empty_data();
+        let app = App::new();
         let snap_before = app.data_snapshot();
         assert!(snap_before.sessions.is_empty());
 
@@ -4217,7 +4207,7 @@ mod tests {
 
     #[test]
     fn modify_data_mutates_in_place_and_visible_to_subsequent_snapshot() {
-        let app = app_with_empty_data();
+        let app = App::new();
         app.modify_data(|d| {
             d.ledger_week.fresh_input = 12345;
             d.sessions.push(make_session(
@@ -4271,7 +4261,7 @@ mod tests {
         // With no runtime the work must run on the calling thread and be
         // applied before the call returns, not dispatched to a worker that
         // never runs.
-        let mut app = app_with_empty_data();
+        let mut app = App::new();
         app.refresh_worker = |_| RefreshIoOutput::default();
         assert!(app.refresh_nonblocking());
         assert!(!app.refresh_in_flight);
@@ -4282,7 +4272,7 @@ mod tests {
         // We poll the return value rather than `refresh_in_flight` because
         // each call also schedules the NEXT worker, so the flag is true on
         // exit even after a successful drain.
-        let mut app = app_with_empty_data();
+        let mut app = App::new();
         app.refresh_worker = |_| RefreshIoOutput::default();
 
         let kicked = app.refresh_nonblocking();
@@ -4306,7 +4296,7 @@ mod tests {
 
     #[test]
     fn with_sessions_preserves_ledger_fields() {
-        let app = app_with_empty_data();
+        let app = App::new();
         app.modify_data(|d| {
             d.ledger_month.cost_usd = 999.99;
         });
