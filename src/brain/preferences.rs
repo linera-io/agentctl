@@ -611,7 +611,6 @@ pub fn distill_preferences(decisions: &[DecisionRecord]) -> DistilledPreferences
 
         let accepted: u32 = group.iter().filter(|d| d.is_positive()).count() as u32;
         let rejected: u32 = group.iter().filter(|d| d.is_negative()).count() as u32;
-        let total = indices.len() as u32;
         let decided = accepted + rejected;
         if decided == 0 {
             continue;
@@ -739,7 +738,10 @@ pub fn distill_preferences(decisions: &[DecisionRecord]) -> DistilledPreferences
             tool: tool.clone(),
             command_pattern: cmd_pattern.clone(),
             preferred_action: preferred,
-            sample_count: total,
+            // Answered decisions only, matching `accept_rate`'s denominator and
+            // the split paths above. Counting deferrals here let six of them
+            // plus one accept clear an evidence floor of five.
+            sample_count: decided,
             accept_rate,
             conditions: Vec::new(),
             confidence: (accept_rate - 0.5).abs() * 2.0,
@@ -1652,6 +1654,49 @@ mod tests {
             "Expected time-of-day temporal pattern, got: {:?}",
             patterns
         );
+    }
+
+    /// A record nobody answered is not evidence: six deferrals plus one accept
+    /// must not clear an evidence floor of five.
+    #[test]
+    fn a_deferred_decision_does_not_count_as_evidence() {
+        let mut decisions: Vec<DecisionRecord> = (0..6)
+            .map(|i| DecisionRecord {
+                timestamp: i.to_string(),
+                pid: 42,
+                project: "proj".into(),
+                tool: Some("Bash".into()),
+                command: Some("cargo test".into()),
+                brain_action: "approve".into(),
+                brain_confidence: 0.4,
+                brain_reasoning: String::new(),
+                user_action: "deferred_low_confidence".into(),
+                context: Some(make_context(1.0, 50, false)),
+                outcome: None,
+                decision_type: DecisionType::Session,
+                suggested_at: None,
+            })
+            .collect();
+        decisions.push(DecisionRecord {
+            timestamp: "6".into(),
+            pid: 42,
+            project: "proj".into(),
+            tool: Some("Bash".into()),
+            command: Some("cargo test".into()),
+            brain_action: "approve".into(),
+            brain_confidence: 0.9,
+            brain_reasoning: String::new(),
+            user_action: "accept".into(),
+            context: Some(make_context(1.0, 50, false)),
+            outcome: None,
+            decision_type: DecisionType::Session,
+            suggested_at: None,
+        });
+
+        let prefs = distill_preferences(&decisions);
+        for p in &prefs.patterns {
+            assert_eq!(p.sample_count, 1, "only one decision was answered: {:?}", p);
+        }
     }
 
     /// An observation the user approved carries no brain verb, so one brain
