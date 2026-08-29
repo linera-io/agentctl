@@ -599,16 +599,12 @@ pub fn distill_preferences(decisions: &[DecisionRecord]) -> DistilledPreferences
 
         // `accept_rate` measures agreement with the brain across the WHOLE
         // group, so it only names a preference if the brain said one thing
-        // throughout. Taking one record's verb would let the earliest decide.
-        let mut verbs: Vec<&str> = group
-            .iter()
-            .map(|d| d.brain_action.as_str())
-            .filter(|a| !a.is_empty())
-            .collect();
+        // throughout. An observation's empty verb counts as its own value:
+        // there was nothing to agree with, so mixing it in decides nothing.
+        let mut verbs: Vec<&str> = group.iter().map(|d| d.brain_action.as_str()).collect();
         verbs.sort_unstable();
         verbs.dedup();
         let brain_action = match verbs.as_slice() {
-            [] => String::new(),
             [only] => (*only).to_string(),
             _ => continue,
         };
@@ -1655,6 +1651,51 @@ mod tests {
             time_pattern,
             "Expected time-of-day temporal pattern, got: {:?}",
             patterns
+        );
+    }
+
+    /// An observation the user approved carries no brain verb, so one brain
+    /// record must not speak for a group that is mostly observations.
+    #[test]
+    fn one_brain_verb_does_not_speak_for_a_group_of_observations() {
+        let mut decisions: Vec<DecisionRecord> = (0..19)
+            .map(|i| DecisionRecord {
+                timestamp: i.to_string(),
+                pid: 42,
+                project: "proj".into(),
+                tool: Some("Bash".into()),
+                command: Some("git push origin".into()),
+                brain_action: String::new(),
+                brain_confidence: 0.0,
+                brain_reasoning: String::new(),
+                user_action: "user_approve".into(),
+                context: Some(make_context(1.0, 50, false)),
+                outcome: None,
+                decision_type: DecisionType::Session,
+                suggested_at: None,
+            })
+            .collect();
+        decisions.push(DecisionRecord {
+            timestamp: "19".into(),
+            pid: 42,
+            project: "proj".into(),
+            tool: Some("Bash".into()),
+            command: Some("git push origin".into()),
+            brain_action: "deny".into(),
+            brain_confidence: 0.9,
+            brain_reasoning: String::new(),
+            user_action: "reject".into(),
+            context: Some(make_context(1.0, 50, false)),
+            outcome: None,
+            decision_type: DecisionType::Session,
+            suggested_at: None,
+        });
+
+        let prefs = distill_preferences(&decisions);
+        assert!(
+            !prefs.patterns.iter().any(|p| p.preferred_action == "deny"),
+            "19 user approvals must not distil to deny: {:?}",
+            prefs.patterns
         );
     }
 
