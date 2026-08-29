@@ -193,7 +193,9 @@ pub fn load_tasks(path: &str) -> io::Result<TaskFile> {
 }
 
 /// Run tasks with dependency resolution and parallel execution.
-pub fn run_tasks(task_file: TaskFile, parallel: bool) -> io::Result<()> {
+/// `notify` is the resolved `notify` setting; without it this posted a desktop
+/// notification on every completed run, with no way to turn it off.
+pub fn run_tasks(task_file: TaskFile, parallel: bool, notify: bool) -> io::Result<()> {
     validate_task_file(&task_file)?;
 
     let mut tasks: Vec<TaskRun> = task_file
@@ -459,7 +461,7 @@ pub fn run_tasks(task_file: TaskFile, parallel: bool) -> io::Result<()> {
     print_final_summary(&tasks);
 
     #[cfg(target_os = "macos")]
-    {
+    if notify {
         let counts = compute_counts(&tasks);
         let msg = if counts.failed == 0 && counts.aborted == 0 && counts.skipped == 0 {
             format!("All {total} tasks completed")
@@ -472,7 +474,10 @@ pub fn run_tasks(task_file: TaskFile, parallel: bool) -> io::Result<()> {
         let _ = Command::new("osascript")
             .args([
                 "-e",
-                &format!("display notification \"{msg}\" with title \"claudectl run\""),
+                &format!(
+                    "display notification \"{msg}\" with title \"{} run\"",
+                    crate::product::NAME
+                ),
             ])
             .spawn();
     }
@@ -1247,7 +1252,7 @@ mod tests {
             retries: None,
         };
 
-        let result = run_tasks(task_file, false);
+        let result = run_tasks(task_file, false, false);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("nonexistent"));
