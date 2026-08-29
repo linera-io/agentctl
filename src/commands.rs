@@ -914,10 +914,22 @@ pub(crate) fn run_clean(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
 
-    // Collect active PIDs to avoid deleting live sessions
-    let active_pids: std::collections::HashSet<u32> = {
+    // One host scan for both liveness questions. The `--finished` filter below
+    // runs per JSONL file, so asking it to build its own App cost a full scan
+    // and a `ps` fork for every file in `~/.claude/projects`.
+    let (active_pids, active_jsonl): (
+        std::collections::HashSet<u32>,
+        std::collections::HashSet<std::path::PathBuf>,
+    ) = {
         let app = App::with_host_state();
-        app.data_snapshot().sessions.iter().map(|s| s.pid).collect()
+        let snap = app.data_snapshot();
+        (
+            snap.sessions.iter().map(|s| s.pid).collect(),
+            snap.sessions
+                .iter()
+                .filter_map(|s| s.jsonl_path.clone())
+                .collect(),
+        )
     };
 
     let mut removed_sessions = 0u64;
@@ -999,18 +1011,8 @@ pub(crate) fn run_clean(
                 }
 
                 // If --finished only, skip JSONL files whose corresponding session is still active
-                if finished_only {
-                    // Check if any active session is using this JSONL
-                    let app = App::with_host_state();
-                    let is_active = app.data_snapshot().sessions.iter().any(|s| {
-                        s.jsonl_path
-                            .as_ref()
-                            .map(|p| p == &file_path)
-                            .unwrap_or(false)
-                    });
-                    if is_active {
-                        continue;
-                    }
+                if finished_only && active_jsonl.contains(&file_path) {
+                    continue;
                 }
 
                 let size = metadata.len();
