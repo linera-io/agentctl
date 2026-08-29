@@ -188,10 +188,10 @@ action = "deny"
 match_cost_above = 20.0
 action = "terminate"
 
-[rules.codex-only]
+[rules.codex-budget]
 match_provider = ["Codex"]
-match_tool = ["Bash"]
-action = "deny"
+match_cost_above = 5.0
+action = "terminate"
 ```
 
 The table name is the rule name — `[rules.deny-rm-rf]`, not `[[rules]]` with a
@@ -204,6 +204,11 @@ omitted matcher means "any". Deny rules always take precedence.
 whole command — not a glob and not an exact match. `["cargo"]` would also match
 `rm -rf ~/.cargo`, so on an approve rule prefer the narrowest string that
 identifies the command. `match_tool` and `match_provider` are exact matches.
+
+`match_tool` and `match_command` read the session's pending tool call, which
+comes from the transcript. Only Claude sessions report it today, so a rule
+carrying either matcher never fires against a Codex session — match those on
+`match_provider`, `match_project`, or `match_cost_above` instead.
 
 `action` must be one of `approve`, `deny`, `send`, `terminate` or `kill`; a rule
 with any other value is discarded with a warning rather than silently falling
