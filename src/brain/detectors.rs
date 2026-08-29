@@ -308,8 +308,16 @@ fn rule_suggestion(action: &str, pattern: &PreferencePattern) -> String {
         .map(|c| format!("\nmatch_command = [\"{c}\"]"))
         .unwrap_or_default();
 
+    // `match_command` is a substring test and the pattern is only the command's
+    // first two tokens, so an approve covers more than was ever observed. A
+    // full-line comment survives the parser, so the warning travels with paste.
+    let caveat = match (action, command) {
+        ("approve", Some(c)) => format!("# also matches any command containing {c:?}\n"),
+        _ => String::new(),
+    };
+
     format!(
-        "add to {}:\n[rules.{}-{}]\nmatch_tool = [\"{}\"]{command_line}\naction = \"{action}\"",
+        "add to {}:\n{caveat}[rules.{}-{}]\nmatch_tool = [\"{}\"]{command_line}\naction = \"{action}\"",
         target.display(),
         action,
         rule_slug(&pattern.tool, command),
@@ -1052,5 +1060,38 @@ mod tests {
                 "{action:?} must not be handed over as a pasteable rule"
             );
         }
+    }
+
+    /// An approve rule matches a superset of what was observed, and the caveat
+    /// saying so must survive being pasted.
+    #[test]
+    fn an_approve_suggestion_says_it_matches_more_than_it_saw() {
+        let insights = detect_missing_rules(&[], &pattern("approve", 1.0));
+        let suggestion = insights[0].suggestion.clone().expect("a suggestion");
+        assert!(
+            suggestion.contains("# also matches any command containing \"rm -rf\""),
+            "{suggestion}"
+        );
+
+        // Keep the comment: the parser must skip it, not choke on it.
+        let pasted = suggestion
+            .lines()
+            .skip_while(|l| !l.starts_with('#') && !l.starts_with('['))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            pasted.starts_with('#'),
+            "the comment must be pasted: {pasted}"
+        );
+        let parsed = crate::config::parse_config_file_for_test(&pasted);
+        assert_eq!(parsed.len(), 1, "the comment must not break parsing");
+        assert_eq!(parsed[0].action, RuleAction::Approve);
+
+        // A deny matches a superset too, but that direction is fail-safe.
+        let deny = detect_missing_rules(&[], &pattern("deny", 0.0))[0]
+            .suggestion
+            .clone()
+            .expect("a suggestion");
+        assert!(!deny.contains('#'), "no caveat on a deny: {deny}");
     }
 }
