@@ -683,10 +683,12 @@ pub fn distill_preferences(decisions: &[DecisionRecord]) -> DistilledPreferences
                             brain_action.clone()
                         }
                     } else if sub_rate <= 0.3 {
-                        if brain_action == "approve" || brain_action.is_empty() {
-                            "deny".to_string()
-                        } else {
-                            "approve".to_string()
+                        // Rejecting a deny means "let it run", but rejecting
+                        // route/spawn/terminate says nothing about permission.
+                        match brain_action.as_str() {
+                            "approve" | "" => "deny".to_string(),
+                            "deny" => "approve".to_string(),
+                            _ => continue,
                         }
                     } else {
                         continue; // Still ambiguous after split
@@ -714,10 +716,12 @@ pub fn distill_preferences(decisions: &[DecisionRecord]) -> DistilledPreferences
                 brain_action.clone()
             }
         } else if accept_rate <= 0.3 {
-            if brain_action == "approve" || brain_action.is_empty() {
-                "deny".to_string()
-            } else {
-                "approve".to_string()
+            // Rejecting a deny means "let it run", but rejecting
+            // route/spawn/terminate says nothing about permission.
+            match brain_action.as_str() {
+                "approve" | "" => "deny".to_string(),
+                "deny" => "approve".to_string(),
+                _ => continue,
             }
         } else {
             continue; // Ambiguous — don't form a pattern
