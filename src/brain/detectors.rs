@@ -266,16 +266,20 @@ fn rule_slug(tool: &str, command: Option<&str>) -> String {
 /// truncates the line, and quotes are stripped.
 const UNQUOTABLE: [char; 4] = [',', '#', '"', '\''];
 
-/// The rule matcher expressing this condition, or `None` if the rule language
-/// has no equivalent (context level and time-of-day have no matcher).
+/// The rule matcher expressing this condition exactly, or `None` where the rule
+/// language has no equivalent.
+///
+/// `CostAbove(v)` selects `cost >= v` but `match_cost_above = v` fires only on
+/// `cost > v`, and the split is always an observed cost — so the rule would
+/// exclude a sample the pattern was built from. Near enough is not enough here.
 fn condition_matcher(condition: &PreferenceCondition) -> Option<String> {
     match condition {
-        PreferenceCondition::CostAbove(usd) => Some(format!("match_cost_above = {usd}")),
         PreferenceCondition::NoErrors => Some("match_last_error = false".to_string()),
         PreferenceCondition::HasErrors => Some("match_last_error = true".to_string()),
         PreferenceCondition::NoFileConflict => Some("match_file_conflict = false".to_string()),
         PreferenceCondition::HasFileConflict => Some("match_file_conflict = true".to_string()),
-        PreferenceCondition::CostBelow(_)
+        PreferenceCondition::CostAbove(_)
+        | PreferenceCondition::CostBelow(_)
         | PreferenceCondition::ContextBelow(_)
         | PreferenceCondition::ContextAbove(_)
         | PreferenceCondition::HourRange(_, _) => None,
@@ -1000,15 +1004,6 @@ mod tests {
     /// dropped — dropping it widens the rule past what the user agreed to.
     #[test]
     fn an_expressible_condition_becomes_a_matcher() {
-        let suggestion = one(
-            "Bash",
-            Some("cargo test"),
-            vec![PreferenceCondition::CostAbove(1.0)],
-        );
-        let parsed = crate::config::parse_config_file_for_test(&toml_of(&suggestion));
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].match_cost_above, Some(1.0), "{suggestion}");
-
         let flags = one(
             "Bash",
             Some("cargo test"),
@@ -1027,6 +1022,7 @@ mod tests {
     #[test]
     fn an_inexpressible_condition_is_not_emitted_as_a_rule() {
         for condition in [
+            PreferenceCondition::CostAbove(1.0),
             PreferenceCondition::CostBelow(1.0),
             PreferenceCondition::ContextAbove(80),
             PreferenceCondition::ContextBelow(20),
@@ -1043,7 +1039,7 @@ mod tests {
             "Bash",
             Some("cargo test"),
             vec![
-                PreferenceCondition::CostAbove(1.0),
+                PreferenceCondition::HasErrors,
                 PreferenceCondition::HourRange(8, 18),
             ],
         );
