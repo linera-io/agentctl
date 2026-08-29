@@ -596,10 +596,22 @@ pub fn distill_preferences(decisions: &[DecisionRecord]) -> DistilledPreferences
             continue; // Need at least 2 decisions to form a pattern
         }
         let group: Vec<&DecisionRecord> = indices.iter().map(|&i| &decisions_mut[i]).collect();
-        let brain_action = group
-            .first()
-            .map(|d| d.brain_action.clone())
-            .unwrap_or_default();
+
+        // `accept_rate` measures agreement with the brain across the WHOLE
+        // group, so it only names a preference if the brain said one thing
+        // throughout. Taking one record's verb would let the earliest decide.
+        let mut verbs: Vec<&str> = group
+            .iter()
+            .map(|d| d.brain_action.as_str())
+            .filter(|a| !a.is_empty())
+            .collect();
+        verbs.sort_unstable();
+        verbs.dedup();
+        let brain_action = match verbs.as_slice() {
+            [] => String::new(),
+            [only] => (*only).to_string(),
+            _ => continue,
+        };
 
         let accepted: u32 = group.iter().filter(|d| d.is_positive()).count() as u32;
         let rejected: u32 = group.iter().filter(|d| d.is_negative()).count() as u32;
@@ -1643,6 +1655,40 @@ mod tests {
             time_pattern,
             "Expected time-of-day temporal pattern, got: {:?}",
             patterns
+        );
+    }
+
+    /// `accept_rate` counts agreement across the whole group, so a group whose
+    /// brain verb varies names no preference — reading it off one record let
+    /// the earliest decide.
+    #[test]
+    fn a_group_with_mixed_brain_verbs_forms_no_pattern() {
+        let decisions: Vec<DecisionRecord> = (0..10)
+            .map(|i| DecisionRecord {
+                timestamp: i.to_string(),
+                pid: 42,
+                project: "proj".into(),
+                tool: Some("Bash".into()),
+                command: Some("rm -rf /tmp/x".into()),
+                brain_action: if i == 0 { "approve" } else { "deny" }.into(),
+                brain_confidence: 0.9,
+                brain_reasoning: String::new(),
+                user_action: "accept".into(),
+                context: Some(make_context(1.0, 50, false)),
+                outcome: None,
+                decision_type: DecisionType::Session,
+                suggested_at: None,
+            })
+            .collect();
+
+        let prefs = distill_preferences(&decisions);
+        assert!(
+            !prefs
+                .patterns
+                .iter()
+                .any(|p| p.preferred_action == "approve"),
+            "agreeing with nine denials must not distil to approve: {:?}",
+            prefs.patterns
         );
     }
 }
