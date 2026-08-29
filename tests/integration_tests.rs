@@ -799,10 +799,10 @@ fn cost_opus_tokens() {
 
     let cost = monitor::estimate_cost(&s);
     // plain_input = 1M - 500k - 200k = 300k
-    // cost = 300k/1M * 15 + 100k/1M * 75 + 500k/1M * 1.875 + 200k/1M * 18.75
-    //      = 0.3 * 15 + 0.1 * 75 + 0.5 * 1.875 + 0.2 * 18.75
-    //      = 4.5 + 7.5 + 0.9375 + 3.75 = 16.6875
-    let expected = 16.6875;
+    // Opus 4.5+ is $5/$25 per MTok, cache read 0.1x, cache write 1.25x.
+    // cost = 0.3 * 5 + 0.1 * 25 + 0.5 * 0.50 + 0.2 * 6.25
+    //      = 1.5 + 2.5 + 0.25 + 1.25 = 5.5
+    let expected = 5.5;
     assert!(
         (cost - expected).abs() < 0.001,
         "opus cost={cost}, expected={expected}"
@@ -838,9 +838,10 @@ fn cost_haiku_tokens() {
     s.cache_write_tokens = 0;
 
     let cost = monitor::estimate_cost(&s);
-    // plain_input = 100k
-    // cost = 100k/1M * 0.80 + 50k/1M * 4.0 = 0.08 + 0.2 = 0.28
-    let expected = 0.28;
+    // plain_input = 100k. Haiku 4.5 is $1/$5 per MTok (the old $0.80/$4 was
+    // Haiku 3.5's, and undercharged every Haiku 4.5 message).
+    // cost = 100k/1M * 1.0 + 50k/1M * 5.0 = 0.1 + 0.25 = 0.35
+    let expected = 0.35;
     assert!(
         (cost - expected).abs() < 0.001,
         "haiku cost={cost}, expected={expected}"
@@ -857,8 +858,9 @@ fn cost_unknown_model_defaults_to_opus() {
     s.cache_write_tokens = 0;
 
     let cost = monitor::estimate_cost(&s);
-    // Should use opus pricing: 1M/1M * 15 = 15.0
-    let expected = 15.0;
+    // Unknown models fall back to the current flagship-Opus tier, $5/MTok
+    // input (the old $15 was retired Opus 4.1 pricing): 1M/1M * 5 = 5.0.
+    let expected = 5.0;
     assert!(
         (cost - expected).abs() < 0.001,
         "unknown model cost={cost}, expected={expected}"
@@ -884,8 +886,9 @@ fn context_max_opus() {
 
 #[test]
 fn context_max_sonnet() {
-    assert_eq!(monitor::model_context_max("sonnet-4.6"), 200_000);
-    assert_eq!(monitor::model_context_max("sonnet"), 200_000);
+    // Sonnet 4.6 and Sonnet 5 both carry the 1M context window.
+    assert_eq!(monitor::model_context_max("sonnet-4.6"), 1_000_000);
+    assert_eq!(monitor::model_context_max("sonnet"), 1_000_000);
 }
 
 #[test]
@@ -930,7 +933,11 @@ fn shorten_model_sonnet_generic() {
 
 #[test]
 fn shorten_model_haiku() {
-    assert_eq!(monitor::shorten_model("claude-haiku-4-5-20251001"), "haiku");
+    // Labels now carry the version, because versions no longer share a price.
+    assert_eq!(
+        monitor::shorten_model("claude-haiku-4-5-20251001"),
+        "haiku-4.5"
+    );
 }
 
 #[test]

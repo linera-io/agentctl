@@ -11,6 +11,10 @@ pub struct TranscriptUsage {
     pub input_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
+    /// Portion of `cache_creation_input_tokens` written with a 1-hour TTL,
+    /// from `usage.cache_creation.ephemeral_1h_input_tokens`. Billed at 2x
+    /// base input rather than the 5-minute 1.25x.
+    pub cache_creation_1h_input_tokens: u64,
     pub output_tokens: u64,
 }
 
@@ -40,6 +44,11 @@ pub struct TranscriptMessage {
     /// a recognizable RFC-3339 `timestamp` field. Used to track when a user
     /// last interacted with the session.
     pub timestamp_ms: Option<u64>,
+    /// `<message.id>:<requestId>` — identifies the logical API response. One
+    /// response is written as many JSONL lines (streaming, multiple content
+    /// blocks) that all repeat the same cumulative `usage`, so this is what
+    /// makes usage accounting countable exactly once.
+    pub message_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,7 +163,16 @@ pub fn parse_line(line: &str) -> Option<TranscriptEvent> {
             .get("timestamp")
             .and_then(|v| v.as_str())
             .and_then(parse_rfc3339_utc_ms),
+        message_key: message_key(&entry, msg),
     }))
+}
+
+/// `<message.id>:<requestId>`, or `None` when either half is absent (user
+/// turns, synthetic entries, older transcripts).
+fn message_key(entry: &Value, msg: &Value) -> Option<String> {
+    let id = msg.get("id").and_then(|v| v.as_str())?;
+    let request = entry.get("requestId").and_then(|v| v.as_str())?;
+    Some(format!("{id}:{request}"))
 }
 
 /// Parse an RFC-3339 UTC timestamp like "2026-04-19T22:57:04.552Z" into unix
@@ -255,6 +273,11 @@ fn parse_usage(value: &Value) -> Option<TranscriptUsage> {
             .unwrap_or(0),
         cache_creation_input_tokens: value
             .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        cache_creation_1h_input_tokens: value
+            .get("cache_creation")
+            .and_then(|v| v.get("ephemeral_1h_input_tokens"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
         output_tokens: value
