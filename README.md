@@ -175,9 +175,9 @@ claudectl --stats --since 24h            # Aggregated cost statistics
 ## Auto-Rules
 
 ```toml
-[rules.approve-cargo]
+[rules.approve-cargo-test]
 match_tool = ["Bash"]
-match_command = ["cargo"]
+match_command = ["cargo test"]
 action = "approve"
 
 [rules.deny-rm-rf]
@@ -199,6 +199,11 @@ The table name is the rule name — `[rules.deny-rm-rf]`, not `[[rules]]` with a
 
 Rules match by tool, command, project, cost, provider, and error state. An
 omitted matcher means "any". Deny rules always take precedence.
+
+`match_command` is an unanchored, case-insensitive **substring** test against the
+whole command — not a glob and not an exact match. `["cargo"]` would also match
+`rm -rf ~/.cargo`, so on an approve rule prefer the narrowest string that
+identifies the command. `match_tool` and `match_provider` are exact matches.
 
 `action` must be one of `approve`, `deny`, `send`, `terminate` or `kill`; a rule
 with any other value is discarded with a warning rather than silently falling

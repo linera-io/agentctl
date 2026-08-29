@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use super::decisions::{DecisionRecord, DistilledPreferences};
 use super::insights::{Insight, InsightCategory, InsightSeverity, epoch_now};
 use super::preferences::PreferencePattern;
+use crate::rules::RuleAction;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Detection algorithms
@@ -348,12 +349,13 @@ pub(crate) fn detect_missing_rules(
             continue;
         }
 
-        // `preferred_action` is the brain's own verb, so it can be
-        // route/spawn/delegate — actions the rule language cannot express.
-        let Some(action) = crate::rules::RuleAction::parse(&p.preferred_action) else {
-            continue;
+        // Only approve and deny are safe to hand over: `send` would type the
+        // engine's "continue" default, `terminate`/`kill` destroy sessions, and
+        // route/spawn/delegate have no rule form.
+        let action = match RuleAction::parse(&p.preferred_action) {
+            Some(a @ (RuleAction::Approve | RuleAction::Deny)) => a.label(),
+            _ => continue,
         };
-        let action = action.label();
 
         let cmd_part = p
             .command_pattern
@@ -717,9 +719,16 @@ mod tests {
         let insights = detect_missing_rules(&[], &prefs);
         let suggestion = insights[0].suggestion.clone().expect("a suggestion");
 
+        // The path is whatever `product::project_config` resolves to — asserting
+        // it is never `.claudectl.toml` would contradict legacy resolution, which
+        // returns exactly that when only the legacy file exists.
         assert!(
-            !suggestion.contains(".claudectl.toml"),
-            "the config file was renamed: {suggestion}"
+            suggestion.contains(
+                &crate::product::project_config(std::path::Path::new("."))
+                    .display()
+                    .to_string()
+            ),
+            "the target must be the resolved config path: {suggestion}"
         );
 
         // Substring-matching the header would pass even when the header is
@@ -1024,13 +1033,23 @@ mod tests {
         );
     }
 
-    /// `preferred_action` carries the brain's verb, which may have no rule form.
+    /// Only approve and deny survive as a rule. `send` would type the engine's
+    /// "continue" default, `terminate`/`kill` would destroy sessions, and
+    /// route/spawn/delegate have no rule form at all.
     #[test]
     fn a_preference_the_rule_language_cannot_express_is_not_suggested() {
-        for action in ["route", "spawn", "delegate", ""] {
+        for action in [
+            "route",
+            "spawn",
+            "delegate",
+            "send",
+            "terminate",
+            "kill",
+            "",
+        ] {
             assert!(
                 detect_missing_rules(&[], &pattern(action, 1.0)).is_empty(),
-                "{action:?} has no rule syntax and must not be suggested"
+                "{action:?} must not be handed over as a pasteable rule"
             );
         }
     }
