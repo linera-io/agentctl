@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use super::decisions::{DecisionRecord, DistilledPreferences};
 use super::insights::{Insight, InsightCategory, InsightSeverity, epoch_now};
-use super::preferences::PreferencePattern;
+use super::preferences::{PreferenceCondition, PreferencePattern};
 use crate::rules::RuleAction;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -266,19 +266,43 @@ fn rule_slug(tool: &str, command: Option<&str>) -> String {
 /// truncates the line, and quotes are stripped.
 const UNQUOTABLE: [char; 4] = [',', '#', '"', '\''];
 
+/// The rule matcher expressing this condition, or `None` if the rule language
+/// has no equivalent (context level and time-of-day have no matcher).
+fn condition_matcher(condition: &PreferenceCondition) -> Option<String> {
+    match condition {
+        PreferenceCondition::CostAbove(usd) => Some(format!("match_cost_above = {usd}")),
+        PreferenceCondition::NoErrors => Some("match_last_error = false".to_string()),
+        PreferenceCondition::HasErrors => Some("match_last_error = true".to_string()),
+        PreferenceCondition::NoFileConflict => Some("match_file_conflict = false".to_string()),
+        PreferenceCondition::HasFileConflict => Some("match_file_conflict = true".to_string()),
+        PreferenceCondition::CostBelow(_)
+        | PreferenceCondition::ContextBelow(_)
+        | PreferenceCondition::ContextAbove(_)
+        | PreferenceCondition::HourRange(_, _) => None,
+    }
+}
+
 /// Paste-ready TOML for one detected pattern, or prose where no exact rule can
 /// be produced — the user pastes this verbatim, so a near-miss is worse than none.
 fn rule_suggestion(action: &str, pattern: &PreferencePattern) -> String {
     let target = crate::product::project_config(std::path::Path::new("."));
     let command = pattern.command_pattern.as_deref();
 
-    if !pattern.conditions.is_empty() {
+    // Five of the nine conditions have an exact matcher; a pattern carrying any
+    // of the rest cannot be stated as a rule, and dropping it silently would
+    // widen the rule to cases the user never agreed to.
+    let Some(condition_lines) = pattern
+        .conditions
+        .iter()
+        .map(condition_matcher)
+        .collect::<Option<Vec<_>>>()
+    else {
         return format!(
-            "observed only under specific conditions, which auto-rules cannot \
-             express — review before adding a rule for [{}]",
+            "observed only under a condition auto-rules cannot express — review \
+             before adding a rule for [{}]",
             pattern.tool
         );
-    }
+    };
 
     // `distill_preferences` uses "*" when a decision carries no tool, but
     // `match_tool` is an exact-equality test: nothing is named "*", so the rule
@@ -307,6 +331,10 @@ fn rule_suggestion(action: &str, pattern: &PreferencePattern) -> String {
     let command_line = command
         .map(|c| format!("\nmatch_command = [\"{c}\"]"))
         .unwrap_or_default();
+    let condition_block = condition_lines
+        .iter()
+        .map(|l| format!("\n{l}"))
+        .collect::<String>();
 
     // `match_command` is a substring test and the pattern is only the command's
     // first two tokens, so an approve covers more than was ever observed. A
@@ -317,7 +345,7 @@ fn rule_suggestion(action: &str, pattern: &PreferencePattern) -> String {
     };
 
     format!(
-        "add to {}:\n{caveat}[rules.{}-{}]\nmatch_tool = [\"{}\"]{command_line}\naction = \"{action}\"",
+        "add to {}:\n{caveat}[rules.{}-{}]\nmatch_tool = [\"{}\"]{command_line}{condition_block}\naction = \"{action}\"",
         target.display(),
         action,
         rule_slug(&pattern.tool, command),
@@ -554,7 +582,6 @@ mod tests {
         DecisionContext, DecisionType, DistilledPreferences, PreferencePattern, TemporalPattern,
         ToolAccuracy,
     };
-    use crate::brain::preferences::PreferenceCondition;
 
     fn make_decision(tool: &str, command: &str, user_action: &str, pid: u32) -> DecisionRecord {
         DecisionRecord {
@@ -969,17 +996,60 @@ mod tests {
         assert_eq!(parsed[0].match_command, vec!["rm -rf".to_string()]);
     }
 
-    /// Dropping the condition would invert the learned behaviour on the deny half.
+    /// A condition with an exact matcher must be carried into the rule, not
+    /// dropped — dropping it widens the rule past what the user agreed to.
     #[test]
-    fn a_conditional_preference_is_not_emitted_as_a_rule() {
+    fn an_expressible_condition_becomes_a_matcher() {
         let suggestion = one(
             "Bash",
             Some("cargo test"),
             vec![PreferenceCondition::CostAbove(1.0)],
         );
+        let parsed = crate::config::parse_config_file_for_test(&toml_of(&suggestion));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].match_cost_above, Some(1.0), "{suggestion}");
+
+        let flags = one(
+            "Bash",
+            Some("cargo test"),
+            vec![
+                PreferenceCondition::HasErrors,
+                PreferenceCondition::NoFileConflict,
+            ],
+        );
+        let parsed = crate::config::parse_config_file_for_test(&toml_of(&flags));
+        assert_eq!(parsed[0].match_last_error, Some(true), "{flags}");
+        assert_eq!(parsed[0].match_file_conflict, Some(false), "{flags}");
+    }
+
+    /// A condition with no matcher must fall back to prose, and one
+    /// inexpressible condition taints the whole set.
+    #[test]
+    fn an_inexpressible_condition_is_not_emitted_as_a_rule() {
+        for condition in [
+            PreferenceCondition::CostBelow(1.0),
+            PreferenceCondition::ContextAbove(80),
+            PreferenceCondition::ContextBelow(20),
+            PreferenceCondition::HourRange(8, 18),
+        ] {
+            let suggestion = one("Bash", Some("cargo test"), vec![condition.clone()]);
+            assert!(
+                !suggestion.contains("[rules."),
+                "{condition:?} has no matcher and must not become a rule: {suggestion}"
+            );
+        }
+
+        let mixed = one(
+            "Bash",
+            Some("cargo test"),
+            vec![
+                PreferenceCondition::CostAbove(1.0),
+                PreferenceCondition::HourRange(8, 18),
+            ],
+        );
         assert!(
-            !suggestion.contains("[rules."),
-            "a condition auto-rules cannot express must not become a rule: {suggestion}"
+            !mixed.contains("[rules."),
+            "one inexpressible condition must taint the set: {mixed}"
         );
     }
 
