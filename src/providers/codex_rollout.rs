@@ -43,6 +43,85 @@ struct Line {
     #[serde(rename = "type")]
     kind: Option<String>,
     payload: Option<serde_json::Value>,
+    /// Position of the line within the rollout. Stable across re-reads, so it
+    /// is what makes a usage row identifiable rather than merely re-appended.
+    ordinal: Option<u64>,
+}
+
+/// One turn's token usage, as a delta.
+///
+/// Codex reports `total_token_usage` as a running total for the session, so a
+/// row per event would re-bill the whole session every turn — the same
+/// over-counting that made the Claude ledger read 11x high. These are the
+/// differences between successive snapshots, which sum to the session total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageEvent {
+    /// `<session or file stem>:<ordinal>` is unique and stable, so re-reading
+    /// a rollout produces the same rows rather than duplicates.
+    pub ordinal: u64,
+    pub timestamp: Option<String>,
+    /// The model in force at this point — `turn_context` is re-emitted per
+    /// turn, and a session can change model mid-flight.
+    pub model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// Per-turn token deltas from a rollout.
+///
+/// `last_token_usage` looks like the same thing, but it is only present on some
+/// events and nothing guarantees the series partitions the total; differencing
+/// the cumulative figure is exact by construction and needs no such assumption.
+pub fn usage_events(contents: &str) -> Vec<UsageEvent> {
+    let mut out = Vec::new();
+    let mut model: Option<String> = None;
+    let mut prev_input = 0u64;
+    let mut prev_output = 0u64;
+
+    for (idx, raw) in contents.lines().enumerate() {
+        let Ok(line) = serde_json::from_str::<Line>(raw) else {
+            continue;
+        };
+        let (Some(kind), Some(payload)) = (line.kind.as_deref(), line.payload.as_ref()) else {
+            continue;
+        };
+        if kind == "turn_context" {
+            if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
+                model = Some(m.to_string());
+            }
+            continue;
+        }
+        if kind != "event_msg"
+            || payload.get("type").and_then(|v| v.as_str()) != Some("token_count")
+        {
+            continue;
+        }
+        let Some(total) = payload.get("info").and_then(|i| i.get("total_token_usage")) else {
+            continue;
+        };
+        let field = |k: &str| {
+            total
+                .get(k)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        let (input, output) = (field("input_tokens"), field("output_tokens"));
+
+        // Saturating: a counter that goes backwards is not a negative cost.
+        let event = UsageEvent {
+            ordinal: line.ordinal.unwrap_or(idx as u64),
+            timestamp: line.timestamp.clone(),
+            model: model.clone(),
+            input_tokens: input.saturating_sub(prev_input),
+            output_tokens: output.saturating_sub(prev_output),
+        };
+        prev_input = input.max(prev_input);
+        prev_output = output.max(prev_output);
+        if event.input_tokens > 0 || event.output_tokens > 0 {
+            out.push(event);
+        }
+    }
+    out
 }
 
 /// Fold a rollout's lines into a summary.
@@ -190,4 +269,88 @@ fn modified_since(path: &Path, since_ms: u64) -> bool {
         return true;
     };
     age.as_millis() as u64 >= since_ms
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    const MULTI: &str = include_str!("../../tests/fixtures/codex/rollout-multi-turn.jsonl");
+    const BASIC: &str = include_str!("../../tests/fixtures/codex/rollout-basic.jsonl");
+
+    /// Codex reports a running total, so the events must be differenced. The
+    /// deltas must also sum back to the session total — that is what makes the
+    /// ledger's per-turn rows add up to what Codex says was spent.
+    #[test]
+    fn cumulative_totals_become_per_turn_deltas() {
+        let events = usage_events(MULTI);
+        assert_eq!(events.len(), 3, "one row per token_count event");
+
+        assert_eq!(
+            (events[0].input_tokens, events[0].output_tokens),
+            (12_000, 800)
+        );
+        assert_eq!(
+            (events[1].input_tokens, events[1].output_tokens),
+            (13_000, 700)
+        );
+        assert_eq!(
+            (events[2].input_tokens, events[2].output_tokens),
+            (15_000, 900)
+        );
+
+        let summed: (u64, u64) = events.iter().fold((0, 0), |acc, e| {
+            (acc.0 + e.input_tokens, acc.1 + e.output_tokens)
+        });
+        assert_eq!(
+            summed,
+            (40_000, 2_400),
+            "deltas must sum to the session total"
+        );
+    }
+
+    /// A session can change model mid-flight; each turn bills at the model in
+    /// force when it ran, not at whatever the session ended on.
+    #[test]
+    fn each_turn_carries_the_model_in_force_at_the_time() {
+        let events = usage_events(MULTI);
+        assert_eq!(events[0].model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(events[1].model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(events[2].model.as_deref(), Some("gpt-5.4"));
+    }
+
+    /// The ordinal is what keys the row, so re-reading a rollout must produce
+    /// the same identities rather than duplicates.
+    #[test]
+    fn ordinals_are_stable_across_reads() {
+        let a = usage_events(MULTI);
+        let b = usage_events(MULTI);
+        assert_eq!(a, b);
+        assert_eq!(
+            a.iter().map(|e| e.ordinal).collect::<Vec<_>>(),
+            vec![3, 4, 6]
+        );
+    }
+
+    /// A rollout that is still being written ends mid-line; that must yield the
+    /// turns so far, not nothing.
+    #[test]
+    fn a_truncated_rollout_yields_the_complete_turns() {
+        let cut = &MULTI[..MULTI.len() - 40];
+        let events = usage_events(cut);
+        assert!(
+            !events.is_empty(),
+            "complete turns must survive a partial tail"
+        );
+    }
+
+    #[test]
+    fn a_single_turn_rollout_bills_its_whole_total() {
+        let events = usage_events(BASIC);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            (events[0].input_tokens, events[0].output_tokens),
+            (12_000, 800)
+        );
+    }
 }

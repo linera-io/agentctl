@@ -297,9 +297,11 @@ fn find_jsonl_files_cached(root: &Path) -> Vec<PathBuf> {
         all.extend(dc.files.iter().cloned());
     }
 
-    // Project subdir was deleted since last scan ⇒ drop its cache
-    // entry so memory doesn't accrete forever.
-    cache.retain(|k, _| seen_subdirs.contains(k));
+    // Project subdir was deleted since last scan ⇒ drop its cache entry so
+    // memory doesn't accrete forever. Scoped to children of `root`: the cache
+    // is global but `seen_subdirs` only describes the root just scanned, so an
+    // unscoped retain would evict every other root's entries.
+    cache.retain(|k, _| k.parent() != Some(root) || seen_subdirs.contains(k));
 
     all
 }
@@ -417,7 +419,16 @@ pub fn scan_and_append() -> ScanReport {
         &ledger_path(),
         &offsets_path(),
         &dirs_home().join(".claude").join("sessions"),
+        &codex_sessions_dir(),
     )
+}
+
+/// Where Codex keeps its rollouts. `CODEX_HOME` wins, matching `discovery`.
+fn codex_sessions_dir() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs_home().join(".codex"))
+        .join("sessions")
 }
 
 fn dirs_home() -> PathBuf {
@@ -433,6 +444,7 @@ pub fn scan_and_append_at(
     ledger: &Path,
     offsets_file: &Path,
     sessions_dir: &Path,
+    codex_sessions_root: &Path,
 ) -> ScanReport {
     if let Some(parent) = ledger.parent() {
         if fs::create_dir_all(parent).is_err() {
@@ -443,7 +455,13 @@ pub fn scan_and_append_at(
     // Migration, append and compaction all rewrite or extend the same file and
     // must be exclusive against other scanners — including other processes.
     with_ledger_lock(ledger, || {
-        scan_and_append_locked(projects_root, ledger, offsets_file, sessions_dir)
+        scan_and_append_locked(
+            projects_root,
+            ledger,
+            offsets_file,
+            sessions_dir,
+            codex_sessions_root,
+        )
     })
     .unwrap_or_default()
 }
@@ -453,6 +471,7 @@ fn scan_and_append_locked(
     ledger: &Path,
     offsets_file: &Path,
     sessions_dir: &Path,
+    codex_sessions_root: &Path,
 ) -> ScanReport {
     migrate_v1_ledger(ledger, offsets_file);
 
@@ -608,6 +627,13 @@ fn scan_and_append_locked(
         );
     }
 
+    append_codex_rows(
+        codex_sessions_root,
+        &mut ledger_out,
+        &mut offsets,
+        &mut report,
+    );
+
     let _ = ledger_out.flush();
     drop(ledger_out);
     save_offsets_at(offsets_file, &offsets);
@@ -761,6 +787,73 @@ fn with_ledger_lock<T>(ledger: &Path, body: impl FnOnce() -> T) -> std::io::Resu
     let result = body();
     unsafe { libc::flock(fd, libc::LOCK_UN) };
     Ok(result)
+}
+
+/// Append one row per Codex turn.
+///
+/// Unlike a Claude transcript, a rollout is re-read in full whenever it
+/// changes rather than tailed from an offset. Codex reports a *running total*,
+/// so a turn's cost is the difference from the previous snapshot — and a tail
+/// read starting mid-file has no previous snapshot to subtract, which would
+/// bill that turn for the whole session to date. Re-reading is affordable
+/// because rollouts are per-session and few next to the Claude tree, and the
+/// rows are keyed, so re-appending them changes no total.
+fn append_codex_rows(
+    root: &Path,
+    ledger_out: &mut impl Write,
+    offsets: &mut OffsetMap,
+    report: &mut ScanReport,
+) {
+    for rollout in crate::providers::codex_rollout::discover_rollout_files(root) {
+        let key = rollout.display().to_string();
+        let Some((mtime, size)) = metadata_mtime_len(&rollout) else {
+            continue;
+        };
+        report.files_scanned += 1;
+        if let Some(prev) = offsets.get(&key) {
+            if prev.mtime_ms == mtime && prev.last_byte == size {
+                continue;
+            }
+        }
+        let Ok(contents) = fs::read_to_string(&rollout) else {
+            continue;
+        };
+        let sid = session_id_from_path(&rollout);
+        let mut appended = 0u64;
+        for event in crate::providers::codex_rollout::usage_events(&contents) {
+            let ts = event
+                .timestamp
+                .as_deref()
+                .and_then(crate::transcript::parse_rfc3339_utc_ms)
+                .unwrap_or(mtime);
+            let row = format!(
+                "{},{},{},{},0,0,0,{},{}",
+                ts,
+                csv_escape(&sid),
+                csv_escape(event.model.as_deref().unwrap_or("")),
+                event.input_tokens,
+                event.output_tokens,
+                csv_escape(&format!("codex:{sid}:{}", event.ordinal)),
+            );
+            if writeln!(ledger_out, "{row}").is_ok() {
+                appended += 1;
+            }
+        }
+        if appended > 0 {
+            report.files_updated += 1;
+            report.rows_appended += appended;
+        }
+        offsets.insert(
+            key,
+            FileOffset {
+                last_byte: size,
+                mtime_ms: mtime,
+                // Never drained: the rollout of a live session keeps growing,
+                // and we have no writer-liveness signal for Codex here.
+                drained: false,
+            },
+        );
+    }
 }
 
 /// Retire a v1 ledger and rebuild from the transcripts.
@@ -1011,6 +1104,7 @@ mod tests {
         ledger: PathBuf,
         offsets: PathBuf,
         sessions: PathBuf,
+        codex: PathBuf,
     }
 
     impl TestPaths {
@@ -1025,20 +1119,29 @@ mod tests {
             let projects = root.join("projects");
             let share = root.join("share");
             let sessions = root.join("sessions");
+            let codex = root.join("codex-sessions");
             fs::create_dir_all(&projects).unwrap();
             fs::create_dir_all(&share).unwrap();
             fs::create_dir_all(&sessions).unwrap();
+            fs::create_dir_all(&codex).unwrap();
             Self {
                 ledger: share.join("usage_log.csv"),
                 offsets: share.join("usage_offsets.json"),
                 projects,
                 sessions,
+                codex,
                 _root: root,
             }
         }
 
         fn scan(&self) -> ScanReport {
-            scan_and_append_at(&self.projects, &self.ledger, &self.offsets, &self.sessions)
+            scan_and_append_at(
+                &self.projects,
+                &self.ledger,
+                &self.offsets,
+                &self.sessions,
+                &self.codex,
+            )
         }
 
         /// Mark the JSONL named `<session_id>.jsonl` as having a live writer
@@ -1224,6 +1327,122 @@ mod tests {
             files.len(),
             1,
             "cache must still short-circuit inside the interval"
+        );
+    }
+
+    /// Codex rollouts must reach the ledger, billed per turn at the model each
+    /// turn actually ran on.
+    #[test]
+    fn codex_rollouts_are_ingested_per_turn() {
+        let p = TestPaths::new("codex-ingest");
+        let day = p.codex.join("2026/08/24");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-multi.jsonl"),
+            include_str!("../tests/fixtures/codex/rollout-multi-turn.jsonl"),
+        )
+        .unwrap();
+
+        let report = p.scan();
+        assert_eq!(report.rows_appended, 3, "one row per token_count event");
+
+        let s = p.summary(0);
+        assert_eq!(s.msg_count, 3);
+        // Deltas, not three copies of the running total.
+        assert_eq!(s.fresh_input, 40_000);
+        assert_eq!(s.output, 2_400);
+    }
+
+    /// A rollout re-read after it grows must not re-bill the turns already
+    /// counted — the whole point of keying rows by ordinal.
+    #[test]
+    fn rescanning_a_codex_rollout_does_not_double_count() {
+        let p = TestPaths::new("codex-rescan");
+        let day = p.codex.join("2026/08/24");
+        fs::create_dir_all(&day).unwrap();
+        let path = day.join("rollout-multi.jsonl");
+        let full = include_str!("../tests/fixtures/codex/rollout-multi-turn.jsonl");
+        fs::write(&path, full).unwrap();
+
+        p.scan();
+        let first = p.summary(0);
+
+        // Touch it so the mtime/size gate re-reads the whole file.
+        fs::write(&path, format!("{full}\n")).unwrap();
+        p.scan();
+        let second = p.summary(0);
+
+        assert_eq!(first.msg_count, 3);
+        assert_eq!(second, first, "a re-read must not change any total");
+    }
+
+    /// Codex sessions and Claude sessions land in one ledger, so the windows
+    /// cover the whole fleet rather than one product.
+    #[test]
+    fn claude_and_codex_usage_share_the_ledger() {
+        let p = TestPaths::new("codex-mixed");
+        write_tmp(
+            &p.projects.join("-test/sess-claude.jsonl"),
+            &fixture_assistant_line("2026-08-24T10:00:00.000Z", "claude-opus-5", 100, 0, 0, 50),
+        );
+        let day = p.codex.join("2026/08/24");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-multi.jsonl"),
+            include_str!("../tests/fixtures/codex/rollout-multi-turn.jsonl"),
+        )
+        .unwrap();
+
+        p.scan();
+        let s = p.summary(0);
+        assert_eq!(s.msg_count, 4, "1 Claude message + 3 Codex turns");
+        assert_eq!(s.fresh_input, 100 + 40_000);
+        assert_eq!(s.output, 50 + 2_400);
+    }
+
+    /// The feed is what prices Codex: `gpt-5-codex` has no entry in the static
+    /// table, so without it a Codex turn falls back to the flagship-Opus tier
+    /// and bills ~4x what it cost.
+    #[test]
+    fn codex_turns_are_priced_from_the_feed() {
+        let p = TestPaths::new("codex-priced");
+        let day = p.codex.join("2026/08/24");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-multi.jsonl"),
+            include_str!("../tests/fixtures/codex/rollout-multi-turn.jsonl"),
+        )
+        .unwrap();
+        p.scan();
+
+        // Published gpt-5-codex rates: $1.25 input / $10 output per MTok.
+        crate::models::set_feed_prices(std::collections::HashMap::from([(
+            "gpt-5-codex".to_string(),
+            crate::models::ModelProfile {
+                input_per_m: 1.25,
+                output_per_m: 10.0,
+                cache_read_per_m: 0.125,
+                cache_write_per_m: 1.25,
+                cache_write_1h_per_m: 1.25,
+                context_max: 272_000,
+            },
+        )]));
+        let priced = p.summary(0);
+        crate::models::set_feed_prices(std::collections::HashMap::new());
+        let unpriced = p.summary(0);
+
+        // Turns 1-2 are gpt-5-codex (25k in / 1.5k out); turn 3 switched to
+        // gpt-5.4, which the feed here does not carry.
+        let expected_codex = (25_000.0 * 1.25 + 1_500.0 * 10.0) / 1_000_000.0;
+        assert!(
+            priced.cost_usd > expected_codex,
+            "the two gpt-5-codex turns must at least cost their feed price"
+        );
+        assert!(
+            priced.cost_usd < unpriced.cost_usd,
+            "feed pricing must beat the Opus-tier fallback, got {:.4} vs {:.4}",
+            priced.cost_usd,
+            unpriced.cost_usd
         );
     }
 
@@ -1863,7 +2082,7 @@ mod tests {
         .join("\n");
         fs::write(&project, format!("{body}\n")).unwrap();
 
-        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions, &p.codex);
         let s = load_summary_at(&p.ledger, 0);
         assert_eq!(s.msg_count, 1, "three lines are one response");
         assert_eq!(
@@ -1890,12 +2109,12 @@ mod tests {
         );
         fs::write(&project, format!("{line}\n{line}\n")).unwrap();
 
-        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions, &p.codex);
         let first = load_summary_at(&p.ledger, 0);
 
         // Rewrite shorter, forcing the truncation branch to re-append.
         fs::write(&project, format!("{line}\n")).unwrap();
-        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions, &p.codex);
         let second = load_summary_at(&p.ledger, 0);
 
         assert_eq!(first.msg_count, 1);
@@ -1912,7 +2131,7 @@ mod tests {
         let line = r#"{"type":"assistant","timestamp":"2026-04-22T10:00:00.000Z","requestId":"req_c","message":{"id":"msg_c","role":"assistant","model":"claude-opus-5","usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":1000000,"cache_creation":{"ephemeral_1h_input_tokens":1000000},"output_tokens":0},"content":[]}}"#;
         fs::write(&project, format!("{line}\n")).unwrap();
 
-        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions, &p.codex);
         let s = load_summary_at(&p.ledger, 0);
         assert_eq!(s.cache_write, 1_000_000);
         // 1M tokens x $10/MTok (2x the $5 base), not $6.25 (1.25x).
@@ -2029,13 +2248,19 @@ mod tests {
             for _ in 0..4 {
                 scope.spawn(|| {
                     while !done.load(std::sync::atomic::Ordering::Acquire) {
-                        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+                        scan_and_append_at(
+                            &p.projects,
+                            &p.ledger,
+                            &p.offsets,
+                            &p.sessions,
+                            &p.codex,
+                        );
                     }
                 });
             }
         });
         // Final pass so anything written after the last scan is ingested.
-        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions, &p.codex);
 
         let s = load_summary_at(&p.ledger, 0);
         COMPACT_THRESHOLD_BYTES.store(64 * 1024 * 1024, std::sync::atomic::Ordering::Relaxed);
