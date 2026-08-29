@@ -23,6 +23,7 @@ mod logger;
 mod models;
 mod monitor;
 mod orchestrator;
+mod pricing_feed;
 mod process;
 mod product;
 mod reaper;
@@ -437,6 +438,8 @@ fn run_main(cli: Cli) -> io::Result<()> {
     }
 
     models::set_overrides(cfg.model_overrides.clone());
+    // After overrides, so a user price always wins over the feed.
+    pricing_feed::install_and_refresh();
     let filters = ViewFilters {
         status_filter: commands::parse_status_filter(cli.filter_status.as_deref())?,
         focus_filter: commands::parse_focus_filter(cli.focus.as_deref())?,

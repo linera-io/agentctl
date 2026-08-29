@@ -22,6 +22,7 @@ pub mod logger;
 pub mod models;
 pub mod monitor;
 pub mod orchestrator;
+pub mod pricing_feed;
 pub mod process;
 pub mod product;
 pub mod provider;

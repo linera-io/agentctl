@@ -214,10 +214,29 @@ fn read_live_session_ids(sessions_dir: &Path) -> std::collections::HashSet<Strin
 /// project subdir's mtime moves (i.e. within ≤30 s of session start)
 /// instead of waiting for a full re-walk timer. Steady-state cost: 1
 /// read_dir of projects_root (~36 entries) + 36 stats = ~10 ms.
+///
+/// That mtime test is necessary but not sufficient: mtime moves for
+/// *direct* children only, while the walk is recursive. A subagent
+/// transcript written to `<project>/<session>/subagents/` leaves the
+/// project subdir's mtime untouched, so a cache keyed on it alone never
+/// sees the file — on a real tree the great majority of transcripts are
+/// nested like that. `REWALK_AFTER_MS` bounds how long such a file can
+/// stay invisible.
 #[derive(Default)]
 struct SubdirCache {
     last_mtime_ms: u64,
+    last_walk_ms: u64,
     files: Vec<PathBuf>,
+}
+
+/// Re-walk a project subdir at least this often, whatever its mtime says.
+/// Bounds the staleness the mtime test cannot see; a full walk of a heavy
+/// tree is ~500 ms, so once a minute per subdir is cheap against a 30 s
+/// scan cadence.
+static REWALK_AFTER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(60_000);
+
+fn rewalk_after_ms() -> u64 {
+    REWALK_AFTER_MS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 type FileListCache = HashMap<PathBuf, SubdirCache>;
@@ -265,19 +284,24 @@ fn find_jsonl_files_cached(root: &Path) -> Vec<PathBuf> {
         let mtime = dir_mtime_ms(&path);
         seen_subdirs.insert(path.clone());
 
+        let now = now_ms();
         let dc = cache.entry(path.clone()).or_default();
-        if dc.last_mtime_ms != mtime {
+        let aged_out = now.saturating_sub(dc.last_walk_ms) >= rewalk_after_ms();
+        if dc.last_mtime_ms != mtime || aged_out {
             let mut walked = Vec::new();
             walk_jsonls_into(&path, &mut walked);
             dc.files = walked;
             dc.last_mtime_ms = mtime;
+            dc.last_walk_ms = now;
         }
         all.extend(dc.files.iter().cloned());
     }
 
-    // Project subdir was deleted since last scan ⇒ drop its cache
-    // entry so memory doesn't accrete forever.
-    cache.retain(|k, _| seen_subdirs.contains(k));
+    // Project subdir was deleted since last scan ⇒ drop its cache entry so
+    // memory doesn't accrete forever. Scoped to children of `root`: the cache
+    // is global but `seen_subdirs` only describes the root just scanned, so an
+    // unscoped retain would evict every other root's entries.
+    cache.retain(|k, _| k.parent() != Some(root) || seen_subdirs.contains(k));
 
     all
 }
@@ -395,7 +419,16 @@ pub fn scan_and_append() -> ScanReport {
         &ledger_path(),
         &offsets_path(),
         &dirs_home().join(".claude").join("sessions"),
+        &codex_sessions_dir(),
     )
+}
+
+/// Where Codex keeps its rollouts. `CODEX_HOME` wins, matching `discovery`.
+fn codex_sessions_dir() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs_home().join(".codex"))
+        .join("sessions")
 }
 
 fn dirs_home() -> PathBuf {
@@ -411,6 +444,7 @@ pub fn scan_and_append_at(
     ledger: &Path,
     offsets_file: &Path,
     sessions_dir: &Path,
+    codex_sessions_root: &Path,
 ) -> ScanReport {
     if let Some(parent) = ledger.parent() {
         if fs::create_dir_all(parent).is_err() {
@@ -421,7 +455,13 @@ pub fn scan_and_append_at(
     // Migration, append and compaction all rewrite or extend the same file and
     // must be exclusive against other scanners — including other processes.
     with_ledger_lock(ledger, || {
-        scan_and_append_locked(projects_root, ledger, offsets_file, sessions_dir)
+        scan_and_append_locked(
+            projects_root,
+            ledger,
+            offsets_file,
+            sessions_dir,
+            codex_sessions_root,
+        )
     })
     .unwrap_or_default()
 }
@@ -431,6 +471,7 @@ fn scan_and_append_locked(
     ledger: &Path,
     offsets_file: &Path,
     sessions_dir: &Path,
+    codex_sessions_root: &Path,
 ) -> ScanReport {
     migrate_v1_ledger(ledger, offsets_file);
 
@@ -586,6 +627,13 @@ fn scan_and_append_locked(
         );
     }
 
+    append_codex_rows(
+        codex_sessions_root,
+        &mut ledger_out,
+        &mut offsets,
+        &mut report,
+    );
+
     let _ = ledger_out.flush();
     drop(ledger_out);
     save_offsets_at(offsets_file, &offsets);
@@ -739,6 +787,73 @@ fn with_ledger_lock<T>(ledger: &Path, body: impl FnOnce() -> T) -> std::io::Resu
     let result = body();
     unsafe { libc::flock(fd, libc::LOCK_UN) };
     Ok(result)
+}
+
+/// Append one row per Codex turn.
+///
+/// Unlike a Claude transcript, a rollout is re-read in full whenever it
+/// changes rather than tailed from an offset. Codex reports a *running total*,
+/// so a turn's cost is the difference from the previous snapshot — and a tail
+/// read starting mid-file has no previous snapshot to subtract, which would
+/// bill that turn for the whole session to date. Re-reading is affordable
+/// because rollouts are per-session and few next to the Claude tree, and the
+/// rows are keyed, so re-appending them changes no total.
+fn append_codex_rows(
+    root: &Path,
+    ledger_out: &mut impl Write,
+    offsets: &mut OffsetMap,
+    report: &mut ScanReport,
+) {
+    for rollout in crate::providers::codex_rollout::discover_rollout_files(root) {
+        let key = rollout.display().to_string();
+        let Some((mtime, size)) = metadata_mtime_len(&rollout) else {
+            continue;
+        };
+        report.files_scanned += 1;
+        if let Some(prev) = offsets.get(&key) {
+            if prev.mtime_ms == mtime && prev.last_byte == size {
+                continue;
+            }
+        }
+        let Ok(contents) = fs::read_to_string(&rollout) else {
+            continue;
+        };
+        let sid = session_id_from_path(&rollout);
+        let mut appended = 0u64;
+        for event in crate::providers::codex_rollout::usage_events(&contents) {
+            let ts = event
+                .timestamp
+                .as_deref()
+                .and_then(crate::transcript::parse_rfc3339_utc_ms)
+                .unwrap_or(mtime);
+            let row = format!(
+                "{},{},{},{},0,0,0,{},{}",
+                ts,
+                csv_escape(&sid),
+                csv_escape(event.model.as_deref().unwrap_or("")),
+                event.input_tokens,
+                event.output_tokens,
+                csv_escape(&format!("codex:{sid}:{}", event.ordinal)),
+            );
+            if writeln!(ledger_out, "{row}").is_ok() {
+                appended += 1;
+            }
+        }
+        if appended > 0 {
+            report.files_updated += 1;
+            report.rows_appended += appended;
+        }
+        offsets.insert(
+            key,
+            FileOffset {
+                last_byte: size,
+                mtime_ms: mtime,
+                // Never drained: the rollout of a live session keeps growing,
+                // and we have no writer-liveness signal for Codex here.
+                drained: false,
+            },
+        );
+    }
 }
 
 /// Retire a v1 ledger and rebuild from the transcripts.
@@ -989,6 +1104,7 @@ mod tests {
         ledger: PathBuf,
         offsets: PathBuf,
         sessions: PathBuf,
+        codex: PathBuf,
     }
 
     impl TestPaths {
@@ -1003,20 +1119,29 @@ mod tests {
             let projects = root.join("projects");
             let share = root.join("share");
             let sessions = root.join("sessions");
+            let codex = root.join("codex-sessions");
             fs::create_dir_all(&projects).unwrap();
             fs::create_dir_all(&share).unwrap();
             fs::create_dir_all(&sessions).unwrap();
+            fs::create_dir_all(&codex).unwrap();
             Self {
                 ledger: share.join("usage_log.csv"),
                 offsets: share.join("usage_offsets.json"),
                 projects,
                 sessions,
+                codex,
                 _root: root,
             }
         }
 
         fn scan(&self) -> ScanReport {
-            scan_and_append_at(&self.projects, &self.ledger, &self.offsets, &self.sessions)
+            scan_and_append_at(
+                &self.projects,
+                &self.ledger,
+                &self.offsets,
+                &self.sessions,
+                &self.codex,
+            )
         }
 
         /// Mark the JSONL named `<session_id>.jsonl` as having a live writer
@@ -1131,6 +1256,202 @@ mod tests {
         assert_eq!(summary.msg_count, 2);
         assert_eq!(summary.fresh_input, 40);
         assert_eq!(summary.output, 12);
+    }
+
+    /// A transcript created in a NESTED directory must still be discovered.
+    /// The cache keys on the top-level project subdir's mtime but walks
+    /// recursively, so a file added under `<project>/<session>/subagents/`
+    /// leaves that mtime untouched and was previously invisible until some
+    /// unrelated change moved the parent. Most transcripts on a real tree are
+    /// nested like that.
+    #[test]
+    fn nested_subagent_transcripts_are_discovered_after_the_first_scan() {
+        let _g = rewalk_test_lock();
+        // Force the age-based re-walk rather than sleeping out the interval.
+        let restore = rewalk_after_ms();
+        REWALK_AFTER_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let p = TestPaths::new("nested-discovery");
+        let top = p.projects.join("-test");
+        let nested = top.join("sess-parent/subagents");
+        fs::create_dir_all(&nested).unwrap();
+
+        // First scan establishes the cached listing for `-test`.
+        write_tmp(
+            &top.join("sess-parent.jsonl"),
+            &fixture_assistant_line("2026-04-22T10:00:00.000Z", "claude-opus-5", 10, 0, 0, 5),
+        );
+        let first = p.scan();
+        assert_eq!(first.rows_appended, 1, "parent transcript ingested");
+
+        // A subagent transcript appears in the nested dir. The top-level
+        // `-test` mtime does not change.
+        write_tmp(
+            &nested.join("agent-abc.jsonl"),
+            &fixture_assistant_line("2026-04-22T10:01:00.000Z", "claude-opus-5", 20, 0, 0, 7),
+        );
+        let second = p.scan();
+        REWALK_AFTER_MS.store(restore, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            second.rows_appended, 1,
+            "the nested subagent transcript must be discovered"
+        );
+    }
+
+    /// The re-walk is a bounded backstop, not a replacement for the cache: an
+    /// unchanged subdir inside the interval must still be served from cache.
+    #[test]
+    fn an_unchanged_subdir_is_not_rewalked_within_the_interval() {
+        let _g = rewalk_test_lock();
+        let restore = rewalk_after_ms();
+        REWALK_AFTER_MS.store(60_000, std::sync::atomic::Ordering::Relaxed);
+
+        let p = TestPaths::new("rewalk-fastpath");
+        let top = p.projects.join("-test");
+        let nested = top.join("sess-parent/subagents");
+        fs::create_dir_all(&nested).unwrap();
+        write_tmp(
+            &top.join("sess-parent.jsonl"),
+            &fixture_assistant_line("2026-04-22T10:00:00.000Z", "claude-opus-5", 10, 0, 0, 5),
+        );
+        let _ = find_jsonl_files_cached(&p.projects);
+
+        // Nested addition, parent mtime untouched, well inside the interval.
+        write_tmp(
+            &nested.join("agent-xyz.jsonl"),
+            &fixture_assistant_line("2026-04-22T10:01:00.000Z", "claude-opus-5", 20, 0, 0, 7),
+        );
+        let files = find_jsonl_files_cached(&p.projects);
+        REWALK_AFTER_MS.store(restore, std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            files.len(),
+            1,
+            "cache must still short-circuit inside the interval"
+        );
+    }
+
+    /// Codex rollouts must reach the ledger, billed per turn at the model each
+    /// turn actually ran on.
+    #[test]
+    fn codex_rollouts_are_ingested_per_turn() {
+        let p = TestPaths::new("codex-ingest");
+        let day = p.codex.join("2026/08/24");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-multi.jsonl"),
+            include_str!("../tests/fixtures/codex/rollout-multi-turn.jsonl"),
+        )
+        .unwrap();
+
+        let report = p.scan();
+        assert_eq!(report.rows_appended, 3, "one row per token_count event");
+
+        let s = p.summary(0);
+        assert_eq!(s.msg_count, 3);
+        // Deltas, not three copies of the running total.
+        assert_eq!(s.fresh_input, 40_000);
+        assert_eq!(s.output, 2_400);
+    }
+
+    /// A rollout re-read after it grows must not re-bill the turns already
+    /// counted — the whole point of keying rows by ordinal.
+    #[test]
+    fn rescanning_a_codex_rollout_does_not_double_count() {
+        let p = TestPaths::new("codex-rescan");
+        let day = p.codex.join("2026/08/24");
+        fs::create_dir_all(&day).unwrap();
+        let path = day.join("rollout-multi.jsonl");
+        let full = include_str!("../tests/fixtures/codex/rollout-multi-turn.jsonl");
+        fs::write(&path, full).unwrap();
+
+        p.scan();
+        let first = p.summary(0);
+
+        // Touch it so the mtime/size gate re-reads the whole file.
+        fs::write(&path, format!("{full}\n")).unwrap();
+        p.scan();
+        let second = p.summary(0);
+
+        assert_eq!(first.msg_count, 3);
+        assert_eq!(second, first, "a re-read must not change any total");
+    }
+
+    /// Codex sessions and Claude sessions land in one ledger, so the windows
+    /// cover the whole fleet rather than one product.
+    #[test]
+    fn claude_and_codex_usage_share_the_ledger() {
+        let p = TestPaths::new("codex-mixed");
+        write_tmp(
+            &p.projects.join("-test/sess-claude.jsonl"),
+            &fixture_assistant_line("2026-08-24T10:00:00.000Z", "claude-opus-5", 100, 0, 0, 50),
+        );
+        let day = p.codex.join("2026/08/24");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-multi.jsonl"),
+            include_str!("../tests/fixtures/codex/rollout-multi-turn.jsonl"),
+        )
+        .unwrap();
+
+        p.scan();
+        let s = p.summary(0);
+        assert_eq!(s.msg_count, 4, "1 Claude message + 3 Codex turns");
+        assert_eq!(s.fresh_input, 100 + 40_000);
+        assert_eq!(s.output, 50 + 2_400);
+    }
+
+    /// The feed is what prices Codex: `gpt-5-codex` has no entry in the static
+    /// table, so without it a Codex turn falls back to the flagship-Opus tier
+    /// and bills ~4x what it cost.
+    #[test]
+    fn codex_turns_are_priced_from_the_feed() {
+        let p = TestPaths::new("codex-priced");
+        let day = p.codex.join("2026/08/24");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-multi.jsonl"),
+            include_str!("../tests/fixtures/codex/rollout-multi-turn.jsonl"),
+        )
+        .unwrap();
+        p.scan();
+
+        // Published gpt-5-codex rates: $1.25 input / $10 output per MTok.
+        crate::models::set_feed_prices(std::collections::HashMap::from([(
+            "gpt-5-codex".to_string(),
+            crate::models::ModelProfile {
+                input_per_m: 1.25,
+                output_per_m: 10.0,
+                cache_read_per_m: 0.125,
+                cache_write_per_m: 1.25,
+                cache_write_1h_per_m: 1.25,
+                context_max: 272_000,
+            },
+        )]));
+        let priced = p.summary(0);
+        crate::models::set_feed_prices(std::collections::HashMap::new());
+        let unpriced = p.summary(0);
+
+        // Turns 1-2 are gpt-5-codex (25k in / 1.5k out); turn 3 switched to
+        // gpt-5.4, which the feed here does not carry.
+        let expected_codex = (25_000.0 * 1.25 + 1_500.0 * 10.0) / 1_000_000.0;
+        assert!(
+            priced.cost_usd > expected_codex,
+            "the two gpt-5-codex turns must at least cost their feed price"
+        );
+        assert!(
+            priced.cost_usd < unpriced.cost_usd,
+            "feed pricing must beat the Opus-tier fallback, got {:.4} vs {:.4}",
+            priced.cost_usd,
+            unpriced.cost_usd
+        );
+    }
+
+    /// Serialize the tests that drive the global re-walk interval.
+    fn rewalk_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[test]
@@ -1761,7 +2082,7 @@ mod tests {
         .join("\n");
         fs::write(&project, format!("{body}\n")).unwrap();
 
-        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions, &p.codex);
         let s = load_summary_at(&p.ledger, 0);
         assert_eq!(s.msg_count, 1, "three lines are one response");
         assert_eq!(
@@ -1788,12 +2109,12 @@ mod tests {
         );
         fs::write(&project, format!("{line}\n{line}\n")).unwrap();
 
-        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions, &p.codex);
         let first = load_summary_at(&p.ledger, 0);
 
         // Rewrite shorter, forcing the truncation branch to re-append.
         fs::write(&project, format!("{line}\n")).unwrap();
-        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions, &p.codex);
         let second = load_summary_at(&p.ledger, 0);
 
         assert_eq!(first.msg_count, 1);
@@ -1810,7 +2131,7 @@ mod tests {
         let line = r#"{"type":"assistant","timestamp":"2026-04-22T10:00:00.000Z","requestId":"req_c","message":{"id":"msg_c","role":"assistant","model":"claude-opus-5","usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":1000000,"cache_creation":{"ephemeral_1h_input_tokens":1000000},"output_tokens":0},"content":[]}}"#;
         fs::write(&project, format!("{line}\n")).unwrap();
 
-        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions, &p.codex);
         let s = load_summary_at(&p.ledger, 0);
         assert_eq!(s.cache_write, 1_000_000);
         // 1M tokens x $10/MTok (2x the $5 base), not $6.25 (1.25x).
@@ -1870,6 +2191,14 @@ mod tests {
         // exercised and the test would pass for the wrong reason. Verified:
         // with the ledger lock removed and this set, all 40 responses are lost.
         COMPACT_THRESHOLD_BYTES.store(512, std::sync::atomic::Ordering::Relaxed);
+        // This test asserts nothing is lost, so discovery must not be the
+        // limiting factor: the writer creates hundreds of files per
+        // millisecond, and `dir_mtime_ms` cannot distinguish additions inside
+        // one tick. Re-walk every scan so the assertion is about
+        // append-vs-compaction, which is what it exists to check.
+        let _rw = rewalk_test_lock();
+        let restore_rewalk = rewalk_after_ms();
+        REWALK_AFTER_MS.store(0, std::sync::atomic::Ordering::Relaxed);
         const TOTAL: usize = 400;
         fs::create_dir_all(&p.projects).unwrap();
         for i in 0..40 {
@@ -1895,29 +2224,47 @@ mod tests {
                 for i in 40..TOTAL {
                     let f = p.projects.join(format!("-test/sess-{i}.jsonl"));
                     let _ = fs::create_dir_all(f.parent().unwrap());
-                    let _ = fs::write(
-                        &f,
-                        format!(
-                            "{}\n",
-                            fixture_keyed_line_now(&format!("msg_{i}"), &format!("req_{i}"), 10)
-                        ),
+                    let body = format!(
+                        "{}\n",
+                        fixture_keyed_line_now(&format!("msg_{i}"), &format!("req_{i}"), 10)
                     );
+                    // Write then rename, so a scanner never sees the file
+                    // half-written. `fs::write` truncates first; a scanner that
+                    // reads the empty intermediate state records it as fully
+                    // ingested, and because these fixtures have no live writer
+                    // the drained-skip then never re-reads them — the row is
+                    // gone for good (the contract asserted by
+                    // `dead_writer_is_drained_once_then_skipped`). That is a
+                    // property of writing non-atomically, not of the code under
+                    // test: a real transcript is either held open by a live
+                    // session (writer_alive, never drained) or already complete
+                    // because its writer exited.
+                    let tmp = f.with_extension("jsonl.tmp");
+                    let _ = fs::write(&tmp, body);
+                    let _ = fs::rename(&tmp, &f);
                 }
                 done.store(true, std::sync::atomic::Ordering::Release);
             });
             for _ in 0..4 {
                 scope.spawn(|| {
                     while !done.load(std::sync::atomic::Ordering::Acquire) {
-                        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+                        scan_and_append_at(
+                            &p.projects,
+                            &p.ledger,
+                            &p.offsets,
+                            &p.sessions,
+                            &p.codex,
+                        );
                     }
                 });
             }
         });
         // Final pass so anything written after the last scan is ingested.
-        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions, &p.codex);
 
         let s = load_summary_at(&p.ledger, 0);
         COMPACT_THRESHOLD_BYTES.store(64 * 1024 * 1024, std::sync::atomic::Ordering::Relaxed);
+        REWALK_AFTER_MS.store(restore_rewalk, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
             s.msg_count, TOTAL as u64,
             "every response must survive concurrent scan+compaction"

@@ -26,6 +26,8 @@ pub struct ModelOverride {
 pub enum ModelProfileSource {
     BuiltIn,
     Override,
+    /// The refreshed price table — see `pricing_feed`.
+    Feed,
     Fallback,
 }
 
@@ -34,6 +36,7 @@ impl ModelProfileSource {
         match self {
             Self::BuiltIn => "built-in",
             Self::Override => "override",
+            Self::Feed => "feed",
             Self::Fallback => "fallback",
         }
     }
@@ -47,6 +50,29 @@ pub struct ResolvedModelProfile {
 }
 
 static MODEL_OVERRIDES: OnceLock<Mutex<HashMap<String, ModelProfile>>> = OnceLock::new();
+
+/// Prices from the refreshed feed, keyed by lowercased model id. Empty until
+/// `pricing_feed::install_and_refresh` runs, which is what makes the static
+/// table below the offline fallback rather than the source of truth.
+static FEED_PRICES: OnceLock<Mutex<HashMap<String, ModelProfile>>> = OnceLock::new();
+
+fn feed_store() -> &'static Mutex<HashMap<String, ModelProfile>> {
+    FEED_PRICES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn set_feed_prices(prices: HashMap<String, ModelProfile>) {
+    if let Ok(mut guard) = feed_store().lock() {
+        *guard = prices;
+    }
+}
+
+/// The static table, for comparison against the feed.
+pub fn built_in_prices() -> Vec<(String, ModelProfile)> {
+    MODELS
+        .iter()
+        .map(|e| (e.fragment.to_string(), e.profile))
+        .collect()
+}
 
 /// One published model version: the id fragment that identifies it, the label
 /// shown in the UI, and its prices per million tokens.
@@ -210,6 +236,22 @@ pub(crate) fn resolve_with_overrides(
         };
     }
 
+    // The feed outranks the static table: the table is a snapshot and the feed
+    // is maintained, so a model released after our last release is priced
+    // correctly instead of falling through to a guess. A user override still
+    // wins over both.
+    if let Some(profile) = feed_store()
+        .lock()
+        .ok()
+        .and_then(|feed| feed.get(&raw_key).copied())
+    {
+        return ResolvedModelProfile {
+            key: shorten_model(model),
+            profile,
+            source: ModelProfileSource::Feed,
+        };
+    }
+
     if let Some(hit) = exact_entry(model) {
         return ResolvedModelProfile {
             key: hit.label.into(),
@@ -280,6 +322,16 @@ mod tests {
     /// the wrong comparison (3.0 * 0.1 != 0.3).
     fn near(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    /// Serialize the tests that mutate the process-global override and feed
+    /// tables — in parallel they clear each other's fixtures mid-assertion.
+    /// Same convention as `usage_ledger`'s `cache_test_lock`.
+    fn model_state_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[test]
@@ -391,9 +443,73 @@ mod tests {
         }
     }
 
+    fn feed_profile(input: f64) -> ModelProfile {
+        entry("", "", input, input * 5.0, 1_000_000).profile
+    }
+
+    /// The feed is maintained and the static table is a snapshot, so a model
+    /// the feed prices differently must follow the feed — that is the whole
+    /// point of fetching it.
+    #[test]
+    fn feed_outranks_the_built_in_table() {
+        let _g = model_state_lock();
+        set_feed_prices(HashMap::from([(
+            "claude-opus-5".to_string(),
+            feed_profile(7.5),
+        )]));
+        let r = resolve("claude-opus-5");
+        assert_eq!(r.source, ModelProfileSource::Feed);
+        assert_eq!(r.profile.input_per_m, 7.5);
+        set_feed_prices(HashMap::new());
+
+        // ...and with no feed loaded, the static table still answers.
+        let r = resolve("claude-opus-5");
+        assert_eq!(r.source, ModelProfileSource::BuiltIn);
+        assert_eq!(r.profile.input_per_m, 5.0);
+    }
+
+    /// A user who has written a price into config has said what they want; the
+    /// feed must not silently overrule it.
+    #[test]
+    fn override_outranks_the_feed() {
+        let _g = model_state_lock();
+        set_feed_prices(HashMap::from([(
+            "claude-opus-5".to_string(),
+            feed_profile(7.5),
+        )]));
+        set_overrides(vec![ModelOverride {
+            name: "claude-opus-5".into(),
+            profile: feed_profile(2.0),
+        }]);
+        let r = resolve("claude-opus-5");
+        assert_eq!(r.source, ModelProfileSource::Override);
+        assert_eq!(r.profile.input_per_m, 2.0);
+        set_overrides(Vec::new());
+        set_feed_prices(HashMap::new());
+    }
+
+    /// A model released after our last release has no static entry; the feed is
+    /// what keeps it off the loud fallback.
+    #[test]
+    fn feed_prices_a_model_the_static_table_has_never_heard_of() {
+        let _g = model_state_lock();
+        set_feed_prices(HashMap::from([(
+            "gpt-5-codex".to_string(),
+            feed_profile(1.25),
+        )]));
+        let r = resolve("gpt-5-codex");
+        assert_eq!(r.source, ModelProfileSource::Feed);
+        assert_eq!(r.profile.input_per_m, 1.25);
+        set_feed_prices(HashMap::new());
+
+        // Without the feed it is an unpriced guess, as before.
+        assert_eq!(resolve("gpt-5-codex").source, ModelProfileSource::Fallback);
+    }
+
     /// An override that omits the 1h rate must not price 1h writes at zero.
     #[test]
     fn override_without_1h_rate_derives_it() {
+        let _g = model_state_lock();
         set_overrides(vec![ModelOverride {
             name: "custom-model".into(),
             profile: ModelProfile {
