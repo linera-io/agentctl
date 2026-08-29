@@ -626,7 +626,8 @@ impl Config {
 # input_per_m = 3.00
 # output_per_m = 15.00
 # cache_read_per_m = 0.30
-# cache_write_per_m = 3.75
+# cache_write_per_m = 3.75        # 5-minute cache write
+# cache_write_1h_per_m = 6.00     # 1-hour cache write; defaults to 1.6x the 5m rate
 # context_max = 200000
 
 # ── Auto-Rules ──────────────────────────────────────────────────────
@@ -845,6 +846,10 @@ fn parse_config_file(path: &PathBuf) -> Option<RawConfig> {
                     "cache_write_per_m" => {
                         profile.cache_write_per_m =
                             value.parse().unwrap_or(profile.cache_write_per_m);
+                    }
+                    "cache_write_1h_per_m" => {
+                        profile.cache_write_1h_per_m =
+                            value.parse().unwrap_or(profile.cache_write_1h_per_m);
                     }
                     "context_max" => {
                         profile.context_max = value.parse().unwrap_or(profile.context_max);
@@ -1095,6 +1100,7 @@ fn ensure_model_override<'a>(
             output_per_m: 0.0,
             cache_read_per_m: 0.0,
             cache_write_per_m: 0.0,
+            cache_write_1h_per_m: 0.0,
             context_max: 0,
         },
     });
