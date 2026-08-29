@@ -705,7 +705,8 @@ pub fn distill_preferences(decisions: &[DecisionRecord]) -> DistilledPreferences
                         tool: tool.clone(),
                         command_pattern: cmd_pattern.clone(),
                         preferred_action: preferred,
-                        sample_count: sub.len() as u32,
+                        // Answered only, matching `sub_rate`'s denominator.
+                        sample_count: sub_dec,
                         accept_rate: sub_rate,
                         conditions: vec![cond],
                         confidence: (sub_rate - 0.5).abs() * 2.0,
@@ -738,9 +739,9 @@ pub fn distill_preferences(decisions: &[DecisionRecord]) -> DistilledPreferences
             tool: tool.clone(),
             command_pattern: cmd_pattern.clone(),
             preferred_action: preferred,
-            // Answered decisions only, matching `accept_rate`'s denominator and
-            // the split paths above. Counting deferrals here let six of them
-            // plus one accept clear an evidence floor of five.
+            // Answered decisions only, matching `accept_rate`'s denominator.
+            // Counting deferrals here let six of them plus one accept clear an
+            // evidence floor of five.
             sample_count: decided,
             accept_rate,
             conditions: Vec::new(),
@@ -1696,6 +1697,49 @@ mod tests {
         let prefs = distill_preferences(&decisions);
         for p in &prefs.patterns {
             assert_eq!(p.sample_count, 1, "only one decision was answered: {:?}", p);
+        }
+    }
+
+    /// The conditional path builds the same struct and must count the same way.
+    #[test]
+    fn a_deferred_decision_does_not_count_as_evidence_on_the_split_path() {
+        // 4 accepted without errors + 2 rejected with errors leaves accept_rate
+        // in the ambiguous band so `best_split` runs; the 8 deferrals carry
+        // context — which is what enables the split — but answer nothing.
+        let mut decisions = Vec::new();
+        let mut push = |pid: u32, user_action: &str, err: bool| {
+            decisions.push(DecisionRecord {
+                timestamp: pid.to_string(),
+                pid,
+                project: "proj".into(),
+                tool: Some("Bash".into()),
+                command: Some("cargo test".into()),
+                brain_action: "approve".into(),
+                brain_confidence: 0.9,
+                brain_reasoning: String::new(),
+                user_action: user_action.into(),
+                context: Some(make_context(1.0, 50, err)),
+                outcome: None,
+                decision_type: DecisionType::Session,
+                suggested_at: None,
+            })
+        };
+        for pid in 0..4 {
+            push(pid, "accept", false);
+        }
+        for pid in 4..6 {
+            push(pid, "reject", true);
+        }
+        for pid in 6..14 {
+            push(pid, "deferred_low_confidence", true);
+        }
+
+        for p in &distill_preferences(&decisions).patterns {
+            assert!(
+                p.sample_count <= 6,
+                "deferrals must not pad the evidence: {:?}",
+                p
+            );
         }
     }
 
