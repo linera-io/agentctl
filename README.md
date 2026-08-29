@@ -188,9 +188,8 @@ action = "deny"
 match_cost_above = 20.0
 action = "terminate"
 
-[rules.codex-off-prod]
+[rules.codex-sessions]
 match_provider = ["Codex"]
-match_project = ["infra-prod"]
 action = "deny"
 ```
 
@@ -206,11 +205,12 @@ whole command — not a glob and not an exact match. `["cargo"]` would also matc
 identifies the command. `match_project` is a substring test too; `match_tool`
 and `match_provider` are exact matches.
 
-`match_tool`, `match_command` and `match_cost_above` read state derived from a
-Claude transcript. A Codex session carries none of it today — it has no
-transcript path, so no pending tool call and a cost of zero — so a rule using
-any of them never fires against one. Match Codex sessions on `match_provider`
-and `match_project`, the only fields those rows populate.
+**Auto-rules do not reach Codex sessions yet.** A rule is only evaluated for a
+session in `NeedsInput` or `WaitingInput`, and the monitor derives those from a
+Claude transcript or Claude hook state. A Codex row has no transcript path, so
+it never reaches either status and no rule fires against it — whatever matchers
+the rule carries. The `match_provider = ["Codex"]` example above is written for
+when it does.
 
 `action` must be one of `approve`, `deny`, `send`, `terminate` or `kill`; a rule
 with any other value is discarded with a warning rather than silently falling

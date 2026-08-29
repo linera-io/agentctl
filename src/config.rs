@@ -657,6 +657,8 @@ impl Config {
 # [rules.codex_only]
 # match_provider = ["Codex"]
 # action = "deny"
+# (not reached yet: rules need NeedsInput/WaitingInput, which Codex rows
+#  never hold — see the Auto-Rules section of the README)
 
 # ── Event Hooks ─────────────────────────────────────────────────────
 # Run shell commands on session events.
