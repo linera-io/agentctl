@@ -292,7 +292,7 @@ fn rule_suggestion(action: &str, pattern: &PreferencePattern) -> String {
     let target = crate::product::project_config(std::path::Path::new("."));
     let command = pattern.command_pattern.as_deref();
 
-    // Five of the nine conditions have an exact matcher; a pattern carrying any
+    // Four of the nine conditions have an exact matcher; a pattern carrying any
     // of the rest cannot be stated as a rule, and dropping it silently would
     // widen the rule to cases the user never agreed to.
     let Some(condition_lines) = pattern
@@ -413,7 +413,7 @@ pub(crate) fn detect_missing_rules(
             category: InsightCategory::MissingRule,
             severity: InsightSeverity::Suggestion,
             summary: format!(
-                "{action} [{}]{cmd_part} (consistent in {:.0}% of {} decisions)",
+                "{action} [{}]{cmd_part} (consistent in {:.0}% of {} answered)",
                 p.tool,
                 consistency * 100.0,
                 p.sample_count,
