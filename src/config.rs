@@ -1512,14 +1512,9 @@ action = "deny"
         );
     }
 
-    /// `[[rules]]` array-of-tables yields no rules AND no warning.
-    ///
-    /// `[[rules]]` never reaches `parse_rule_section`, so no rule object is
-    /// created — which means the discard warnings cannot fire either and the
-    /// user is told nothing at all. Worth pinning because it is the quietest
-    /// way a config can do nothing: a rule copied from a pre-0.34 README, or
-    /// from any TOML reference that assumes array-of-tables, vanishes without
-    /// a trace. The accepted form is `[rules.<name>]`.
+    /// `[[rules]]` never reaches `parse_rule_section`, so no rule object exists
+    /// for the discard warnings to fire on — the quietest way a config can do
+    /// nothing. The accepted form is `[rules.<name>]`.
     #[test]
     fn array_of_tables_syntax_yields_no_rules() {
         use std::io::Write;
