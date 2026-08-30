@@ -922,12 +922,16 @@ fn reset_cache_for_tests() {
 /// test's `reset_cache_for_tests` can wipe another test's freshly-read
 /// rows mid-assertion. Each cache-touching test acquires
 /// `cache_test_lock()` at the top and holds it until done.
+///
+/// Poisoning is recovered from rather than propagated: the lock orders tests,
+/// it guards no invariant, and each test installs its own fixture. Failing on
+/// it reported one panicking test as four.
 #[cfg(test)]
 fn cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("test serialise mutex poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Testable variant: explicit ledger path, NO cache. Used by tests so each
