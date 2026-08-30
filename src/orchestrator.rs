@@ -192,6 +192,33 @@ pub fn load_tasks(path: &str) -> io::Result<TaskFile> {
     serde_json::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// Announce a finished run on the desktop. macOS only; a no-op elsewhere, so
+/// that the `notify` gate reads the same on every platform.
+#[cfg(target_os = "macos")]
+fn notify_run_complete(tasks: &[TaskRun], total: usize) {
+    let counts = compute_counts(tasks);
+    let msg = if counts.failed == 0 && counts.aborted == 0 && counts.skipped == 0 {
+        format!("All {total} tasks completed")
+    } else {
+        format!(
+            "{} completed, {} failed, {} skipped, {} aborted",
+            counts.completed, counts.failed, counts.skipped, counts.aborted
+        )
+    };
+    let _ = Command::new("osascript")
+        .args([
+            "-e",
+            &format!(
+                "display notification \"{msg}\" with title \"{} run\"",
+                crate::product::NAME
+            ),
+        ])
+        .spawn();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn notify_run_complete(_tasks: &[TaskRun], _total: usize) {}
+
 /// Run tasks with dependency resolution and parallel execution.
 /// `notify` is the resolved `notify` setting; without it this posted a desktop
 /// notification on every completed run, with no way to turn it off.
@@ -460,26 +487,8 @@ pub fn run_tasks(task_file: TaskFile, parallel: bool, notify: bool) -> io::Resul
     println!("Summary: {}", summary_path.display());
     print_final_summary(&tasks);
 
-    #[cfg(target_os = "macos")]
     if notify {
-        let counts = compute_counts(&tasks);
-        let msg = if counts.failed == 0 && counts.aborted == 0 && counts.skipped == 0 {
-            format!("All {total} tasks completed")
-        } else {
-            format!(
-                "{} completed, {} failed, {} skipped, {} aborted",
-                counts.completed, counts.failed, counts.skipped, counts.aborted
-            )
-        };
-        let _ = Command::new("osascript")
-            .args([
-                "-e",
-                &format!(
-                    "display notification \"{msg}\" with title \"{} run\"",
-                    crate::product::NAME
-                ),
-            ])
-            .spawn();
+        notify_run_complete(&tasks, total);
     }
 
     let counts = compute_counts(&tasks);
