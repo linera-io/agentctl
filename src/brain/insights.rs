@@ -359,7 +359,13 @@ fn format_insights(insights: &[Insight], header: &str) -> String {
             for insight in group {
                 lines.push(format!("  - {}", insight.summary));
                 if let Some(ref suggestion) = insight.suggestion {
-                    lines.push(format!("    \u{2192} {suggestion}"));
+                    // Indent every line, not just the first. A rule suggestion
+                    // is a multi-line TOML block; pushing it whole left lines
+                    // two onward at column 0, outside the grouped list.
+                    for (i, line) in suggestion.lines().enumerate() {
+                        let prefix = if i == 0 { "    \u{2192} " } else { "      " };
+                        lines.push(format!("{prefix}{line}"));
+                    }
                 }
             }
             lines.push(String::new());

@@ -596,14 +596,21 @@ pub fn distill_preferences(decisions: &[DecisionRecord]) -> DistilledPreferences
             continue; // Need at least 2 decisions to form a pattern
         }
         let group: Vec<&DecisionRecord> = indices.iter().map(|&i| &decisions_mut[i]).collect();
-        let brain_action = group
-            .first()
-            .map(|d| d.brain_action.clone())
-            .unwrap_or_default();
+
+        // `accept_rate` measures agreement with the brain across the WHOLE
+        // group, so it only names a preference if the brain said one thing
+        // throughout. An observation's empty verb counts as its own value:
+        // there was nothing to agree with, so mixing it in decides nothing.
+        let mut verbs: Vec<&str> = group.iter().map(|d| d.brain_action.as_str()).collect();
+        verbs.sort_unstable();
+        verbs.dedup();
+        let brain_action = match verbs.as_slice() {
+            [only] => (*only).to_string(),
+            _ => continue,
+        };
 
         let accepted: u32 = group.iter().filter(|d| d.is_positive()).count() as u32;
         let rejected: u32 = group.iter().filter(|d| d.is_negative()).count() as u32;
-        let total = indices.len() as u32;
         let decided = accepted + rejected;
         if decided == 0 {
             continue;
@@ -683,10 +690,12 @@ pub fn distill_preferences(decisions: &[DecisionRecord]) -> DistilledPreferences
                             brain_action.clone()
                         }
                     } else if sub_rate <= 0.3 {
-                        if brain_action == "approve" || brain_action.is_empty() {
-                            "deny".to_string()
-                        } else {
-                            "approve".to_string()
+                        // Rejecting a deny means "let it run", but rejecting
+                        // route/spawn/terminate says nothing about permission.
+                        match brain_action.as_str() {
+                            "approve" | "" => "deny".to_string(),
+                            "deny" => "approve".to_string(),
+                            _ => continue,
                         }
                     } else {
                         continue; // Still ambiguous after split
@@ -696,7 +705,8 @@ pub fn distill_preferences(decisions: &[DecisionRecord]) -> DistilledPreferences
                         tool: tool.clone(),
                         command_pattern: cmd_pattern.clone(),
                         preferred_action: preferred,
-                        sample_count: sub.len() as u32,
+                        // Answered only, matching `sub_rate`'s denominator.
+                        sample_count: sub_dec,
                         accept_rate: sub_rate,
                         conditions: vec![cond],
                         confidence: (sub_rate - 0.5).abs() * 2.0,
@@ -714,10 +724,12 @@ pub fn distill_preferences(decisions: &[DecisionRecord]) -> DistilledPreferences
                 brain_action.clone()
             }
         } else if accept_rate <= 0.3 {
-            if brain_action == "approve" || brain_action.is_empty() {
-                "deny".to_string()
-            } else {
-                "approve".to_string()
+            // Rejecting a deny means "let it run", but rejecting
+            // route/spawn/terminate says nothing about permission.
+            match brain_action.as_str() {
+                "approve" | "" => "deny".to_string(),
+                "deny" => "approve".to_string(),
+                _ => continue,
             }
         } else {
             continue; // Ambiguous — don't form a pattern
@@ -727,7 +739,10 @@ pub fn distill_preferences(decisions: &[DecisionRecord]) -> DistilledPreferences
             tool: tool.clone(),
             command_pattern: cmd_pattern.clone(),
             preferred_action: preferred,
-            sample_count: total,
+            // Answered decisions only, matching `accept_rate`'s denominator.
+            // Counting deferrals here let six of them plus one accept clear an
+            // evidence floor of five.
+            sample_count: decided,
             accept_rate,
             conditions: Vec::new(),
             confidence: (accept_rate - 0.5).abs() * 2.0,
@@ -1639,6 +1654,171 @@ mod tests {
             time_pattern,
             "Expected time-of-day temporal pattern, got: {:?}",
             patterns
+        );
+    }
+
+    /// A record nobody answered is not evidence: six deferrals plus one accept
+    /// must not clear an evidence floor of five.
+    #[test]
+    fn a_deferred_decision_does_not_count_as_evidence() {
+        let mut decisions: Vec<DecisionRecord> = (0..6)
+            .map(|i| DecisionRecord {
+                timestamp: i.to_string(),
+                pid: 42,
+                project: "proj".into(),
+                tool: Some("Bash".into()),
+                command: Some("cargo test".into()),
+                brain_action: "approve".into(),
+                brain_confidence: 0.4,
+                brain_reasoning: String::new(),
+                user_action: "deferred_low_confidence".into(),
+                context: Some(make_context(1.0, 50, false)),
+                outcome: None,
+                decision_type: DecisionType::Session,
+                suggested_at: None,
+            })
+            .collect();
+        decisions.push(DecisionRecord {
+            timestamp: "6".into(),
+            pid: 42,
+            project: "proj".into(),
+            tool: Some("Bash".into()),
+            command: Some("cargo test".into()),
+            brain_action: "approve".into(),
+            brain_confidence: 0.9,
+            brain_reasoning: String::new(),
+            user_action: "accept".into(),
+            context: Some(make_context(1.0, 50, false)),
+            outcome: None,
+            decision_type: DecisionType::Session,
+            suggested_at: None,
+        });
+
+        let prefs = distill_preferences(&decisions);
+        for p in &prefs.patterns {
+            assert_eq!(p.sample_count, 1, "only one decision was answered: {:?}", p);
+        }
+    }
+
+    /// The conditional path builds the same struct and must count the same way.
+    #[test]
+    fn a_deferred_decision_does_not_count_as_evidence_on_the_split_path() {
+        // 4 accepted without errors + 2 rejected with errors leaves accept_rate
+        // in the ambiguous band so `best_split` runs; the 8 deferrals carry
+        // context — which is what enables the split — but answer nothing.
+        let mut decisions = Vec::new();
+        let mut push = |pid: u32, user_action: &str, err: bool| {
+            decisions.push(DecisionRecord {
+                timestamp: pid.to_string(),
+                pid,
+                project: "proj".into(),
+                tool: Some("Bash".into()),
+                command: Some("cargo test".into()),
+                brain_action: "approve".into(),
+                brain_confidence: 0.9,
+                brain_reasoning: String::new(),
+                user_action: user_action.into(),
+                context: Some(make_context(1.0, 50, err)),
+                outcome: None,
+                decision_type: DecisionType::Session,
+                suggested_at: None,
+            })
+        };
+        for pid in 0..4 {
+            push(pid, "accept", false);
+        }
+        for pid in 4..6 {
+            push(pid, "reject", true);
+        }
+        for pid in 6..14 {
+            push(pid, "deferred_low_confidence", true);
+        }
+
+        for p in &distill_preferences(&decisions).patterns {
+            assert!(
+                p.sample_count <= 6,
+                "deferrals must not pad the evidence: {:?}",
+                p
+            );
+        }
+    }
+
+    /// An observation the user approved carries no brain verb, so one brain
+    /// record must not speak for a group that is mostly observations.
+    #[test]
+    fn one_brain_verb_does_not_speak_for_a_group_of_observations() {
+        let mut decisions: Vec<DecisionRecord> = (0..19)
+            .map(|i| DecisionRecord {
+                timestamp: i.to_string(),
+                pid: 42,
+                project: "proj".into(),
+                tool: Some("Bash".into()),
+                command: Some("git push origin".into()),
+                brain_action: String::new(),
+                brain_confidence: 0.0,
+                brain_reasoning: String::new(),
+                user_action: "user_approve".into(),
+                context: Some(make_context(1.0, 50, false)),
+                outcome: None,
+                decision_type: DecisionType::Session,
+                suggested_at: None,
+            })
+            .collect();
+        decisions.push(DecisionRecord {
+            timestamp: "19".into(),
+            pid: 42,
+            project: "proj".into(),
+            tool: Some("Bash".into()),
+            command: Some("git push origin".into()),
+            brain_action: "deny".into(),
+            brain_confidence: 0.9,
+            brain_reasoning: String::new(),
+            user_action: "reject".into(),
+            context: Some(make_context(1.0, 50, false)),
+            outcome: None,
+            decision_type: DecisionType::Session,
+            suggested_at: None,
+        });
+
+        let prefs = distill_preferences(&decisions);
+        assert!(
+            !prefs.patterns.iter().any(|p| p.preferred_action == "deny"),
+            "19 user approvals must not distil to deny: {:?}",
+            prefs.patterns
+        );
+    }
+
+    /// `accept_rate` counts agreement across the whole group, so a group whose
+    /// brain verb varies names no preference — reading it off one record let
+    /// the earliest decide.
+    #[test]
+    fn a_group_with_mixed_brain_verbs_forms_no_pattern() {
+        let decisions: Vec<DecisionRecord> = (0..10)
+            .map(|i| DecisionRecord {
+                timestamp: i.to_string(),
+                pid: 42,
+                project: "proj".into(),
+                tool: Some("Bash".into()),
+                command: Some("rm -rf /tmp/x".into()),
+                brain_action: if i == 0 { "approve" } else { "deny" }.into(),
+                brain_confidence: 0.9,
+                brain_reasoning: String::new(),
+                user_action: "accept".into(),
+                context: Some(make_context(1.0, 50, false)),
+                outcome: None,
+                decision_type: DecisionType::Session,
+                suggested_at: None,
+            })
+            .collect();
+
+        let prefs = distill_preferences(&decisions);
+        assert!(
+            !prefs
+                .patterns
+                .iter()
+                .any(|p| p.preferred_action == "approve"),
+            "agreeing with nine denials must not distil to approve: {:?}",
+            prefs.patterns
         );
     }
 }

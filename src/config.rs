@@ -658,6 +658,8 @@ impl Config {
 # [rules.codex_only]
 # match_provider = ["Codex"]
 # action = "deny"
+# (not reached yet: rules need NeedsInput/WaitingInput, which Codex rows
+#  never hold — see the Auto-Rules section of the README)
 
 # ── Event Hooks ─────────────────────────────────────────────────────
 # Run shell commands on session events.
@@ -1111,6 +1113,23 @@ fn ensure_model_override<'a>(
         .profile
 }
 
+/// Parse config text and return just its rules.
+///
+/// Exists so a test elsewhere in the crate can assert that a string we tell a
+/// user to paste actually parses, rather than substring-matching it. Checking
+/// that a suggestion *contains* `[rules.x]` passes even when the header is
+/// glued to a prose prefix and is therefore not a header at all.
+#[cfg(test)]
+pub(crate) fn parse_config_file_for_test(contents: &str) -> Vec<AutoRule> {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().expect("temp file");
+    file.write_all(contents.as_bytes()).expect("write");
+    file.flush().expect("flush");
+    parse_config_file(&file.path().to_path_buf())
+        .map(|raw| raw.rules)
+        .unwrap_or_default()
+}
+
 fn upsert_model_override(overrides: &mut Vec<ModelOverride>, incoming: ModelOverride) {
     if let Some(existing) = overrides.iter_mut().find(|item| item.name == incoming.name) {
         *existing = incoming;
@@ -1501,16 +1520,11 @@ action = "deny"
         );
     }
 
-    /// README.md documents `[[rules]]` array-of-tables syntax the parser does
-    /// not support, so rules copied from it silently become NO rules.
-    ///
-    /// This pins the gap rather than hiding it. `[[rules]]` never reaches
-    /// `parse_rule_section`, so no rule object is created — meaning the
-    /// discard warnings added here cannot fire either, and the user gets
-    /// nothing at all. The parser and the generated config template both use
-    /// `[rules.<name>]`; the README is the odd one out and is fixed separately.
+    /// `[[rules]]` never reaches `parse_rule_section`, so no rule object exists
+    /// for the discard warnings to fire on — the quietest way a config can do
+    /// nothing. The accepted form is `[rules.<name>]`.
     #[test]
-    fn readme_array_of_tables_syntax_yields_no_rules() {
+    fn array_of_tables_syntax_yields_no_rules() {
         use std::io::Write;
         let mut file = tempfile::NamedTempFile::new().unwrap();
         write!(
@@ -1529,8 +1543,7 @@ action = "deny"
         );
         assert!(
             raw.rule_warnings.is_empty(),
-            "and nothing warns, because no rule was ever created — the reason \
-             the README mismatch is worth fixing at the source"
+            "and nothing warns, because no rule was ever created"
         );
     }
 

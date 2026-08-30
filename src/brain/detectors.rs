@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use super::decisions::{DecisionRecord, DistilledPreferences};
 use super::insights::{Insight, InsightCategory, InsightSeverity, epoch_now};
+use super::preferences::{PreferenceCondition, PreferencePattern};
+use crate::rules::RuleAction;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Detection algorithms
@@ -212,6 +214,160 @@ pub(crate) fn detect_context_blowouts(decisions: &[DecisionRecord]) -> Vec<Insig
     }]
 }
 
+/// A table name unique to the (tool, command) pair a suggestion describes.
+///
+/// Keying on the tool alone collided: one insight is emitted per pattern, so
+/// three separate Bash denials all suggested `[rules.deny-bash]`. Pasting them
+/// leaves ONE rule matching only the last, because `ensure_rule` reuses a rule
+/// by name and every matcher is last-write-wins — so two of the three denials
+/// the user believes they added silently do not exist.
+/// Slugifying alone is not enough: it is lossy, so it collides. `rm -rf` and
+/// `rm/rf` both reduce to `bash-rm-rf`, and any all-punctuation command —
+/// realistic, since `command_pattern` is only the first two tokens — reduces to
+/// bare `bash`. A short digest of the untouched command restores uniqueness
+/// while the readable part keeps the name meaningful.
+fn rule_slug(tool: &str, command: Option<&str>) -> String {
+    let readable = |text: &str| {
+        let mut out = String::with_capacity(text.len());
+        let mut pending_dash = false;
+        for ch in text.to_lowercase().chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch);
+                pending_dash = false;
+            } else if !pending_dash {
+                out.push('-');
+                pending_dash = true;
+            }
+        }
+        out.trim_matches('-').to_string()
+    };
+
+    let mut slug = readable(tool);
+    if slug.is_empty() {
+        slug.push_str("rule");
+    }
+    let Some(command) = command else {
+        return slug;
+    };
+
+    let stem = readable(command);
+    if !stem.is_empty() {
+        slug.push('-');
+        // Cap the readable part: `command_pattern` is two tokens, but nothing
+        // bounds their length, and a table name is read by a human.
+        slug.push_str(stem.get(..32).unwrap_or(&stem).trim_matches('-'));
+    }
+    slug.push('-');
+    slug.push_str(&short_digest(command));
+    slug
+}
+
+/// Characters the config reader cannot round-trip: `,` splits an array, `#`
+/// truncates the line, and quotes are stripped.
+const UNQUOTABLE: [char; 4] = [',', '#', '"', '\''];
+
+/// The rule matcher expressing this condition exactly, or `None` where the rule
+/// language has no equivalent.
+///
+/// `CostAbove(v)` selects `cost >= v` but `match_cost_above = v` fires only on
+/// `cost > v`, and the split is always an observed cost — so the rule would
+/// exclude a sample the pattern was built from. Near enough is not enough here.
+fn condition_matcher(condition: &PreferenceCondition) -> Option<String> {
+    match condition {
+        PreferenceCondition::NoErrors => Some("match_last_error = false".to_string()),
+        PreferenceCondition::HasErrors => Some("match_last_error = true".to_string()),
+        PreferenceCondition::NoFileConflict => Some("match_file_conflict = false".to_string()),
+        PreferenceCondition::HasFileConflict => Some("match_file_conflict = true".to_string()),
+        PreferenceCondition::CostAbove(_)
+        | PreferenceCondition::CostBelow(_)
+        | PreferenceCondition::ContextBelow(_)
+        | PreferenceCondition::ContextAbove(_)
+        | PreferenceCondition::HourRange(_, _) => None,
+    }
+}
+
+/// Paste-ready TOML for one detected pattern, or prose where no exact rule can
+/// be produced — the user pastes this verbatim, so a near-miss is worse than none.
+fn rule_suggestion(action: &str, pattern: &PreferencePattern) -> String {
+    let target = crate::product::project_config(std::path::Path::new("."));
+    let command = pattern.command_pattern.as_deref();
+
+    // Four of the nine conditions have an exact matcher; a pattern carrying any
+    // of the rest cannot be stated as a rule, and dropping it silently would
+    // widen the rule to cases the user never agreed to.
+    let Some(condition_lines) = pattern
+        .conditions
+        .iter()
+        .map(condition_matcher)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return format!(
+            "observed only under a condition auto-rules cannot express — review \
+             before adding a rule for [{}]",
+            pattern.tool
+        );
+    };
+
+    // `distill_preferences` uses "*" when a decision carries no tool, but
+    // `match_tool` is an exact-equality test: nothing is named "*", so the rule
+    // could never fire, and omitting the matcher would match every tool.
+    if pattern.tool == "*" {
+        return format!(
+            "seen across tools rather than one — an auto-rule has to name a \
+             single tool, so add this{} by hand",
+            command.map(|c| format!(" for {c:?}")).unwrap_or_default()
+        );
+    }
+
+    if pattern.tool.contains(UNQUOTABLE) || command.is_some_and(|c| c.contains(UNQUOTABLE)) {
+        return format!(
+            "add a rule for [{}]{} by hand — it contains a character the config \
+             reader cannot round-trip",
+            pattern.tool,
+            command
+                .map(|c| format!(" matching {c:?}"))
+                .unwrap_or_default()
+        );
+    }
+
+    // The engine's wildcard is an OMITTED matcher; `["*"]` is a live substring
+    // test for an asterisk, so it never fires and a deny would fail open.
+    let command_line = command
+        .map(|c| format!("\nmatch_command = [\"{c}\"]"))
+        .unwrap_or_default();
+    let condition_block = condition_lines
+        .iter()
+        .map(|l| format!("\n{l}"))
+        .collect::<String>();
+
+    // `match_command` is a substring test and the pattern is only the command's
+    // first two tokens, so an approve covers more than was ever observed. A
+    // full-line comment survives the parser, so the warning travels with paste.
+    let caveat = match (action, command) {
+        ("approve", Some(c)) => format!("# also matches any command containing {c:?}\n"),
+        _ => String::new(),
+    };
+
+    format!(
+        "add to {}:\n{caveat}[rules.{}-{}]\nmatch_tool = [\"{}\"]{command_line}{condition_block}\naction = \"{action}\"",
+        target.display(),
+        action,
+        rule_slug(&pattern.tool, command),
+        pattern.tool,
+    )
+}
+
+/// FNV-1a, four hex chars. Deterministic across runs so a suggestion the user
+/// already pasted keeps the same name; not a security hash.
+fn short_digest(text: &str) -> String {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in text.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("{:04x}", hash & 0xffff)
+}
+
 /// Detect high-confidence patterns that could become AutoRules.
 pub(crate) fn detect_missing_rules(
     _decisions: &[DecisionRecord],
@@ -225,69 +381,46 @@ pub(crate) fn detect_missing_rules(
             continue;
         }
 
-        // High-confidence approve patterns
-        if p.accept_rate >= 0.9 {
-            let cmd_part = p
-                .command_pattern
-                .as_ref()
-                .map(|c| format!(" \"{c}\""))
-                .unwrap_or_default();
-
-            insights.push(Insight {
-                fingerprint: format!(
-                    "missing_rule:approve:{}:{}",
-                    p.tool,
-                    p.command_pattern.as_deref().unwrap_or("*")
-                ),
-                generated_at: now,
-                category: InsightCategory::MissingRule,
-                severity: InsightSeverity::Suggestion,
-                summary: format!(
-                    "approve [{}]{cmd_part} (accepted {:.0}%, n={})",
-                    p.tool,
-                    p.accept_rate * 100.0,
-                    p.sample_count,
-                ),
-                suggestion: Some(format!(
-                    "add to .claudectl.toml: [[rules]] match_tool=\"{}\" match_command=\"{}\" action=\"approve\"",
-                    p.tool,
-                    p.command_pattern.as_deref().unwrap_or("*"),
-                )),
-                evidence_count: p.sample_count,
-            });
+        // `accept_rate` measures agreement with the BRAIN, not a wish for the
+        // call to proceed — both extremes are decisive, and `preferred_action`
+        // is what they already resolved to.
+        let consistency = p.accept_rate.max(1.0 - p.accept_rate);
+        if consistency < 0.9 {
+            continue;
         }
 
-        // High-confidence deny patterns
-        if p.accept_rate <= 0.1 {
-            let cmd_part = p
-                .command_pattern
-                .as_ref()
-                .map(|c| format!(" \"{c}\""))
-                .unwrap_or_default();
+        // Only approve and deny are safe to hand over: `send` would type the
+        // engine's "continue" default, `terminate`/`kill` destroy sessions, and
+        // route/spawn/delegate have no rule form.
+        let action = match RuleAction::parse(&p.preferred_action) {
+            Some(a @ (RuleAction::Approve | RuleAction::Deny)) => a.label(),
+            _ => continue,
+        };
 
-            insights.push(Insight {
-                fingerprint: format!(
-                    "missing_rule:deny:{}:{}",
-                    p.tool,
-                    p.command_pattern.as_deref().unwrap_or("*")
-                ),
-                generated_at: now,
-                category: InsightCategory::MissingRule,
-                severity: InsightSeverity::Suggestion,
-                summary: format!(
-                    "deny [{}]{cmd_part} (rejected {:.0}%, n={})",
-                    p.tool,
-                    (1.0 - p.accept_rate) * 100.0,
-                    p.sample_count,
-                ),
-                suggestion: Some(format!(
-                    "add to .claudectl.toml: [[rules]] match_tool=\"{}\" match_command=\"{}\" action=\"deny\"",
-                    p.tool,
-                    p.command_pattern.as_deref().unwrap_or("*"),
-                )),
-                evidence_count: p.sample_count,
-            });
-        }
+        let cmd_part = p
+            .command_pattern
+            .as_ref()
+            .map(|c| format!(" \"{c}\""))
+            .unwrap_or_default();
+
+        insights.push(Insight {
+            fingerprint: format!(
+                "missing_rule:{action}:{}:{}",
+                p.tool,
+                p.command_pattern.as_deref().unwrap_or("*")
+            ),
+            generated_at: now,
+            category: InsightCategory::MissingRule,
+            severity: InsightSeverity::Suggestion,
+            summary: format!(
+                "{action} [{}]{cmd_part} (consistent in {:.0}% of {} answered)",
+                p.tool,
+                consistency * 100.0,
+                p.sample_count,
+            ),
+            suggestion: Some(rule_suggestion(action, p)),
+            evidence_count: p.sample_count,
+        });
     }
 
     insights
@@ -603,6 +736,141 @@ mod tests {
         assert!(insights.iter().any(|i| i.summary.contains("rm -rf")));
     }
 
+    /// A suggested rule must be in the syntax the config parser actually reads.
+    #[test]
+    fn a_suggested_rule_uses_syntax_the_parser_accepts() {
+        let prefs = DistilledPreferences {
+            patterns: vec![PreferencePattern {
+                tool: "Bash".to_string(),
+                command_pattern: Some("rm -rf".to_string()),
+                preferred_action: "deny".to_string(),
+                sample_count: 6,
+                accept_rate: 0.0,
+                conditions: Vec::new(),
+                confidence: 1.0,
+            }],
+            tool_accuracy: Vec::new(),
+            total_decisions: 6,
+            overall_accuracy: 0.8,
+            temporal: Vec::new(),
+        };
+
+        let insights = detect_missing_rules(&[], &prefs);
+        let suggestion = insights[0].suggestion.clone().expect("a suggestion");
+
+        // The path is whatever `product::project_config` resolves to — asserting
+        // it is never `.claudectl.toml` would contradict legacy resolution, which
+        // returns exactly that when only the legacy file exists.
+        assert!(
+            suggestion.contains(
+                &crate::product::project_config(std::path::Path::new("."))
+                    .display()
+                    .to_string()
+            ),
+            "the target must be the resolved config path: {suggestion}"
+        );
+
+        // Substring-matching the header would pass even when the header is
+        // glued to the prose prefix and so is not a header at all. Parse the
+        // TOML the user would actually paste and assert a rule comes back.
+        let toml: String = suggestion
+            .lines()
+            .skip_while(|line| !line.starts_with('['))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            toml.starts_with("[rules."),
+            "the table header must own its own line: {suggestion:?}"
+        );
+
+        let parsed = crate::config::parse_config_file_for_test(&toml);
+        assert_eq!(
+            parsed.len(),
+            1,
+            "the suggestion must produce exactly 1 rule"
+        );
+        assert!(
+            parsed[0].name.starts_with("deny-bash-rm-rf-"),
+            "readable stem plus a digest: {}",
+            parsed[0].name
+        );
+        assert_eq!(parsed[0].action, crate::rules::RuleAction::Deny);
+        assert_eq!(parsed[0].match_tool, vec!["Bash".to_string()]);
+        assert_eq!(parsed[0].match_command, vec!["rm -rf".to_string()]);
+    }
+
+    /// Two denials for the same tool must not collide on one table name.
+    ///
+    /// `ensure_rule` reuses a rule by name and every matcher is
+    /// last-write-wins, so identical headers silently collapse into one rule
+    /// matching only the last pattern — the earlier denials would not exist.
+    #[test]
+    fn two_suggestions_for_one_tool_get_distinct_rule_names() {
+        let pattern = |cmd: &str| PreferencePattern {
+            tool: "Bash".to_string(),
+            command_pattern: Some(cmd.to_string()),
+            preferred_action: "deny".to_string(),
+            sample_count: 6,
+            accept_rate: 0.0,
+            conditions: Vec::new(),
+            confidence: 1.0,
+        };
+        let prefs = DistilledPreferences {
+            patterns: vec![pattern("rm -rf"), pattern("curl | sh")],
+            tool_accuracy: Vec::new(),
+            total_decisions: 12,
+            overall_accuracy: 0.8,
+            temporal: Vec::new(),
+        };
+
+        let names: Vec<String> = detect_missing_rules(&[], &prefs)
+            .iter()
+            .filter_map(|i| i.suggestion.clone())
+            .filter_map(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("[rules."))
+                    .map(str::to_string)
+            })
+            .collect();
+
+        assert_eq!(names.len(), 2);
+        assert_ne!(
+            names[0], names[1],
+            "both denials suggested the same table: {names:?}"
+        );
+    }
+
+    /// Slugifying is lossy, so the readable part alone is not a unique name.
+    ///
+    /// `rm -rf` and `rm/rf` both reduce to `bash-rm-rf`, and any command made
+    /// only of punctuation reduces to nothing at all — so without a digest,
+    /// distinct denials would still collide onto one table and silently
+    /// overwrite each other.
+    #[test]
+    fn commands_that_slugify_identically_still_get_distinct_names() {
+        let collide = ["rm -rf", "rm/rf"];
+        let empty_stem = ["|", ">", "", "\u{65e5}\u{672c}"];
+
+        let names: Vec<String> = collide
+            .iter()
+            .chain(empty_stem.iter())
+            .map(|c| rule_slug("Bash", Some(c)))
+            .collect();
+
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "names collided: {names:?}");
+        assert!(
+            names.iter().all(|n| !n.is_empty() && !n.ends_with('-')),
+            "no empty or dangling-dash table names: {names:?}"
+        );
+
+        // Stable across calls, so re-running does not rename a rule the user
+        // has already pasted.
+        assert_eq!(rule_slug("Bash", Some("rm -rf")), names[0]);
+        // No command at all stays clean, with no trailing digest.
+        assert_eq!(rule_slug("Bash", None), "bash");
+    }
+
     #[test]
     fn test_accuracy_gaps_detected() {
         let prefs = DistilledPreferences {
@@ -665,5 +933,231 @@ mod tests {
         let insights = detect_temporal_friction(&prefs);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].category, InsightCategory::TemporalFriction);
+    }
+
+    fn one(tool: &str, command: Option<&str>, conditions: Vec<PreferenceCondition>) -> String {
+        rule_suggestion(
+            "deny",
+            &PreferencePattern {
+                tool: tool.to_string(),
+                command_pattern: command.map(str::to_string),
+                preferred_action: "deny".to_string(),
+                sample_count: 6,
+                accept_rate: 0.0,
+                conditions,
+                confidence: 1.0,
+            },
+        )
+    }
+
+    fn toml_of(suggestion: &str) -> String {
+        suggestion
+            .lines()
+            .skip_while(|l| !l.starts_with('['))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// No command pattern means an omitted matcher, never `["*"]`.
+    #[test]
+    fn a_tool_only_pattern_omits_the_command_matcher() {
+        let suggestion = one("Read", None, Vec::new());
+        assert!(
+            !suggestion.contains("match_command"),
+            "no command means no matcher: {suggestion}"
+        );
+
+        let parsed = crate::config::parse_config_file_for_test(&toml_of(&suggestion));
+        assert_eq!(parsed.len(), 1);
+        assert!(
+            parsed[0].match_command.is_empty(),
+            "an empty matcher is the wildcard; {:?} is not",
+            parsed[0].match_command
+        );
+        assert_eq!(parsed[0].match_tool, vec!["Read".to_string()]);
+    }
+
+    /// `["sort -k1,1"]` parses back as two patterns, the stray `1` matching
+    /// almost anything by substring — so such commands get prose, not TOML.
+    #[test]
+    fn a_command_the_parser_would_mangle_falls_back_to_prose() {
+        for command in ["sort -k1,1", "awk -F,", "open f.html#top", "say \"hi\""] {
+            let suggestion = one("Bash", Some(command), Vec::new());
+            assert!(
+                !suggestion.contains("[rules."),
+                "{command:?} must not be printed as a rule: {suggestion}"
+            );
+            assert!(
+                suggestion.contains("by hand"),
+                "{command:?} should tell the user to write it themselves: {suggestion}"
+            );
+        }
+
+        // A clean command still gets paste-ready TOML, and round-trips exactly.
+        let suggestion = one("Bash", Some("rm -rf"), Vec::new());
+        let parsed = crate::config::parse_config_file_for_test(&toml_of(&suggestion));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].match_command, vec!["rm -rf".to_string()]);
+    }
+
+    /// A condition with an exact matcher must be carried into the rule, not
+    /// dropped — dropping it widens the rule past what the user agreed to.
+    #[test]
+    fn an_expressible_condition_becomes_a_matcher() {
+        let flags = one(
+            "Bash",
+            Some("cargo test"),
+            vec![
+                PreferenceCondition::HasErrors,
+                PreferenceCondition::NoFileConflict,
+            ],
+        );
+        let parsed = crate::config::parse_config_file_for_test(&toml_of(&flags));
+        assert_eq!(parsed[0].match_last_error, Some(true), "{flags}");
+        assert_eq!(parsed[0].match_file_conflict, Some(false), "{flags}");
+    }
+
+    /// A condition with no matcher must fall back to prose, and one
+    /// inexpressible condition taints the whole set.
+    #[test]
+    fn an_inexpressible_condition_is_not_emitted_as_a_rule() {
+        for condition in [
+            PreferenceCondition::CostAbove(1.0),
+            PreferenceCondition::CostBelow(1.0),
+            PreferenceCondition::ContextAbove(80),
+            PreferenceCondition::ContextBelow(20),
+            PreferenceCondition::HourRange(8, 18),
+        ] {
+            let suggestion = one("Bash", Some("cargo test"), vec![condition.clone()]);
+            assert!(
+                !suggestion.contains("[rules."),
+                "{condition:?} has no matcher and must not become a rule: {suggestion}"
+            );
+        }
+
+        let mixed = one(
+            "Bash",
+            Some("cargo test"),
+            vec![
+                PreferenceCondition::HasErrors,
+                PreferenceCondition::HourRange(8, 18),
+            ],
+        );
+        assert!(
+            !mixed.contains("[rules."),
+            "one inexpressible condition must taint the set: {mixed}"
+        );
+    }
+
+    /// `distill_preferences` writes `"*"` for a decision with no tool, and
+    /// `match_tool` is exact equality — `["*"]` matches nothing, so a pasted
+    /// deny would never fire.
+    #[test]
+    fn a_toolless_pattern_is_not_emitted_as_a_rule() {
+        for command in [None, Some("rm -rf")] {
+            let suggestion = one("*", command, Vec::new());
+            assert!(
+                !suggestion.contains("[rules."),
+                "a tool-less pattern must not become a rule: {suggestion}"
+            );
+            assert!(
+                !suggestion.contains("match_tool"),
+                "and must not print a matcher at all: {suggestion}"
+            );
+        }
+    }
+
+    fn pattern(preferred_action: &str, accept_rate: f64) -> DistilledPreferences {
+        DistilledPreferences {
+            patterns: vec![PreferencePattern {
+                tool: "Bash".to_string(),
+                command_pattern: Some("rm -rf".to_string()),
+                preferred_action: preferred_action.to_string(),
+                sample_count: 6,
+                accept_rate,
+                conditions: Vec::new(),
+                confidence: 1.0,
+            }],
+            tool_accuracy: Vec::new(),
+            total_decisions: 6,
+            overall_accuracy: 0.8,
+            temporal: Vec::new(),
+        }
+    }
+
+    /// `accept_rate` is agreement with the BRAIN, not a wish to proceed, so a
+    /// unanimous accept_rate over a brain that kept denying means deny.
+    #[test]
+    fn the_suggested_action_follows_the_preference_not_the_accept_rate() {
+        let insights = detect_missing_rules(&[], &pattern("deny", 1.0));
+        assert_eq!(insights.len(), 1);
+        let suggestion = insights[0].suggestion.clone().expect("a suggestion");
+        assert!(
+            !suggestion.contains("action = \"approve\""),
+            "agreeing with 6 denials must not suggest auto-approving it: {suggestion}"
+        );
+
+        let parsed = crate::config::parse_config_file_for_test(&toml_of(&suggestion));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].action, crate::rules::RuleAction::Deny);
+        assert!(
+            insights[0].summary.starts_with("deny "),
+            "{}",
+            insights[0].summary
+        );
+    }
+
+    /// Only approve and deny survive as a rule. `send` would type the engine's
+    /// "continue" default, `terminate`/`kill` would destroy sessions, and
+    /// route/spawn/delegate have no rule form at all.
+    #[test]
+    fn a_preference_the_rule_language_cannot_express_is_not_suggested() {
+        for action in [
+            "route",
+            "spawn",
+            "delegate",
+            "send",
+            "terminate",
+            "kill",
+            "",
+        ] {
+            assert!(
+                detect_missing_rules(&[], &pattern(action, 1.0)).is_empty(),
+                "{action:?} must not be handed over as a pasteable rule"
+            );
+        }
+    }
+
+    /// An approve rule matches a superset of what was observed, and the caveat
+    /// saying so must survive being pasted.
+    #[test]
+    fn an_approve_suggestion_says_it_matches_more_than_it_saw() {
+        let insights = detect_missing_rules(&[], &pattern("approve", 1.0));
+        let suggestion = insights[0].suggestion.clone().expect("a suggestion");
+        assert!(
+            suggestion.contains("# also matches any command containing \"rm -rf\""),
+            "{suggestion}"
+        );
+
+        // Keep the comment: the parser must skip it, not choke on it.
+        let pasted = suggestion
+            .lines()
+            .skip_while(|l| !l.starts_with('#') && !l.starts_with('['))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            pasted.starts_with('#'),
+            "the comment must be pasted: {pasted}"
+        );
+        let parsed = crate::config::parse_config_file_for_test(&pasted);
+        assert_eq!(parsed.len(), 1, "the comment must not break parsing");
+        assert_eq!(parsed[0].action, RuleAction::Approve);
+
+        // A deny matches a superset too, but that direction is fail-safe.
+        let deny = detect_missing_rules(&[], &pattern("deny", 0.0))[0]
+            .suggestion
+            .clone()
+            .expect("a suggestion");
+        assert!(!deny.contains('#'), "no caveat on a deny: {deny}");
     }
 }
