@@ -1243,6 +1243,18 @@ impl App {
         applied_any
     }
 
+    /// Post a desktop notification, if the user asked for desktop notifications.
+    ///
+    /// A method rather than a bare `fire_notification` call at each site: seven
+    /// of the eight original sites did not check `notify`, so the documented
+    /// default of `false` bought no silence at all. Routing every one through
+    /// here makes the gate impossible to forget.
+    fn notify_desktop(&self, message: &str) {
+        if self.notify {
+            fire_notification(message);
+        }
+    }
+
     /// Apply an already-computed `RefreshIoOutput` to App state.
     /// All the burn-rate / budget / context / status-transition /
     /// conflict-detection / file-conflict logic runs here on the main
@@ -1288,7 +1300,7 @@ impl App {
                         session.cost_usd,
                         budget
                     );
-                    fire_notification(&format!("{} budget {:.0}%", session.display_name(), pct));
+                    self.notify_desktop(&format!("{} budget {:.0}%", session.display_name(), pct));
                     self.hooks.fire(HookEvent::BudgetWarning, session);
                 }
 
@@ -1311,7 +1323,7 @@ impl App {
                             budget
                         );
                     }
-                    fire_notification(&format!("{} exceeded budget!", session.display_name()));
+                    self.notify_desktop(&format!("{} exceeded budget!", session.display_name()));
                     self.hooks.fire(HookEvent::BudgetExceeded, session);
                 }
             }
@@ -1329,7 +1341,7 @@ impl App {
                         session.display_name(),
                         pct
                     );
-                    fire_notification(&format!(
+                    self.notify_desktop(&format!(
                         "{} context at {:.0}%",
                         session.display_name(),
                         pct
@@ -1404,8 +1416,8 @@ impl App {
             );
 
             // Desktop notification on NeedsInput
-            if self.notify && session.status == SessionStatus::NeedsInput {
-                fire_notification(&session.project_name);
+            if session.status == SessionStatus::NeedsInput {
+                self.notify_desktop(&session.project_name);
             }
 
             // Webhook on status change
@@ -1502,7 +1514,7 @@ impl App {
                         .unwrap_or("unknown");
                     self.status_msg =
                         format!("CONFLICT: {} sessions sharing {}", pids.len(), project);
-                    fire_notification(&format!("{} sessions in {}", pids.len(), project));
+                    self.notify_desktop(&format!("{} sessions in {}", pids.len(), project));
                     if let Some(session) = sessions.iter().find(|s| s.pid == pids[0]) {
                         self.hooks.fire(HookEvent::ConflictDetected, session);
                     }
@@ -1582,7 +1594,7 @@ impl App {
                         let short = file.rsplit('/').next().unwrap_or(file);
                         self.status_msg =
                             format!("FILE CONFLICT: {} edited by {}", short, names.join(", "));
-                        fire_notification(&format!("File conflict: {short}"));
+                        self.notify_desktop(&format!("File conflict: {short}"));
                         if let Some(session) = sessions.iter().find(|s| s.pid == pids[0]) {
                             self.hooks.fire(HookEvent::ConflictDetected, session);
                         }
@@ -2019,7 +2031,7 @@ impl App {
                     "DAILY BUDGET: ${:.2}/${:.2} ({:.0}%)",
                     today_total, daily_limit, pct
                 );
-                fire_notification(&format!("Daily budget at {:.0}%", pct));
+                self.notify_desktop(&format!("Daily budget at {:.0}%", pct));
 
                 // Fire hooks with a synthetic session containing aggregate data
                 let mut dummy = create_aggregate_session(today_total, daily_limit, "daily");
@@ -2043,7 +2055,7 @@ impl App {
                     "WEEKLY BUDGET: ${:.2}/${:.2} ({:.0}%)",
                     week_total, weekly_limit, pct
                 );
-                fire_notification(&format!("Weekly budget at {:.0}%", pct));
+                self.notify_desktop(&format!("Weekly budget at {:.0}%", pct));
 
                 let mut dummy = create_aggregate_session(week_total, weekly_limit, "weekly");
                 self.hooks.fire(HookEvent::BudgetWarning, &dummy);

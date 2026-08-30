@@ -559,7 +559,7 @@ fn run_main(cli: Cli) -> io::Result<()> {
 
     if let Some(ref run_file) = cli.run {
         let task_file = orchestrator::load_tasks(run_file)?;
-        return orchestrator::run_tasks(task_file, cli.parallel);
+        return orchestrator::run_tasks(task_file, cli.parallel, cfg.notify);
     }
 
     if cli.clean {
