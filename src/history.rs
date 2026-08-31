@@ -95,6 +95,12 @@ const HEADER: &str =
 /// and are Claude by construction, so a missing or unknown 9th field reads as
 /// Claude rather than dropping the row.
 fn parse_record(line: &str) -> Option<SessionRecord> {
+    // `needs_header` is read before the open and unlocked, so two processes
+    // ending a session at once both write one — a mid-file header parsed as
+    // data becomes a phantom $0.00 session.
+    if line.starts_with("timestamp,") {
+        return None;
+    }
     let fields: Vec<&str> = line.split(',').collect();
     if fields.len() < 8 {
         return None;
@@ -131,12 +137,8 @@ pub fn load_history(since_secs: Option<u64>) -> Vec<SessionRecord> {
     let reader = BufReader::new(file);
     let mut records = Vec::new();
 
-    for (i, line) in reader.lines().enumerate() {
+    for line in reader.lines() {
         let Ok(line) = line else { continue };
-        if i == 0 && line.starts_with("timestamp") {
-            continue; // skip header
-        }
-
         let Some(record) = parse_record(&line) else {
             continue;
         };
@@ -526,6 +528,20 @@ mod tests {
         let r = parse_record(row).expect("an unknown provider must not drop the row");
         assert_eq!(r.cost_usd, 0.25);
         assert_eq!(r.provider, crate::provider::AgentProvider::Claude);
+    }
+
+    /// A header can land mid-file when two processes end a session at once.
+    /// Parsed as data it becomes a phantom $0.00 session in every total.
+    #[test]
+    fn a_header_line_is_never_data_wherever_it_appears() {
+        assert!(parse_record(HEADER).is_none());
+        assert!(
+            parse_record(
+                "timestamp,pid,project,model,duration_secs,input_tokens,output_tokens,cost_usd"
+            )
+            .is_none(),
+            "the pre-column header must be rejected too"
+        );
     }
 
     /// A truncated row is still rejected.
