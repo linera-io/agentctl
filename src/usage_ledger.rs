@@ -166,13 +166,53 @@ fn save_offsets_at(path: &Path, offsets: &OffsetMap) {
     let _ = fs::write(path, rendered);
 }
 
-/// Read `~/.claude/sessions/*.json` pointer files and return the set of
-/// `sessionId` values for currently-live Claude Code sessions. The set is
-/// used by `scan_and_append` to gate stat-skipping on dead-writer files.
-fn read_live_session_ids(sessions_dir: &Path) -> std::collections::HashSet<String> {
+/// The directories that may hold session pointers, in the order
+/// `process::sidecar_candidate_dirs` probes them. A sandbox registers under
+/// `/var/lib/sandbox-sessions` and leaves `~/.claude/sessions` empty, so reading
+/// only the latter reports every sandbox session as dead.
+fn session_pointer_dirs() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from(crate::reaper::sandbox_sessions_dir()),
+        dirs_home().join(".claude").join("sessions"),
+    ]
+}
+
+/// Union the `sessionId` values of every live-session pointer across `dirs`.
+///
+/// `None` means liveness is UNKNOWN — no directory yielded an answer, or one
+/// that exists could not be read. That is NOT "no session is live": `drained`
+/// comes from `!writer_may_be_live` and permanently skips a transcript.
+fn read_live_session_ids(dirs: &[PathBuf]) -> Option<std::collections::HashSet<String>> {
     let mut out = std::collections::HashSet::new();
-    let Ok(entries) = fs::read_dir(sessions_dir) else {
-        return out;
+    let mut any_read = false;
+    for dir in dirs {
+        match read_live_session_ids_in(dir, &mut out) {
+            DirRead::Read => any_read = true,
+            // A host has no sandbox dir; that absence is not ignorance.
+            DirRead::Absent => {}
+            DirRead::Unknown => return None,
+        }
+    }
+    any_read.then_some(out)
+}
+
+/// Outcome of reading one pointer directory.
+enum DirRead {
+    Read,
+    Absent,
+    /// Exists but could not be read — the answer is unknown, not "none".
+    Unknown,
+}
+
+/// Add one directory's pointers to `out`.
+fn read_live_session_ids_in(
+    sessions_dir: &Path,
+    out: &mut std::collections::HashSet<String>,
+) -> DirRead {
+    let entries = match fs::read_dir(sessions_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DirRead::Absent,
+        Err(_) => return DirRead::Unknown,
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -199,7 +239,7 @@ fn read_live_session_ids(sessions_dir: &Path) -> std::collections::HashSet<Strin
             out.insert(sid.to_string());
         }
     }
-    out
+    DirRead::Read
 }
 
 /// Per-project-subdir cached file list. Walking
@@ -394,7 +434,7 @@ pub fn scan_and_append() -> ScanReport {
         &projects_dir(),
         &ledger_path(),
         &offsets_path(),
-        &dirs_home().join(".claude").join("sessions"),
+        &session_pointer_dirs(),
     )
 }
 
@@ -410,7 +450,7 @@ pub fn scan_and_append_at(
     projects_root: &Path,
     ledger: &Path,
     offsets_file: &Path,
-    sessions_dir: &Path,
+    sessions_dirs: &[PathBuf],
 ) -> ScanReport {
     if let Some(parent) = ledger.parent() {
         if fs::create_dir_all(parent).is_err() {
@@ -421,7 +461,7 @@ pub fn scan_and_append_at(
     // Migration, append and compaction all rewrite or extend the same file and
     // must be exclusive against other scanners — including other processes.
     with_ledger_lock(ledger, || {
-        scan_and_append_locked(projects_root, ledger, offsets_file, sessions_dir)
+        scan_and_append_locked(projects_root, ledger, offsets_file, sessions_dirs)
     })
     .unwrap_or_default()
 }
@@ -430,7 +470,7 @@ fn scan_and_append_locked(
     projects_root: &Path,
     ledger: &Path,
     offsets_file: &Path,
-    sessions_dir: &Path,
+    sessions_dirs: &[PathBuf],
 ) -> ScanReport {
     migrate_v1_ledger(ledger, offsets_file);
 
@@ -446,7 +486,7 @@ fn scan_and_append_locked(
     }
 
     let mut offsets = load_offsets_at(offsets_file);
-    let live = read_live_session_ids(sessions_dir);
+    let live = read_live_session_ids(sessions_dirs);
     let files = find_jsonl_files_cached(projects_root);
 
     let mut report = ScanReport {
@@ -458,13 +498,15 @@ fn scan_and_append_locked(
         let key = jsonl.display().to_string();
         let prev = offsets.get(&key).cloned().unwrap_or_default();
         let session_id = session_id_from_path(jsonl);
-        let writer_alive = live.contains(&session_id);
+        // Unknown liveness counts as "may still be writing": draining a file we
+        // merely failed to observe loses every later append, permanently.
+        let writer_may_be_live = live.as_ref().is_none_or(|live| live.contains(&session_id));
 
         // Drained-skip: a JSONL whose writer process exited and which we
         // already drained on a prior scan can never grow again. Skip the
         // stat + open + read entirely. This is the dominant code path on
         // any box with many historical sessions — typically 99%+ of files.
-        if !writer_alive && prev.drained {
+        if !writer_may_be_live && prev.drained {
             continue;
         }
 
@@ -476,7 +518,7 @@ fn scan_and_append_locked(
         // bytes can possibly exist. For dead writers also flip the
         // `drained` marker so the next scan can skip the stat above.
         if current_mtime == prev.mtime_ms && current_size == prev.last_byte {
-            if !writer_alive && !prev.drained {
+            if !writer_may_be_live && !prev.drained {
                 offsets.insert(
                     key.clone(),
                     FileOffset {
@@ -504,7 +546,7 @@ fn scan_and_append_locked(
                 FileOffset {
                     last_byte: current_size,
                     mtime_ms: current_mtime,
-                    drained: !writer_alive,
+                    drained: !writer_may_be_live,
                 },
             );
             continue;
@@ -581,7 +623,7 @@ fn scan_and_append_locked(
                 // We just performed a full read up to `current_size`. If
                 // the writer is dead, future scans can skip this file
                 // entirely via the drained-skip above.
-                drained: !writer_alive,
+                drained: !writer_may_be_live,
             },
         );
     }
@@ -1020,7 +1062,12 @@ mod tests {
         }
 
         fn scan(&self) -> ScanReport {
-            scan_and_append_at(&self.projects, &self.ledger, &self.offsets, &self.sessions)
+            scan_and_append_at(
+                &self.projects,
+                &self.ledger,
+                &self.offsets,
+                std::slice::from_ref(&self.sessions),
+            )
         }
 
         /// Mark the JSONL named `<session_id>.jsonl` as having a live writer
@@ -1135,6 +1182,175 @@ mod tests {
         assert_eq!(summary.msg_count, 2);
         assert_eq!(summary.fresh_input, 40);
         assert_eq!(summary.output, 12);
+    }
+
+    /// An absent directory is a positive "nothing registered here", not
+    /// ignorance — a host has no sandbox dir, and treating that as unknown would
+    /// disable the drained-skip fast path on every host.
+    #[test]
+    fn an_absent_directory_still_lets_a_dead_writer_drain() {
+        let p = TestPaths::new("absent-dir");
+        let missing = p._root.join("no-such-sessions-dir");
+        let file = p.projects.join("-test/sess-dead.jsonl");
+        write_tmp(
+            &file,
+            &fixture_assistant_line("2026-04-22T10:00:00.000Z", "claude-opus-4-7", 10, 0, 0, 5),
+        );
+        // One dir absent, one readable and empty: the writer is knowably dead.
+        let dirs = [missing, p.sessions.clone()];
+        assert_eq!(
+            scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &dirs).rows_appended,
+            1
+        );
+
+        let mut f = OpenOptions::new().append(true).open(&file).unwrap();
+        writeln!(
+            f,
+            "{}",
+            fixture_assistant_line("2026-04-22T10:05:00.000Z", "claude-opus-4-7", 7, 0, 0, 3)
+        )
+        .unwrap();
+        drop(f);
+
+        assert_eq!(
+            scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &dirs).rows_appended,
+            0,
+            "an absent dir must not make liveness unknown"
+        );
+    }
+
+    /// A path that exists but is not a listable directory makes liveness
+    /// unknown even when a sibling read fine and was empty — a pointer could be
+    /// in the one we failed to read, and draining on that guess is permanent.
+    #[test]
+    fn an_unreadable_sibling_directory_makes_liveness_unknown() {
+        let p = TestPaths::new("unreadable-sibling");
+        // A regular file: `read_dir` fails with NotADirectory, not NotFound, for
+        // any uid — a permission bit would not gate root.
+        let blocked = p._root.join("not-a-directory");
+        fs::write(&blocked, "").unwrap();
+
+        let file = p.projects.join("-test/sess-x.jsonl");
+        write_tmp(
+            &file,
+            &fixture_assistant_line("2026-04-22T10:00:00.000Z", "claude-opus-4-7", 10, 0, 0, 5),
+        );
+        // p.sessions is readable and EMPTY; `blocked` exists and cannot be read.
+        let dirs = [p.sessions.clone(), blocked];
+        assert_eq!(
+            scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &dirs).rows_appended,
+            1
+        );
+
+        let mut f = OpenOptions::new().append(true).open(&file).unwrap();
+        writeln!(
+            f,
+            "{}",
+            fixture_assistant_line("2026-04-22T10:05:00.000Z", "claude-opus-4-7", 7, 0, 0, 3)
+        )
+        .unwrap();
+        drop(f);
+
+        assert_eq!(
+            scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &dirs).rows_appended,
+            1,
+            "an unreadable sibling must not be read as \"nobody is live\""
+        );
+    }
+
+    /// A sandbox registers under `/var/lib/sandbox-sessions` and leaves
+    /// `~/.claude/sessions` empty, so reading one directory reports every
+    /// sandbox session as dead and permanently drains its transcript.
+    #[test]
+    fn a_pointer_in_either_directory_keeps_a_writer_live() {
+        let p = TestPaths::new("two-dirs");
+        let other = p._root.join("sandbox-sessions");
+        fs::create_dir_all(&other).unwrap();
+        // The pointer lives ONLY in the second directory.
+        fs::write(
+            other.join("sess-live-test-pid.json"),
+            r#"{"sessionId":"sess-live"}"#,
+        )
+        .unwrap();
+
+        let file = p.projects.join("-test/sess-live.jsonl");
+        write_tmp(
+            &file,
+            &fixture_assistant_line("2026-04-22T10:00:00.000Z", "claude-opus-4-7", 10, 0, 0, 5),
+        );
+        let dirs = [p.sessions.clone(), other];
+        assert_eq!(
+            scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &dirs).rows_appended,
+            1
+        );
+
+        let mut f = OpenOptions::new().append(true).open(&file).unwrap();
+        writeln!(
+            f,
+            "{}",
+            fixture_assistant_line("2026-04-22T10:05:00.000Z", "claude-opus-4-7", 7, 0, 0, 3)
+        )
+        .unwrap();
+        drop(f);
+
+        assert_eq!(
+            scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &dirs).rows_appended,
+            1,
+            "a pointer in the second directory must keep the writer live"
+        );
+    }
+
+    /// Before this guard an unreadable sessions dir read as "every writer is
+    /// dead", and `drained` is permanent, so one such scan skipped every
+    /// transcript forever. The halves differ only in that directory.
+    #[test]
+    fn an_unreadable_sessions_dir_must_not_permanently_drain_a_live_writer() {
+        // Control: sessions dir readable, writer registered — the append lands.
+        let ok = TestPaths::new("live-visible");
+        let ok_file = ok.projects.join("-test/sess-live.jsonl");
+        ok.mark_live("sess-live");
+        write_tmp(
+            &ok_file,
+            &fixture_assistant_line("2026-04-22T10:00:00.000Z", "claude-opus-4-7", 10, 0, 0, 5),
+        );
+        assert_eq!(ok.scan().rows_appended, 1);
+        let mut f = OpenOptions::new().append(true).open(&ok_file).unwrap();
+        writeln!(
+            f,
+            "{}",
+            fixture_assistant_line("2026-04-22T10:05:00.000Z", "claude-opus-4-7", 7, 0, 0, 3)
+        )
+        .unwrap();
+        drop(f);
+        assert_eq!(
+            ok.scan().rows_appended,
+            1,
+            "a visible live writer's append must be ingested"
+        );
+
+        // Same sequence, but the sessions directory cannot be read.
+        let bad = TestPaths::new("live-hidden");
+        let bad_file = bad.projects.join("-test/sess-live.jsonl");
+        bad.mark_live("sess-live");
+        fs::remove_dir_all(&bad.sessions).unwrap();
+        write_tmp(
+            &bad_file,
+            &fixture_assistant_line("2026-04-22T10:00:00.000Z", "claude-opus-4-7", 10, 0, 0, 5),
+        );
+        assert_eq!(bad.scan().rows_appended, 1);
+        let mut f = OpenOptions::new().append(true).open(&bad_file).unwrap();
+        writeln!(
+            f,
+            "{}",
+            fixture_assistant_line("2026-04-22T10:05:00.000Z", "claude-opus-4-7", 7, 0, 0, 3)
+        )
+        .unwrap();
+        drop(f);
+        assert_eq!(
+            bad.scan().rows_appended,
+            1,
+            "an unreadable sessions dir must not permanently drain a live writer"
+        );
     }
 
     #[test]
@@ -1765,7 +1981,12 @@ mod tests {
         .join("\n");
         fs::write(&project, format!("{body}\n")).unwrap();
 
-        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+        scan_and_append_at(
+            &p.projects,
+            &p.ledger,
+            &p.offsets,
+            std::slice::from_ref(&p.sessions),
+        );
         let s = load_summary_at(&p.ledger, 0);
         assert_eq!(s.msg_count, 1, "three lines are one response");
         assert_eq!(
@@ -1792,12 +2013,22 @@ mod tests {
         );
         fs::write(&project, format!("{line}\n{line}\n")).unwrap();
 
-        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+        scan_and_append_at(
+            &p.projects,
+            &p.ledger,
+            &p.offsets,
+            std::slice::from_ref(&p.sessions),
+        );
         let first = load_summary_at(&p.ledger, 0);
 
         // Rewrite shorter, forcing the truncation branch to re-append.
         fs::write(&project, format!("{line}\n")).unwrap();
-        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+        scan_and_append_at(
+            &p.projects,
+            &p.ledger,
+            &p.offsets,
+            std::slice::from_ref(&p.sessions),
+        );
         let second = load_summary_at(&p.ledger, 0);
 
         assert_eq!(first.msg_count, 1);
@@ -1814,7 +2045,12 @@ mod tests {
         let line = r#"{"type":"assistant","timestamp":"2026-04-22T10:00:00.000Z","requestId":"req_c","message":{"id":"msg_c","role":"assistant","model":"claude-opus-5","usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":1000000,"cache_creation":{"ephemeral_1h_input_tokens":1000000},"output_tokens":0},"content":[]}}"#;
         fs::write(&project, format!("{line}\n")).unwrap();
 
-        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+        scan_and_append_at(
+            &p.projects,
+            &p.ledger,
+            &p.offsets,
+            std::slice::from_ref(&p.sessions),
+        );
         let s = load_summary_at(&p.ledger, 0);
         assert_eq!(s.cache_write, 1_000_000);
         // 1M tokens x $10/MTok (2x the $5 base), not $6.25 (1.25x).
@@ -1912,13 +2148,23 @@ mod tests {
             for _ in 0..4 {
                 scope.spawn(|| {
                     while !done.load(std::sync::atomic::Ordering::Acquire) {
-                        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+                        scan_and_append_at(
+                            &p.projects,
+                            &p.ledger,
+                            &p.offsets,
+                            std::slice::from_ref(&p.sessions),
+                        );
                     }
                 });
             }
         });
         // Final pass so anything written after the last scan is ingested.
-        scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &p.sessions);
+        scan_and_append_at(
+            &p.projects,
+            &p.ledger,
+            &p.offsets,
+            std::slice::from_ref(&p.sessions),
+        );
 
         let s = load_summary_at(&p.ledger, 0);
         COMPACT_THRESHOLD_BYTES.store(64 * 1024 * 1024, std::sync::atomic::Ordering::Relaxed);
