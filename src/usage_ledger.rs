@@ -169,11 +169,12 @@ fn save_offsets_at(path: &Path, offsets: &OffsetMap) {
 /// Read `~/.claude/sessions/*.json` pointer files and return the set of
 /// `sessionId` values for currently-live Claude Code sessions. The set is
 /// used by `scan_and_append` to gate stat-skipping on dead-writer files.
-fn read_live_session_ids(sessions_dir: &Path) -> std::collections::HashSet<String> {
+/// `None` means the directory could not be read, which is NOT the same as "no
+/// session is live": `drained` is set from `!writer_may_be_live` and permanently
+/// skips a transcript, so collapsing the two loses every later append.
+fn read_live_session_ids(sessions_dir: &Path) -> Option<std::collections::HashSet<String>> {
     let mut out = std::collections::HashSet::new();
-    let Ok(entries) = fs::read_dir(sessions_dir) else {
-        return out;
-    };
+    let entries = fs::read_dir(sessions_dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
         // Skip the *.terminal.json sidecars and anything else non-pointer.
@@ -199,7 +200,7 @@ fn read_live_session_ids(sessions_dir: &Path) -> std::collections::HashSet<Strin
             out.insert(sid.to_string());
         }
     }
-    out
+    Some(out)
 }
 
 /// Per-project-subdir cached file list. Walking
@@ -458,13 +459,15 @@ fn scan_and_append_locked(
         let key = jsonl.display().to_string();
         let prev = offsets.get(&key).cloned().unwrap_or_default();
         let session_id = session_id_from_path(jsonl);
-        let writer_alive = live.contains(&session_id);
+        // Unknown liveness counts as "may still be writing": draining a file we
+        // merely failed to observe loses every later append, permanently.
+        let writer_may_be_live = live.as_ref().is_none_or(|live| live.contains(&session_id));
 
         // Drained-skip: a JSONL whose writer process exited and which we
         // already drained on a prior scan can never grow again. Skip the
         // stat + open + read entirely. This is the dominant code path on
         // any box with many historical sessions — typically 99%+ of files.
-        if !writer_alive && prev.drained {
+        if !writer_may_be_live && prev.drained {
             continue;
         }
 
@@ -476,7 +479,7 @@ fn scan_and_append_locked(
         // bytes can possibly exist. For dead writers also flip the
         // `drained` marker so the next scan can skip the stat above.
         if current_mtime == prev.mtime_ms && current_size == prev.last_byte {
-            if !writer_alive && !prev.drained {
+            if !writer_may_be_live && !prev.drained {
                 offsets.insert(
                     key.clone(),
                     FileOffset {
@@ -504,7 +507,7 @@ fn scan_and_append_locked(
                 FileOffset {
                     last_byte: current_size,
                     mtime_ms: current_mtime,
-                    drained: !writer_alive,
+                    drained: !writer_may_be_live,
                 },
             );
             continue;
@@ -581,7 +584,7 @@ fn scan_and_append_locked(
                 // We just performed a full read up to `current_size`. If
                 // the writer is dead, future scans can skip this file
                 // entirely via the drained-skip above.
-                drained: !writer_alive,
+                drained: !writer_may_be_live,
             },
         );
     }
@@ -1135,6 +1138,65 @@ mod tests {
         assert_eq!(summary.msg_count, 2);
         assert_eq!(summary.fresh_input, 40);
         assert_eq!(summary.output, 12);
+    }
+
+    /// An unreadable sessions directory must not be read as "every writer is
+    /// dead". `read_live_session_ids` returns an empty set when `read_dir`
+    /// fails, and `drained` is set from `!writer_may_be_live`, so one scan in that
+    /// state permanently skips every transcript — the drained-skip contract
+    /// ("a real dead writer cannot append") does not hold for a writer we
+    /// merely failed to observe.
+    ///
+    /// The two halves do identical file operations and differ only in whether
+    /// the sessions directory is readable.
+    #[test]
+    fn an_unreadable_sessions_dir_must_not_permanently_drain_a_live_writer() {
+        // Control: sessions dir readable, writer registered — the append lands.
+        let ok = TestPaths::new("live-visible");
+        let ok_file = ok.projects.join("-test/sess-live.jsonl");
+        ok.mark_live("sess-live");
+        write_tmp(
+            &ok_file,
+            &fixture_assistant_line("2026-04-22T10:00:00.000Z", "claude-opus-4-7", 10, 0, 0, 5),
+        );
+        assert_eq!(ok.scan().rows_appended, 1);
+        let mut f = OpenOptions::new().append(true).open(&ok_file).unwrap();
+        writeln!(
+            f,
+            "{}",
+            fixture_assistant_line("2026-04-22T10:05:00.000Z", "claude-opus-4-7", 7, 0, 0, 3)
+        )
+        .unwrap();
+        drop(f);
+        assert_eq!(
+            ok.scan().rows_appended,
+            1,
+            "a visible live writer's append must be ingested"
+        );
+
+        // Same sequence, but the sessions directory cannot be read.
+        let bad = TestPaths::new("live-hidden");
+        let bad_file = bad.projects.join("-test/sess-live.jsonl");
+        bad.mark_live("sess-live");
+        fs::remove_dir_all(&bad.sessions).unwrap();
+        write_tmp(
+            &bad_file,
+            &fixture_assistant_line("2026-04-22T10:00:00.000Z", "claude-opus-4-7", 10, 0, 0, 5),
+        );
+        assert_eq!(bad.scan().rows_appended, 1);
+        let mut f = OpenOptions::new().append(true).open(&bad_file).unwrap();
+        writeln!(
+            f,
+            "{}",
+            fixture_assistant_line("2026-04-22T10:05:00.000Z", "claude-opus-4-7", 7, 0, 0, 3)
+        )
+        .unwrap();
+        drop(f);
+        assert_eq!(
+            bad.scan().rows_appended,
+            1,
+            "an unreadable sessions dir must not permanently drain a live writer"
+        );
     }
 
     #[test]
