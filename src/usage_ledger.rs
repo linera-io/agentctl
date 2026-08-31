@@ -179,27 +179,40 @@ fn session_pointer_dirs() -> Vec<PathBuf> {
 
 /// Union the `sessionId` values of every live-session pointer across `dirs`.
 ///
-/// `None` means **no** directory could be read, which is NOT the same as "no
-/// session is live": `drained` is set from `!writer_may_be_live` and permanently
-/// skips a transcript, so collapsing the two loses every later append.
+/// `None` means liveness is UNKNOWN — no directory yielded an answer, or one
+/// that exists could not be read. That is NOT "no session is live": `drained`
+/// comes from `!writer_may_be_live` and permanently skips a transcript.
 fn read_live_session_ids(dirs: &[PathBuf]) -> Option<std::collections::HashSet<String>> {
     let mut out = std::collections::HashSet::new();
-    let mut any_readable = false;
+    let mut any_read = false;
     for dir in dirs {
-        if read_live_session_ids_in(dir, &mut out) {
-            any_readable = true;
+        match read_live_session_ids_in(dir, &mut out) {
+            DirRead::Read => any_read = true,
+            // A host has no sandbox dir; that absence is not ignorance.
+            DirRead::Absent => {}
+            DirRead::Unknown => return None,
         }
     }
-    any_readable.then_some(out)
+    any_read.then_some(out)
 }
 
-/// Add one directory's pointers to `out`; `false` if it could not be read.
+/// Outcome of reading one pointer directory.
+enum DirRead {
+    Read,
+    Absent,
+    /// Exists but could not be read — the answer is unknown, not "none".
+    Unknown,
+}
+
+/// Add one directory's pointers to `out`.
 fn read_live_session_ids_in(
     sessions_dir: &Path,
     out: &mut std::collections::HashSet<String>,
-) -> bool {
-    let Ok(entries) = fs::read_dir(sessions_dir) else {
-        return false;
+) -> DirRead {
+    let entries = match fs::read_dir(sessions_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DirRead::Absent,
+        Err(_) => return DirRead::Unknown,
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -226,7 +239,7 @@ fn read_live_session_ids_in(
             out.insert(sid.to_string());
         }
     }
-    true
+    DirRead::Read
 }
 
 /// Per-project-subdir cached file list. Walking
@@ -1169,6 +1182,80 @@ mod tests {
         assert_eq!(summary.msg_count, 2);
         assert_eq!(summary.fresh_input, 40);
         assert_eq!(summary.output, 12);
+    }
+
+    /// An absent directory is a positive "nothing registered here", not
+    /// ignorance — a host has no sandbox dir, and treating that as unknown would
+    /// disable the drained-skip fast path on every host.
+    #[test]
+    fn an_absent_directory_still_lets_a_dead_writer_drain() {
+        let p = TestPaths::new("absent-dir");
+        let missing = p._root.join("no-such-sessions-dir");
+        let file = p.projects.join("-test/sess-dead.jsonl");
+        write_tmp(
+            &file,
+            &fixture_assistant_line("2026-04-22T10:00:00.000Z", "claude-opus-4-7", 10, 0, 0, 5),
+        );
+        // One dir absent, one readable and empty: the writer is knowably dead.
+        let dirs = [missing, p.sessions.clone()];
+        assert_eq!(
+            scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &dirs).rows_appended,
+            1
+        );
+
+        let mut f = OpenOptions::new().append(true).open(&file).unwrap();
+        writeln!(
+            f,
+            "{}",
+            fixture_assistant_line("2026-04-22T10:05:00.000Z", "claude-opus-4-7", 7, 0, 0, 3)
+        )
+        .unwrap();
+        drop(f);
+
+        assert_eq!(
+            scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &dirs).rows_appended,
+            0,
+            "an absent dir must not make liveness unknown"
+        );
+    }
+
+    /// A path that exists but is not a listable directory makes liveness
+    /// unknown even when a sibling read fine and was empty — a pointer could be
+    /// in the one we failed to read, and draining on that guess is permanent.
+    #[test]
+    fn an_unreadable_sibling_directory_makes_liveness_unknown() {
+        let p = TestPaths::new("unreadable-sibling");
+        // A regular file: `read_dir` fails with NotADirectory, not NotFound, for
+        // any uid — a permission bit would not gate root.
+        let blocked = p._root.join("not-a-directory");
+        fs::write(&blocked, "").unwrap();
+
+        let file = p.projects.join("-test/sess-x.jsonl");
+        write_tmp(
+            &file,
+            &fixture_assistant_line("2026-04-22T10:00:00.000Z", "claude-opus-4-7", 10, 0, 0, 5),
+        );
+        // p.sessions is readable and EMPTY; `blocked` exists and cannot be read.
+        let dirs = [p.sessions.clone(), blocked];
+        assert_eq!(
+            scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &dirs).rows_appended,
+            1
+        );
+
+        let mut f = OpenOptions::new().append(true).open(&file).unwrap();
+        writeln!(
+            f,
+            "{}",
+            fixture_assistant_line("2026-04-22T10:05:00.000Z", "claude-opus-4-7", 7, 0, 0, 3)
+        )
+        .unwrap();
+        drop(f);
+
+        assert_eq!(
+            scan_and_append_at(&p.projects, &p.ledger, &p.offsets, &dirs).rows_appended,
+            1,
+            "an unreadable sibling must not be read as \"nobody is live\""
+        );
     }
 
     /// A sandbox registers under `/var/lib/sandbox-sessions` and leaves
