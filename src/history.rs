@@ -93,9 +93,9 @@ fn format_row(
 const HEADER: &str =
     "timestamp,pid,project,model,duration_secs,input_tokens,output_tokens,cost_usd,provider";
 
-/// Parse one CSV row. Rows written before the provider column carry 8 fields
-/// and are Claude by construction, so a missing or unknown 9th field reads as
-/// Claude rather than dropping the row.
+/// Parse one CSV row. A missing or blank 9th field reads as Claude — rows
+/// predating the column are Claude by construction — while a present but
+/// unrecognised one is kept verbatim rather than folded into a known product.
 fn parse_record(line: &str) -> Option<SessionRecord> {
     // `needs_header` is read before the open and unlocked, so two processes
     // ending a session at once both write one — a mid-file header parsed as
@@ -212,11 +212,15 @@ pub fn print_history(since: &str) {
         return;
     }
 
-    println!(
+    // The rule is measured from the header rather than hand-counted, so adding
+    // a column cannot leave it short again.
+    let header = format!(
         "{:<22} {:<7} {:<8} {:<20} {:<12} {:>10} {:>12} {:>12} {:>10}",
         "Timestamp", "PID", "Agent", "Project", "Model", "Duration", "Input", "Output", "Cost"
     );
-    println!("{}", "-".repeat(119));
+    let rule = "-".repeat(header.chars().count());
+    println!("{header}");
+    println!("{rule}");
 
     let mut total_cost = 0.0;
     let mut total_duration = 0u64;
@@ -250,7 +254,7 @@ pub fn print_history(since: &str) {
         total_output += r.output_tokens;
     }
 
-    println!("{}", "-".repeat(119));
+    println!("{rule}");
     let total_cost_str = if total_cost < 1.0 {
         format!("${:.2}", total_cost)
     } else {
