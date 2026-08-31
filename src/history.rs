@@ -13,7 +13,9 @@ pub struct SessionRecord {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: f64,
-    pub provider: crate::provider::AgentProvider,
+    /// The agent label as recorded. A product this build does not know is
+    /// kept verbatim rather than misattributed to a known one.
+    pub provider: String,
 }
 
 fn history_dir() -> PathBuf {
@@ -114,10 +116,15 @@ fn parse_record(line: &str) -> Option<SessionRecord> {
         input_tokens: fields[5].parse().unwrap_or(0),
         output_tokens: fields[6].parse().unwrap_or(0),
         cost_usd: fields[7].parse().unwrap_or(0.0),
-        provider: fields
-            .get(8)
-            .and_then(|l| crate::provider::AgentProvider::from_label(l))
-            .unwrap_or(crate::provider::AgentProvider::Claude),
+        // Absent means a pre-column row, which is Claude by construction. A
+        // label this build does not recognise is kept as written: attributing
+        // another product's spend to Claude would be a lie about money.
+        provider: match fields.get(8).map(|l| l.trim()) {
+            None | Some("") => crate::provider::AgentProvider::Claude.label().to_string(),
+            Some(raw) => crate::provider::AgentProvider::from_label(raw)
+                .map(|p| p.label().to_string())
+                .unwrap_or_else(|| raw.to_string()),
+        },
     })
 }
 
@@ -228,7 +235,7 @@ pub fn print_history(since: &str) {
             "{:<22} {:<7} {:<8} {:<20} {:<12} {:>10} {:>12} {:>12} {:>10}",
             &r.timestamp[..19.min(r.timestamp.len())],
             r.pid,
-            r.provider.label(),
+            &r.provider,
             truncate(&r.project, 20),
             truncate(&r.model, 12),
             dur,
@@ -295,10 +302,10 @@ pub fn print_stats(since: &str) {
     println!();
 
     // Per-agent breakdown. Sorted largest-cost first, like the project table.
-    let mut agents: std::collections::HashMap<&'static str, (f64, u64, usize)> =
+    let mut agents: std::collections::HashMap<&str, (f64, u64, usize)> =
         std::collections::HashMap::new();
     for r in &records {
-        let entry = agents.entry(r.provider.label()).or_default();
+        let entry = agents.entry(r.provider.as_str()).or_default();
         entry.0 += r.cost_usd;
         entry.1 += r.duration_secs;
         entry.2 += 1;
@@ -450,8 +457,6 @@ mod tests {
     /// actually looks like after they upgrade.
     #[test]
     fn rows_of_either_width_survive_in_the_same_file() {
-        use crate::provider::AgentProvider;
-
         let old_row = "2026-08-31T10:00:00Z,111,proj,claude-opus-5,60,10,20,0.0500";
         let new_row = "2026-08-31T10:01:00Z,222,proj,gpt-5,30,5,7,0.0100,Codex";
 
@@ -462,15 +467,14 @@ mod tests {
             "cost must not be corrupted by the new column"
         );
         assert_eq!(
-            old.provider,
-            AgentProvider::Claude,
+            old.provider, "Claude",
             "rows predating the column are Claude by construction"
         );
 
         let new = parse_record(new_row).expect("a 9-field row must parse");
         assert_eq!(new.pid, 222);
         assert_eq!(new.cost_usd, 0.01);
-        assert_eq!(new.provider, AgentProvider::Codex);
+        assert_eq!(new.provider, "Codex");
     }
 
     /// What the writer emits must be what the reader reads, for every product.
@@ -496,7 +500,7 @@ mod tests {
             assert_eq!(back.input_tokens, 123);
             assert_eq!(back.output_tokens, 456);
             assert_eq!(back.cost_usd, 0.5);
-            assert_eq!(back.provider, *provider);
+            assert_eq!(back.provider, provider.label());
         }
     }
 
@@ -527,7 +531,10 @@ mod tests {
         let row = "2026-08-31T10:00:00Z,333,proj,m,60,10,20,0.2500,Gemini";
         let r = parse_record(row).expect("an unknown provider must not drop the row");
         assert_eq!(r.cost_usd, 0.25);
-        assert_eq!(r.provider, crate::provider::AgentProvider::Claude);
+        assert_eq!(
+            r.provider, "Gemini",
+            "an unknown product must not be booked against Claude"
+        );
     }
 
     /// A header can land mid-file when two processes end a session at once.
@@ -542,6 +549,17 @@ mod tests {
             .is_none(),
             "the pre-column header must be rejected too"
         );
+    }
+
+    /// A known label is normalised so case differences do not split a group in
+    /// the per-agent breakdown.
+    #[test]
+    fn a_known_label_is_normalised_for_grouping() {
+        for raw in ["codex", "CODEX", " Codex "] {
+            let row = format!("T,1,p,m,60,10,20,0.1000,{raw}");
+            let r = parse_record(&row).expect("row parses");
+            assert_eq!(r.provider, "Codex", "{raw:?} must normalise");
+        }
     }
 
     /// A truncated row is still rejected.
