@@ -239,7 +239,7 @@ pub fn print_history(since: &str) {
             "{:<22} {:<7} {:<8} {:<20} {:<12} {:>10} {:>12} {:>12} {:>10}",
             &r.timestamp[..19.min(r.timestamp.len())],
             r.pid,
-            &r.provider,
+            truncate(&r.provider, 8),
             truncate(&r.project, 20),
             truncate(&r.model, 12),
             dur,
@@ -444,12 +444,21 @@ fn format_count(n: u64) -> String {
     }
 }
 
+/// Bound a field to `max` columns for display.
+///
+/// Counts characters, not bytes: the old byte slice panicked on any non-ASCII
+/// project name (`&s[..17]` landing inside a multi-byte char). Control
+/// characters are dropped — these values come off disk and go to a terminal.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max - 3])
+    let clean: String = s.chars().filter(|c| !c.is_control()).collect();
+    if clean.chars().count() <= max {
+        return clean;
     }
+    clean
+        .chars()
+        .take(max.saturating_sub(3))
+        .collect::<String>()
+        + "..."
 }
 
 #[cfg(test)]
@@ -564,6 +573,33 @@ mod tests {
             let r = parse_record(&row).expect("row parses");
             assert_eq!(r.provider, "Codex", "{raw:?} must normalise");
         }
+    }
+
+    /// `truncate` byte-sliced, so any non-ASCII project name crashed
+    /// `--history` outright: `&s[..17]` landing inside a multi-byte char.
+    #[test]
+    fn truncate_does_not_panic_on_a_multibyte_name() {
+        // 24 bytes, 8 chars — the old slice at byte 17 split a 3-byte char.
+        let name = "日本語日本語日本";
+        assert_eq!(truncate(name, 20).chars().count(), 8, "fits, so unchanged");
+        let long = "日本語日本語日本語日本語日本語";
+        assert_eq!(
+            truncate(long, 12).chars().count(),
+            12,
+            "must bound by CHARS and not panic"
+        );
+        assert!(truncate(long, 12).ends_with("..."));
+    }
+
+    /// These values come off disk and go to a terminal, so an escape sequence
+    /// in a provider label must not reach it.
+    #[test]
+    fn truncate_strips_control_characters() {
+        let hostile = "\u{1b}[31mRED\u{1b}[0m";
+        let out = truncate(hostile, 30);
+        assert!(!out.contains('\u{1b}'), "escape must not survive: {out:?}");
+        assert_eq!(out, "[31mRED[0m");
+        assert!(!truncate("a\rb\nc", 30).contains('\r'));
     }
 
     /// A truncated row is still rejected.
