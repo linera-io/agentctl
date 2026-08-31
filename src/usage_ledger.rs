@@ -1140,15 +1140,9 @@ mod tests {
         assert_eq!(summary.output, 12);
     }
 
-    /// An unreadable sessions directory must not be read as "every writer is
-    /// dead". `read_live_session_ids` returns an empty set when `read_dir`
-    /// fails, and `drained` is set from `!writer_may_be_live`, so one scan in that
-    /// state permanently skips every transcript — the drained-skip contract
-    /// ("a real dead writer cannot append") does not hold for a writer we
-    /// merely failed to observe.
-    ///
-    /// The two halves do identical file operations and differ only in whether
-    /// the sessions directory is readable.
+    /// Before this guard an unreadable sessions dir read as "every writer is
+    /// dead", and `drained` is permanent, so one such scan skipped every
+    /// transcript forever. The halves differ only in that directory.
     #[test]
     fn an_unreadable_sessions_dir_must_not_permanently_drain_a_live_writer() {
         // Control: sessions dir readable, writer registered — the append lands.
