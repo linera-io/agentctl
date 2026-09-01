@@ -502,6 +502,10 @@ fn scan_and_append_locked(
         // merely failed to observe loses every later append, permanently.
         let writer_may_be_live = live.as_ref().is_none_or(|live| live.contains(&session_id));
 
+        // An empty transcript is indistinguishable from one being created right
+        // now, and `drained` is permanent — never retire a file with no bytes.
+        let drainable = |size: u64| !writer_may_be_live && size > 0;
+
         // Drained-skip: a JSONL whose writer process exited and which we
         // already drained on a prior scan can never grow again. Skip the
         // stat + open + read entirely. This is the dominant code path on
@@ -524,7 +528,7 @@ fn scan_and_append_locked(
                     FileOffset {
                         last_byte: current_size,
                         mtime_ms: current_mtime,
-                        drained: true,
+                        drained: drainable(current_size),
                     },
                 );
             }
@@ -546,7 +550,7 @@ fn scan_and_append_locked(
                 FileOffset {
                     last_byte: current_size,
                     mtime_ms: current_mtime,
-                    drained: !writer_may_be_live,
+                    drained: drainable(current_size),
                 },
             );
             continue;
@@ -623,7 +627,7 @@ fn scan_and_append_locked(
                 // We just performed a full read up to `current_size`. If
                 // the writer is dead, future scans can skip this file
                 // entirely via the drained-skip above.
-                drained: !writer_may_be_live,
+                drained: drainable(current_size),
             },
         );
     }
@@ -1350,6 +1354,30 @@ mod tests {
             bad.scan().rows_appended,
             1,
             "an unreadable sessions dir must not permanently drain a live writer"
+        );
+    }
+
+    /// An empty transcript carries no evidence that it is finished — it is
+    /// indistinguishable from one being created right now — so it must never be
+    /// marked drained, which is permanent.
+    #[test]
+    fn an_empty_transcript_is_never_drained() {
+        let p = TestPaths::new("empty-not-drained");
+        let file = p.projects.join("-test/sess-new.jsonl");
+        // A session whose transcript exists but has not been written yet, and
+        // whose pointer has not appeared: exactly the create/write window.
+        write_tmp(&file, "");
+        assert_eq!(p.scan().rows_appended, 0, "nothing to ingest yet");
+
+        // The writer finishes.
+        write_tmp(
+            &file,
+            &fixture_assistant_line("2026-04-22T10:00:00.000Z", "claude-opus-4-7", 10, 0, 0, 5),
+        );
+        assert_eq!(
+            p.scan().rows_appended,
+            1,
+            "a transcript seen while empty must still be readable once written"
         );
     }
 
