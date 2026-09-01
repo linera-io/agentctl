@@ -331,7 +331,7 @@ pub fn print_stats(since: &str) {
             };
             println!(
                 "  {:<25} {:>8} {:>10} {:>10}",
-                name,
+                truncate(name, 25),
                 count,
                 format_duration(*dur),
                 cost_str,
@@ -401,7 +401,7 @@ pub fn print_stats(since: &str) {
         } else {
             format!("${:.1}", cost)
         };
-        println!("  {:<20} {:>8} {:>10}", name, count, cost_str);
+        println!("  {:<20} {:>8} {:>10}", truncate(name, 20), count, cost_str);
     }
 }
 
