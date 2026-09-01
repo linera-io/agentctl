@@ -317,12 +317,13 @@ pub fn print_stats(since: &str) {
     if agents.len() > 1 {
         let mut agent_list: Vec<_> = agents.into_iter().collect();
         agent_list.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
-        println!("  Per-agent breakdown:");
-        println!(
+        let head = format!(
             "  {:<25} {:>8} {:>10} {:>10}",
             "Agent", "Sessions", "Duration", "Cost"
         );
-        println!("  {}", "-".repeat(55));
+        println!("  Per-agent breakdown:");
+        println!("{head}");
+        println!("  {}", "-".repeat(head.trim_start().chars().count()));
         for (name, (cost, dur, count)) in &agent_list {
             let cost_str = if *cost < 1.0 {
                 format!("${:.2}", cost)
@@ -353,12 +354,13 @@ pub fn print_stats(since: &str) {
     let mut project_list: Vec<_> = projects.into_iter().collect();
     project_list.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
 
-    println!("  Per-project breakdown:");
-    println!(
+    let head = format!(
         "  {:<25} {:>8} {:>10} {:>10}",
         "Project", "Sessions", "Duration", "Cost"
     );
-    println!("  {}", "-".repeat(55));
+    println!("  Per-project breakdown:");
+    println!("{head}");
+    println!("  {}", "-".repeat(head.trim_start().chars().count()));
     for (name, (cost, dur, count)) in &project_list {
         let cost_str = if *cost < 1.0 {
             format!("${:.2}", cost)
@@ -393,8 +395,9 @@ pub fn print_stats(since: &str) {
 
     println!();
     println!("  Per-model breakdown:");
-    println!("  {:<20} {:>8} {:>10}", "Model", "Sessions", "Cost");
-    println!("  {}", "-".repeat(40));
+    let head = format!("  {:<20} {:>8} {:>10}", "Model", "Sessions", "Cost");
+    println!("{head}");
+    println!("  {}", "-".repeat(head.trim_start().chars().count()));
     for (name, (cost, count)) in &model_list {
         let cost_str = if *cost < 1.0 {
             format!("${:.2}", cost)
