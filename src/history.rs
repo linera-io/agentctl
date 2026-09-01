@@ -13,6 +13,9 @@ pub struct SessionRecord {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: f64,
+    /// The agent label as recorded. A product this build does not know is
+    /// kept verbatim rather than misattributed to a known one.
+    pub provider: String,
 }
 
 fn history_dir() -> PathBuf {
@@ -41,10 +44,7 @@ pub fn record_session(session: &crate::session::AgentSession) {
     let Ok(mut file) = file else { return };
 
     if needs_header {
-        let _ = writeln!(
-            file,
-            "timestamp,pid,project,model,duration_secs,input_tokens,output_tokens,cost_usd"
-        );
+        let _ = writeln!(file, "{HEADER}");
     }
 
     let ts = crate::logger::timestamp_now();
@@ -53,16 +53,79 @@ pub fn record_session(session: &crate::session::AgentSession) {
 
     let _ = writeln!(
         file,
-        "{},{},{},{},{},{},{},{:.4}",
-        ts,
-        session.pid,
-        project,
-        model,
-        session.elapsed.as_secs(),
-        session.total_input_tokens,
-        session.total_output_tokens,
-        session.cost_usd,
+        "{}",
+        format_row(
+            &ts,
+            session.pid,
+            &project,
+            &model,
+            session.elapsed.as_secs(),
+            session.total_input_tokens,
+            session.total_output_tokens,
+            session.cost_usd,
+            session.provider,
+        )
     );
+}
+
+/// One CSV row. Separate from the writer so a test can round-trip it through
+/// [`parse_record`] — a field the writer and reader disagree about is the whole
+/// hazard of widening this format.
+#[allow(clippy::too_many_arguments)]
+fn format_row(
+    ts: &str,
+    pid: u32,
+    project: &str,
+    model: &str,
+    duration_secs: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: f64,
+    provider: crate::provider::AgentProvider,
+) -> String {
+    format!(
+        "{ts},{pid},{project},{model},{duration_secs},{input_tokens},{output_tokens},{cost_usd:.4},{}",
+        provider.label()
+    )
+}
+
+/// The CSV header. Kept beside [`format_row`] so the two cannot drift.
+const HEADER: &str =
+    "timestamp,pid,project,model,duration_secs,input_tokens,output_tokens,cost_usd,provider";
+
+/// Parse one CSV row. A missing or blank 9th field reads as Claude — rows
+/// predating the column are Claude by construction — while a present but
+/// unrecognised one is kept verbatim rather than folded into a known product.
+fn parse_record(line: &str) -> Option<SessionRecord> {
+    // `needs_header` is read before the open and unlocked, so two processes
+    // ending a session at once both write one — a mid-file header parsed as
+    // data becomes a phantom $0.00 session.
+    if line.starts_with("timestamp,") {
+        return None;
+    }
+    let fields: Vec<&str> = line.split(',').collect();
+    if fields.len() < 8 {
+        return None;
+    }
+    Some(SessionRecord {
+        timestamp: fields[0].to_string(),
+        pid: fields[1].parse().unwrap_or(0),
+        project: fields[2].to_string(),
+        model: fields[3].to_string(),
+        duration_secs: fields[4].parse().unwrap_or(0),
+        input_tokens: fields[5].parse().unwrap_or(0),
+        output_tokens: fields[6].parse().unwrap_or(0),
+        cost_usd: fields[7].parse().unwrap_or(0.0),
+        // Absent means a pre-column row, which is Claude by construction. A
+        // label this build does not recognise is kept as written: attributing
+        // another product's spend to Claude would be a lie about money.
+        provider: match fields.get(8).map(|l| l.trim()) {
+            None | Some("") => crate::provider::AgentProvider::Claude.label().to_string(),
+            Some(raw) => crate::provider::AgentProvider::from_label(raw)
+                .map(|p| p.label().to_string())
+                .unwrap_or_else(|| raw.to_string()),
+        },
+    })
 }
 
 /// Load all history records, optionally filtered by a time window.
@@ -81,26 +144,10 @@ pub fn load_history(since_secs: Option<u64>) -> Vec<SessionRecord> {
     let reader = BufReader::new(file);
     let mut records = Vec::new();
 
-    for (i, line) in reader.lines().enumerate() {
+    for line in reader.lines() {
         let Ok(line) = line else { continue };
-        if i == 0 && line.starts_with("timestamp") {
-            continue; // skip header
-        }
-
-        let fields: Vec<&str> = line.splitn(8, ',').collect();
-        if fields.len() < 8 {
+        let Some(record) = parse_record(&line) else {
             continue;
-        }
-
-        let record = SessionRecord {
-            timestamp: fields[0].to_string(),
-            pid: fields[1].parse().unwrap_or(0),
-            project: fields[2].to_string(),
-            model: fields[3].to_string(),
-            duration_secs: fields[4].parse().unwrap_or(0),
-            input_tokens: fields[5].parse().unwrap_or(0),
-            output_tokens: fields[6].parse().unwrap_or(0),
-            cost_usd: fields[7].parse().unwrap_or(0.0),
         };
 
         // Filter by time window if specified
@@ -165,11 +212,15 @@ pub fn print_history(since: &str) {
         return;
     }
 
-    println!(
-        "{:<22} {:<7} {:<20} {:<12} {:>10} {:>12} {:>12} {:>10}",
-        "Timestamp", "PID", "Project", "Model", "Duration", "Input", "Output", "Cost"
+    // The rule is measured from the header rather than hand-counted, so adding
+    // a column cannot leave it short again.
+    let header = format!(
+        "{:<22} {:<7} {:<8} {:<20} {:<12} {:>10} {:>12} {:>12} {:>10}",
+        "Timestamp", "PID", "Agent", "Project", "Model", "Duration", "Input", "Output", "Cost"
     );
-    println!("{}", "-".repeat(110));
+    let rule = "-".repeat(header.chars().count());
+    println!("{header}");
+    println!("{rule}");
 
     let mut total_cost = 0.0;
     let mut total_duration = 0u64;
@@ -185,9 +236,10 @@ pub fn print_history(since: &str) {
         };
 
         println!(
-            "{:<22} {:<7} {:<20} {:<12} {:>10} {:>12} {:>12} {:>10}",
+            "{:<22} {:<7} {:<8} {:<20} {:<12} {:>10} {:>12} {:>12} {:>10}",
             &r.timestamp[..19.min(r.timestamp.len())],
             r.pid,
+            truncate(&r.provider, 8),
             truncate(&r.project, 20),
             truncate(&r.model, 12),
             dur,
@@ -202,15 +254,16 @@ pub fn print_history(since: &str) {
         total_output += r.output_tokens;
     }
 
-    println!("{}", "-".repeat(110));
+    println!("{rule}");
     let total_cost_str = if total_cost < 1.0 {
         format!("${:.2}", total_cost)
     } else {
         format!("${:.1}", total_cost)
     };
     println!(
-        "{:<22} {:<7} {:<20} {:<12} {:>10} {:>12} {:>12} {:>10}",
+        "{:<22} {:<7} {:<8} {:<20} {:<12} {:>10} {:>12} {:>12} {:>10}",
         format!("{} sessions", records.len()),
+        "",
         "",
         "",
         "",
@@ -252,6 +305,42 @@ pub fn print_stats(since: &str) {
     );
     println!();
 
+    // Per-agent breakdown. Sorted largest-cost first, like the project table.
+    let mut agents: std::collections::HashMap<&str, (f64, u64, usize)> =
+        std::collections::HashMap::new();
+    for r in &records {
+        let entry = agents.entry(r.provider.as_str()).or_default();
+        entry.0 += r.cost_usd;
+        entry.1 += r.duration_secs;
+        entry.2 += 1;
+    }
+    if agents.len() > 1 {
+        let mut agent_list: Vec<_> = agents.into_iter().collect();
+        agent_list.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        let head = format!(
+            "  {:<25} {:>8} {:>10} {:>10}",
+            "Agent", "Sessions", "Duration", "Cost"
+        );
+        println!("  Per-agent breakdown:");
+        println!("{head}");
+        println!("  {}", "-".repeat(head.trim_start().chars().count()));
+        for (name, (cost, dur, count)) in &agent_list {
+            let cost_str = if *cost < 1.0 {
+                format!("${:.2}", cost)
+            } else {
+                format!("${:.1}", cost)
+            };
+            println!(
+                "  {:<25} {:>8} {:>10} {:>10}",
+                truncate(name, 25),
+                count,
+                format_duration(*dur),
+                cost_str,
+            );
+        }
+        println!();
+    }
+
     // Per-project breakdown
     let mut projects: std::collections::HashMap<String, (f64, u64, usize)> =
         std::collections::HashMap::new();
@@ -265,12 +354,13 @@ pub fn print_stats(since: &str) {
     let mut project_list: Vec<_> = projects.into_iter().collect();
     project_list.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
 
-    println!("  Per-project breakdown:");
-    println!(
+    let head = format!(
         "  {:<25} {:>8} {:>10} {:>10}",
         "Project", "Sessions", "Duration", "Cost"
     );
-    println!("  {}", "-".repeat(55));
+    println!("  Per-project breakdown:");
+    println!("{head}");
+    println!("  {}", "-".repeat(head.trim_start().chars().count()));
     for (name, (cost, dur, count)) in &project_list {
         let cost_str = if *cost < 1.0 {
             format!("${:.2}", cost)
@@ -305,15 +395,16 @@ pub fn print_stats(since: &str) {
 
     println!();
     println!("  Per-model breakdown:");
-    println!("  {:<20} {:>8} {:>10}", "Model", "Sessions", "Cost");
-    println!("  {}", "-".repeat(40));
+    let head = format!("  {:<20} {:>8} {:>10}", "Model", "Sessions", "Cost");
+    println!("{head}");
+    println!("  {}", "-".repeat(head.trim_start().chars().count()));
     for (name, (cost, count)) in &model_list {
         let cost_str = if *cost < 1.0 {
             format!("${:.2}", cost)
         } else {
             format!("${:.1}", cost)
         };
-        println!("  {:<20} {:>8} {:>10}", name, count, cost_str);
+        println!("  {:<20} {:>8} {:>10}", truncate(name, 20), count, cost_str);
     }
 }
 
@@ -356,17 +447,182 @@ fn format_count(n: u64) -> String {
     }
 }
 
+/// Bound a field to `max` columns for display.
+///
+/// Counts characters, not bytes: the old byte slice panicked on any non-ASCII
+/// project name (`&s[..17]` landing inside a multi-byte char). Control
+/// characters are dropped — these values come off disk and go to a terminal.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max - 3])
+    let clean: String = s.chars().filter(|c| !c.is_control()).collect();
+    if clean.chars().count() <= max {
+        return clean;
     }
+    clean
+        .chars()
+        .take(max.saturating_sub(3))
+        .collect::<String>()
+        + "..."
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file written before the provider column keeps working, and a file
+    /// upgraded mid-life holds BOTH widths at once — the row a user's history
+    /// actually looks like after they upgrade.
+    #[test]
+    fn rows_of_either_width_survive_in_the_same_file() {
+        let old_row = "2026-08-31T10:00:00Z,111,proj,claude-opus-5,60,10,20,0.0500";
+        let new_row = "2026-08-31T10:01:00Z,222,proj,gpt-5,30,5,7,0.0100,Codex";
+
+        let old = parse_record(old_row).expect("an 8-field row must still parse");
+        assert_eq!(old.pid, 111);
+        assert_eq!(
+            old.cost_usd, 0.05,
+            "cost must not be corrupted by the new column"
+        );
+        assert_eq!(
+            old.provider, "Claude",
+            "rows predating the column are Claude by construction"
+        );
+
+        let new = parse_record(new_row).expect("a 9-field row must parse");
+        assert_eq!(new.pid, 222);
+        assert_eq!(new.cost_usd, 0.01);
+        assert_eq!(new.provider, "Codex");
+    }
+
+    /// What the writer emits must be what the reader reads, for every product.
+    #[test]
+    fn a_written_row_round_trips_through_the_parser() {
+        for provider in crate::provider::AgentProvider::all() {
+            let row = format_row(
+                "2026-08-31T10:00:00Z",
+                4242,
+                "proj",
+                "some-model",
+                1800,
+                123,
+                456,
+                0.5,
+                *provider,
+            );
+            let back = parse_record(&row).expect("a freshly written row must parse");
+            assert_eq!(back.pid, 4242);
+            assert_eq!(back.project, "proj");
+            assert_eq!(back.model, "some-model");
+            assert_eq!(back.duration_secs, 1800);
+            assert_eq!(back.input_tokens, 123);
+            assert_eq!(back.output_tokens, 456);
+            assert_eq!(back.cost_usd, 0.5);
+            assert_eq!(back.provider, provider.label());
+        }
+    }
+
+    /// The header must name exactly as many columns as a row has fields.
+    #[test]
+    fn the_header_and_a_row_have_the_same_width() {
+        let row = format_row(
+            "2026-08-31T10:00:00Z",
+            1,
+            "p",
+            "m",
+            1,
+            1,
+            1,
+            0.0,
+            crate::provider::AgentProvider::Claude,
+        );
+        assert_eq!(
+            HEADER.split(',').count(),
+            row.split(',').count(),
+            "header {HEADER:?} disagrees with row {row:?}"
+        );
+    }
+
+    /// An unrecognised provider must not drop the row — the cost is still real.
+    #[test]
+    fn an_unknown_provider_label_keeps_the_row() {
+        let row = "2026-08-31T10:00:00Z,333,proj,m,60,10,20,0.2500,Gemini";
+        let r = parse_record(row).expect("an unknown provider must not drop the row");
+        assert_eq!(r.cost_usd, 0.25);
+        assert_eq!(
+            r.provider, "Gemini",
+            "an unknown product must not be booked against Claude"
+        );
+    }
+
+    /// A header can land mid-file when two processes end a session at once.
+    /// Parsed as data it becomes a phantom $0.00 session in every total.
+    #[test]
+    fn a_header_line_is_never_data_wherever_it_appears() {
+        assert!(parse_record(HEADER).is_none());
+        assert!(
+            parse_record(
+                "timestamp,pid,project,model,duration_secs,input_tokens,output_tokens,cost_usd"
+            )
+            .is_none(),
+            "the pre-column header must be rejected too"
+        );
+    }
+
+    /// A known label is normalised so case differences do not split a group in
+    /// the per-agent breakdown.
+    #[test]
+    fn a_known_label_is_normalised_for_grouping() {
+        for raw in ["codex", "CODEX", " Codex "] {
+            let row = format!("T,1,p,m,60,10,20,0.1000,{raw}");
+            let r = parse_record(&row).expect("row parses");
+            assert_eq!(r.provider, "Codex", "{raw:?} must normalise");
+        }
+    }
+
+    /// `truncate` byte-sliced, so any non-ASCII project name crashed
+    /// `--history` outright: `&s[..17]` landing inside a multi-byte char.
+    #[test]
+    fn truncate_does_not_panic_on_a_multibyte_name() {
+        // 24 bytes, 8 chars — the old slice at byte 17 split a 3-byte char.
+        let name = "日本語日本語日本";
+        assert_eq!(truncate(name, 20).chars().count(), 8, "fits, so unchanged");
+        let long = "日本語日本語日本語日本語日本語";
+        assert_eq!(
+            truncate(long, 12).chars().count(),
+            12,
+            "must bound by CHARS and not panic"
+        );
+        assert!(truncate(long, 12).ends_with("..."));
+    }
+
+    /// These values come off disk and go to a terminal, so an escape sequence
+    /// in a provider label must not reach it.
+    #[test]
+    fn truncate_strips_control_characters() {
+        let hostile = "\u{1b}[31mRED\u{1b}[0m";
+        let out = truncate(hostile, 30);
+        assert!(!out.contains('\u{1b}'), "escape must not survive: {out:?}");
+        assert_eq!(out, "[31mRED[0m");
+        assert!(!truncate("a\rb\nc", 30).contains('\r'));
+    }
+
+    /// A truncated row is still rejected.
+    #[test]
+    fn a_short_row_is_rejected() {
+        assert!(parse_record("2026-08-31T10:00:00Z,1,p,m,60,10,20").is_none());
+    }
+
+    /// `label` and `from_label` must stay inverse for every product.
+    #[test]
+    fn every_provider_label_round_trips() {
+        for p in crate::provider::AgentProvider::all() {
+            assert_eq!(
+                crate::provider::AgentProvider::from_label(p.label()),
+                Some(*p),
+                "{} must round-trip",
+                p.label()
+            );
+        }
+    }
 
     #[test]
     fn test_parse_duration() {

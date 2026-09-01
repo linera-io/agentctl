@@ -33,6 +33,15 @@ impl AgentProvider {
         }
     }
 
+    /// The inverse of [`Self::label`], derived from [`Self::all`] so a new
+    /// product cannot be added to one and forgotten in the other.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::all()
+            .iter()
+            .find(|p| p.label().eq_ignore_ascii_case(label.trim()))
+            .copied()
+    }
+
     /// argv0 of the product's CLI, as it appears in a `ps` row.
     pub fn executable(&self) -> &'static str {
         match self {
